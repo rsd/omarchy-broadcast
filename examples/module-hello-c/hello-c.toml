@@ -1,0 +1,22 @@
+# The manifest of the example C module. Install it with the library: copy
+# this file and libobc_module_hello_c.so into a modules.d directory, and set
+# `library` to the library's path (absolute, or relative to this file).
+abi = 1
+# The lowest minor version of the module ABI the module needs: it uses the
+# names and base sizes of ABI 1.6.
+abi_minor = 6
+id = "org.example.hello-c"
+name = "Hello tint (C)"
+version = "0.1.0"
+licence = "MIT OR Apache-2.0"
+kind = "video-stage"
+library = "libobc_module_hello_c.so"
+description = "Example module in C: tints the picture warm, on the CPU"
+
+[[stage]]
+id = "x-example-hello-c"
+slot = "post-composite"
+rank = 100
+device = "cpu"
+frames = ["host"]
+formats = ["nv12"]

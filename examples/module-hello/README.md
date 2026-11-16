@@ -4,16 +4,19 @@ A minimal video module for omarchy-broadcast, written in Rust with
 `obc-module-sdk`. It is built on its own, outside the omarchy-broadcast
 workspace, the way a third-party module is.
 
-It provides one stage, `hello`, which gives the picture a warm tint: on the
-CPU, in place on NV12 frames in host memory, it shifts the colour of every
-pixel towards red and away from blue. Brightness and detail are untouched.
-Its settings appear in the daemon's clients (the bar panel, the CLI) as a
-"Hello module" group:
+It provides one stage, `x-example-hello`, which gives the picture a warm
+tint: on the CPU, in place on NV12 frames in host memory, it shifts the
+colour of every pixel towards red and away from blue. Brightness and detail
+are untouched. The stage id has the vendor form `x-<vendor>-<name>` that a
+stage of a module's own takes (unprefixed ids are the well-known stages of
+the registry). Its settings appear in the daemon's clients (the bar panel,
+the CLI) as a "Hello module" group, `x_example_hello`, the vendor form of
+a group:
 
 | Setting id | Type | Meaning |
 |---|---|---|
-| `effect.hello.enabled` | switch | Turns the stage on and off |
-| `effect.hello.strength` | 0 to 100, step 5, default 50 | How strong the tint is; applies from the next frame |
+| `effect.x_example_hello.enabled` | switch | Turns the stage on and off |
+| `effect.x_example_hello.strength` | 0 to 100, step 5, default 50 | How strong the tint is; applies from the next frame |
 
 ## Files
 
@@ -66,7 +69,7 @@ Start from a copy of this directory:
    `obc_module_sdk::export_module!(YourModule);`.
 
 A module written in another language implements the C ABI of
-`crates/obc-module-abi/include/omarchy_broadcast_module.h` directly.
+`crates/obc-module-abi/include/omarchy_broadcast_module.h` directly; [`module-hello-c`](../module-hello-c/README.md) is this example in C.
 
 ## Licence
 

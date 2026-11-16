@@ -7,7 +7,8 @@
 //! The module shows the surface an audio module implements:
 //!
 //! * [`Module::probe`]: the stage needs nothing, so it is always available;
-//! * [`Module::settings`]: a `hello` group of the `mic` surface, with an
+//! * [`Module::settings`]: an `x_example_hello_audio` group (the vendor
+//!   form of a group) of the `mic` surface, with an
 //!   on/off switch for the stage, a live `gain_db` parameter and the test
 //!   tone's switch and level (load-time);
 //! * [`Instance`]: only `unload`, as an audio-only module, with
@@ -62,17 +63,17 @@ impl Module for HelloAudio {
 
     fn settings(&self) -> SettingsDescription {
         SettingsDescription::new().group(
-            Group::new("hello", "Hello voice")
+            Group::new("x_example_hello_audio", "Hello voice")
                 .surface("mic")
                 .setting(
-                    Setting::bool("mic.hello.enabled", "Voice gain", false)
+                    Setting::bool("mic.x_example_hello_audio.enabled", "Voice gain", false)
                         .stage(STAGE)
                         .role(Role::Enable)
                         .hint("switch"),
                 )
                 .setting(
                     Setting::int(
-                        "mic.hello.gain",
+                        "mic.x_example_hello_audio.gain",
                         "Gain",
                         GAIN_RANGE_DB.0,
                         GAIN_RANGE_DB.1,
@@ -83,20 +84,20 @@ impl Module for HelloAudio {
                     .stage(STAGE)
                     .key(GAIN_KEY)
                     .apply(Apply::Live)
-                    .enabled_when("mic.hello.enabled", Op::Eq, true)
+                    .enabled_when("mic.x_example_hello_audio.enabled", Op::Eq, true)
                     .disabled_reason("Turn on the voice gain to change this")
                     .hint("slider"),
                 )
                 .setting(
-                    Setting::bool("mic.hello.tone", "Test tone", false)
+                    Setting::bool("mic.x_example_hello_audio.tone", "Test tone", false)
                         .stage(STAGE)
                         .key(TONE_KEY)
                         .apply(Apply::Reload)
-                        .enabled_when("mic.hello.enabled", Op::Eq, true),
+                        .enabled_when("mic.x_example_hello_audio.enabled", Op::Eq, true),
                 )
                 .setting(
                     Setting::int(
-                        "mic.hello.tone_level",
+                        "mic.x_example_hello_audio.tone_level",
                         "Tone level",
                         0,
                         100,
@@ -107,7 +108,7 @@ impl Module for HelloAudio {
                     .stage(STAGE)
                     .key(TONE_LEVEL_KEY)
                     .apply(Apply::Reload)
-                    .enabled_when("mic.hello.tone", Op::Eq, true)
+                    .enabled_when("mic.x_example_hello_audio.tone", Op::Eq, true)
                     .disabled_reason("Turn on the test tone to change this"),
                 ),
         )
@@ -263,7 +264,7 @@ mod tests {
             d.groups[0]
                 .settings
                 .iter()
-                .all(|s| s.id.starts_with("mic.hello."))
+                .all(|s| s.id.starts_with("mic.x_example_hello_audio."))
         );
     }
 

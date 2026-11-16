@@ -391,8 +391,11 @@ fn colour_of(req: &ChainRequest<'_>) -> Result<Colour, Error> {
         ColourMatrix::Bt601 => Colour::BT601,
         ColourMatrix::Bt709 => Colour::BT709,
         ColourMatrix::Bt2020 => Colour::BT2020,
-        ColourMatrix::Other(m) => {
-            return Err(Error::unsupported(format!("unknown colour matrix {m}")));
+        other => {
+            return Err(Error::unsupported(format!(
+                "unknown colour matrix {}",
+                other.to_raw()
+            )));
         }
     };
     Ok(Colour::new(k, req.full_range()))
@@ -577,12 +580,9 @@ impl OnnxInstance {
             c.live_on = false;
             c.ema.reset();
             c.has_matte = false;
-            let report = LoadReport {
-                load_ms: t0.elapsed().as_secs_f32() * 1e3,
-                warmup_ms: None,
-                reused_model: true,
-                notice: c.notice.clone(),
-            };
+            let mut report =
+                LoadReport::new(t0.elapsed().as_secs_f32() * 1e3).with_reused_model(true);
+            report.notice = c.notice.clone();
             return Ok((c, report));
         }
         let s = &self.shared;
@@ -631,12 +631,9 @@ impl OnnxInstance {
             );
         }
         let plane = input.0 as usize * input.1 as usize;
-        let report = LoadReport {
-            load_ms: t0.elapsed().as_secs_f32() * 1e3,
-            warmup_ms: Some(started.warmup_ms),
-            reused_model: false,
-            notice: notice.clone(),
-        };
+        let mut report =
+            LoadReport::new(t0.elapsed().as_secs_f32() * 1e3).with_warmup_ms(started.warmup_ms);
+        report.notice = notice.clone();
         let chain = Chain {
             kind: req.kind,
             width: req.width,
@@ -968,7 +965,9 @@ mod tests {
             assert!(s.id.len() <= 48 && s.label.len() <= 48);
         }
         match &g.settings[0].kind {
-            SettingKind::Enum { options, default } => {
+            SettingKind::Enum {
+                options, default, ..
+            } => {
                 assert_eq!(default, "mediapipe-landscape");
                 assert_eq!(
                     options,
@@ -986,7 +985,9 @@ mod tests {
             k => panic!("{k:?}"),
         }
         match &g.settings[1].kind {
-            SettingKind::Enum { options, default } => {
+            SettingKind::Enum {
+                options, default, ..
+            } => {
                 assert_eq!(default, "auto");
                 let values: Vec<&str> = options.iter().map(|(v, _)| v.as_str()).collect();
                 assert_eq!(

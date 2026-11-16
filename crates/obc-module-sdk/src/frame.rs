@@ -5,14 +5,18 @@ use std::ffi::c_void;
 use obc_module_abi::{
     OBC_FORMAT_BGR, OBC_FORMAT_BGRA, OBC_FORMAT_I420, OBC_FORMAT_NV12, OBC_FORMAT_RGB_F32_PLANAR,
     OBC_FORMAT_RGBA, OBC_FRAME_CUDA, OBC_FRAME_DMABUF, OBC_FRAME_FLAG_NEW_SOURCE,
-    OBC_FRAME_FLAG_REPEAT, OBC_FRAME_HOST, OBC_MAX_PLANES, obc_cuda, obc_format, obc_frame,
-    obc_frame_kind, obc_plane,
+    OBC_FRAME_FLAG_REPEAT, OBC_FRAME_HOST, OBC_FRAME_SIZE_1_0, OBC_MAX_PLANES, obc_cuda,
+    obc_format, obc_frame, obc_frame_kind, obc_plane,
 };
 
 use crate::Error;
 
 /// Where a frame's pixels live.
+///
+/// A later release may name more codes, which until then are `Other`: a
+/// `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum FrameKind {
     /// CUDA device memory ([`OBC_FRAME_CUDA`]).
     Cuda,
@@ -58,7 +62,11 @@ impl FrameKind {
 }
 
 /// The pixel format of a frame.
+///
+/// A later release may name more codes, which until then are `Other`: a
+/// `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PixelFormat {
     /// NV12: a Y plane and an interleaved UV plane at half resolution.
     Nv12,
@@ -148,6 +156,10 @@ impl PixelFormat {
 
 /// The CUDA handles of a frame or a chain (`CUcontext`, `CUstream`); both
 /// null for host memory.
+///
+/// It mirrors `obc_cuda`, which is frozen for the life of major 1
+/// (the structure has no `struct_size` and never grows), so it is not
+/// `#[non_exhaustive]`: a module may build one with a struct literal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaHandles {
     /// The `CUcontext`, current on the calling thread during instance
@@ -172,6 +184,11 @@ impl CudaHandles {
     }
 }
 
+// The view reads the whole structure once `struct_size` reaches the base
+// size: sound while no field has been appended. A field appended in a later
+// minor version is read only when it fits in `struct_size`.
+const _: () = assert!(size_of::<obc_frame>() == OBC_FRAME_SIZE_1_0 as usize);
+
 /// A frame the daemon hands to [`crate::Instance::process`], or the
 /// background image of a [`crate::ChainRequest`]: a checked view of an
 /// [`obc_frame`], valid for the duration of the call.
@@ -182,14 +199,13 @@ pub struct Frame<'a> {
 
 impl<'a> Frame<'a> {
     /// A view of `raw`, checked: refused when `struct_size` is smaller than
-    /// this ABI version's frame or `n_planes` is more than
+    /// the frame of ABI 1.0 ([`OBC_FRAME_SIZE_1_0`]) or `n_planes` is more than
     /// [`OBC_MAX_PLANES`].
     pub fn new(raw: &'a obc_frame) -> Result<Self, Error> {
-        if (raw.struct_size as usize) < size_of::<obc_frame>() {
+        if raw.struct_size < OBC_FRAME_SIZE_1_0 {
             return Err(Error::invalid(format!(
-                "frame struct_size {} is smaller than {}",
-                raw.struct_size,
-                size_of::<obc_frame>()
+                "frame struct_size {} is smaller than {OBC_FRAME_SIZE_1_0}",
+                raw.struct_size
             )));
         }
         if raw.n_planes as usize > OBC_MAX_PLANES {
@@ -215,13 +231,13 @@ impl<'a> Frame<'a> {
         // SAFETY: non-null and readable; only the first field is read
         // before the size is known to cover the whole structure.
         let size = unsafe { (*ptr).struct_size } as usize;
-        if size < size_of::<obc_frame>() {
+        if size < OBC_FRAME_SIZE_1_0 as usize {
             return Err(Error::invalid(format!(
-                "frame struct_size {size} is smaller than {}",
-                size_of::<obc_frame>()
+                "frame struct_size {size} is smaller than {OBC_FRAME_SIZE_1_0}"
             )));
         }
-        // SAFETY: the structure is at least as large as `obc_frame`.
+        // SAFETY: at least the base size, the size of `obc_frame` (asserted
+        // above).
         Frame::new(unsafe { &*ptr })
     }
 

@@ -21,12 +21,22 @@
 //!
 //! # Stability
 //!
-//! ABI 1.x is not yet declared stable. Until it is, it may change in
-//! breaking ways, even without a change of the major version: the version
-//! numbers are the host's check, not yet a promise that a module built
-//! against one release works with the next. A module built outside this
-//! repository may need rebuilding, against the matching `obc-module-sdk` or
-//! header, after an update of omarchy-broadcast.
+//! ABI 1 is stable from 1.6. A module library built for ABI 1.N loads and
+//! behaves as documented on every host of ABI 1.M with M >= N; a host
+//! refuses a library of a newer minor version, with a reason that says
+//! what to update. A minor version only appends (structure fields,
+//! vtable entries, constants, manifest keys, JSON keys and types): nothing
+//! is removed from major 1 or changes meaning in it, and a break is a new
+//! major version. Covered: the layouts, offsets and constant values, the
+//! two exported symbols, the required entries, the ownership, lifetime and
+//! call rules below, and the manifest, settings, probe and `_host`
+//! vocabularies of each minor version. Not covered: which thread makes a
+//! call (beyond the threading rules), timing, and anything undocumented.
+//!
+//! ABI 1 is defined for LP64 little-endian targets (x86_64, aarch64): the
+//! sizes and offsets of the header, and the base sizes `OBC_*_SIZE_1_*`,
+//! hold there. The header refuses to compile for a target with another
+//! pointer size or byte order.
 //!
 //! # Conventions
 //!
@@ -36,12 +46,23 @@
 //!   structure, and padding is spelled out as `reserved` fields that must be
 //!   zero, so a reader can tell which fields are present from
 //!   `struct_size` alone. A reader accepts any `struct_size` at least the
-//!   structure's size in ABI 1.0 (its size in this version unless its
-//!   documentation names a field appended since, as [`obc_load_report`]'s
-//!   `notice` of ABI 1.5), larger or smaller than its own, and reads a
-//!   field only when it fits in `struct_size`; it rejects a smaller one
-//!   ([`OBC_ERR_INVALID`]). A writer writes only the fields that fit in the
-//!   reader's `struct_size` when the reader set it (an output structure).
+//!   structure's base size, its size in the minor version that introduced
+//!   it ([`OBC_HOST_SIZE_1_0`], [`OBC_FRAME_SIZE_1_0`],
+//!   [`OBC_CHAIN_REQUEST_SIZE_1_0`], [`OBC_LOAD_REPORT_SIZE_1_0`],
+//!   [`OBC_MODULE_VTABLE_SIZE_1_0`], and for the audio structures of 1.2
+//!   [`OBC_AUDIO_BUFFER_SIZE_1_2`], [`OBC_AUDIO_REQUEST_SIZE_1_2`],
+//!   [`OBC_AUDIO_LOAD_REPORT_SIZE_1_2`]), larger or smaller than its own,
+//!   and reads a field only when it fits in `struct_size`; it rejects a
+//!   smaller one ([`OBC_ERR_INVALID`]). A reader compares with the base
+//!   size, never with its own `sizeof`, which grows when a field is
+//!   appended. A writer writes only the fields that fit in the reader's
+//!   `struct_size` when the reader set it (an output structure).
+//! * The structures without a `struct_size` ([`obc_plane`], [`obc_cuda`],
+//!   [`obc_value`], [`obc_param`], [`obc_timing`], [`obc_status_value`])
+//!   sit in arrays or inside other structures: their size and layout are
+//!   frozen for the life of major 1, and growth is by a new structure. A
+//!   new value kind may use the 8-byte payload of [`obc_value`] as a
+//!   pointer and its `reserved0` as a length.
 //! * A boolean is a `uint8_t`, 0 for false and 1 for true; a reader takes
 //!   any non-zero value as true. (C's `bool` is not used across the
 //!   boundary: a byte other than 0 or 1 in a Rust `bool` is undefined
@@ -60,21 +81,74 @@
 //!   object (module or instance).
 //! * Every function pointer is declared nullable for safety across the
 //!   boundary; the documentation of each says whether a module must provide
-//!   it. The host refuses a vtable that lacks a required one.
+//!   it. The host refuses a vtable that lacks a required one. The required
+//!   set depends on the module's kind (see [`obc_module_vtable`]).
+//!
+//! # Version gating
+//!
+//! The host presents itself to a module as a host of the module's declared
+//! minor version (what `obc_module_abi_version` returns): it sets no flag
+//! bit, passes no constant (frame kind, pixel format, value kind, matrix,
+//! chroma siting, audio format), fills no field, sets no `struct_size`
+//! larger than that version's, sends no settings type or status value and
+//! calls no vtable entry that the declared minor version does not define,
+//! whatever the size of the module's vtable says. A module, for its part:
+//!
+//! * ignores parameters whose key it does not know, and the members of
+//!   `_host` it does not know;
+//! * accepts a `struct_size` larger than its own;
+//! * answers a constant it does not know with [`OBC_ERR_UNSUPPORTED`].
+//!
+//! A manifest may say the lowest minor version the module needs
+//! (`abi_minor = N`, 0 when absent): a host of an older minor lists such a
+//! module as needing module ABI 1.N, and a host refuses a library built for
+//! a minor version lower than its manifest's `abi_minor`.
 //!
 //! # Threading
 //!
 //! The host serialises the calls on one module object, and the calls on one
-//! instance (they come from the streaming thread). Calls on the module and
-//! on its instances may run concurrently on different threads, as may calls
-//! on different instances. [`obc_host::log`] may be called from any thread.
+//! instance: two calls on one instance never run at the same time. They may
+//! come from different threads, one after the other: a module assumes no
+//! thread affinity (a chain may be loaded on a worker thread and run on
+//! the streaming thread, and a second instance may load while the first
+//! runs). Calls on the module and on its instances may run concurrently on
+//! different threads, as may calls on different instances.
+//! [`obc_host::log`] may be called from any thread.
 //!
-//! # CUDA frames
+//! A module may run threads of its own. The module stops (joins) the
+//! threads of an instance before `instance_destroy` returns, and those of
+//! the module object before `destroy` returns: no code of the module runs
+//! after that, except what a later call starts. From such a thread a
+//! module calls only [`obc_host::log`] of the host's callbacks, unless the
+//! documentation of a callback says otherwise.
+//!
+//! # GPU contexts
 //!
 //! For [`OBC_FRAME_CUDA`] frames the host makes [`obc_cuda::context`]
-//! current on the calling thread around every instance call. A module never
-//! creates a CUDA context of its own, and never makes one current. The
-//! audio kind is the one exception (see below).
+//! current on the calling thread during every instance call. A module
+//! never creates a CUDA context of its own for those frames, and never
+//! touches the frames' context beyond enqueuing work on the chain's
+//! stream. A module whose runtime needs the device's primary context (a
+//! TensorRT or ONNX Runtime session, for one) may let the runtime hold it
+//! while a GPU session of its own lives, on these terms:
+//!
+//! * it counts its sessions, and releases (resets) the primary context
+//!   when the last one ends;
+//! * it restores the context that was current on the calling thread
+//!   before it returns;
+//! * it makes no GPU call in `init`, `probe` or `check` (which must stay
+//!   cheap and must not wake a suspended GPU), nor at all when the
+//!   configuration says `_host.cuda = false`.
+//!
+//! An `audio-filter` module runs in a process of its own and may create a
+//! GPU context of its own (see below).
+//!
+//! # The process
+//!
+//! A module assumes nothing of the process that hosts it (the video
+//! daemon, the audio worker, or a host of its own in a later release): it
+//! sets no signal handler, changes no environment variable, working
+//! directory or locale, does not fork, and does not exit the process.
 //!
 //! # Audio (since ABI 1.2)
 //!
@@ -101,10 +175,29 @@
 //! * The host fails a stage open after a run of consecutive overruns
 //!   (blocks that missed their deadline; 50 by default, half a second of
 //!   10 ms blocks), and reports it.
-//! * A module of the kind still sets the required video entries
-//!   (`instance_load`, `instance_process`): they may fail with
-//!   [`OBC_ERR_UNSUPPORTED`]. The host refuses an `audio-filter` module
-//!   whose vtable lacks the audio entries.
+//! * The host refuses an `audio-filter` module whose vtable lacks the audio
+//!   entries. The video entries `instance_load` and `instance_process` are
+//!   not required of the kind: since ABI 1.6 a host accepts them null (an
+//!   older host requires them set, so a module that supports hosts of 1.5
+//!   or older sets them to stubs that fail with [`OBC_ERR_UNSUPPORTED`]).
+//!
+//! # The `background` stage
+//!
+//! The provider of the well-known `background` stage makes the matte and
+//! composites the picture itself: the host hands it the camera frame and
+//! takes the finished picture back. The host passes it the load-time
+//! parameter [`OBC_BACKGROUND_PARAM_MODE`] (a string,
+//! [`OBC_BACKGROUND_MODE_BLUR`] or [`OBC_BACKGROUND_MODE_REPLACE`]; a chain
+//! without the effect has no `background` stage) and, with every frame
+//! while the chain has the stage, the live parameter
+//! [`OBC_BACKGROUND_PARAM_BLUR_STRENGTH`] (a float from 0.0 to 1.0, under
+//! either mode; a module ignores it under replace). Under replace the
+//! background is the request's image ([`obc_chain_request::background`],
+//! a host BGR frame of the chain's output size), or a per-frame background
+//! (below). Module-side compositing is the contract of the stage for the
+//! life of major 1. A later minor version may add, beside it, an optional
+//! contract in which the module returns the matte only and the host
+//! composites; a module that does not declare it is not affected.
 //!
 //! # The per-frame background (since ABI 1.4)
 //!
@@ -138,6 +231,36 @@
 //! A module of ABI 1.3 or older, or one that leaves the entry null, is
 //! never called: the host shows the video background as a still (the
 //! load-time image), and reports that it does.
+//!
+//! # Namespaces
+//!
+//! * **Stage ids** are one namespace across modules: two modules that
+//!   declare one id are two providers of one function. The well-known ids
+//!   (the registry) are `background`, `enhance`, `frame-generation`,
+//!   `denoise`, `relight`, `hdr`, `eye-contact`, `auto-frame`,
+//!   `mic-denoise`, `mic-dereverb`, `mic-enhance`, `mic-focus` and
+//!   `mic-bandwidth`. Every id without the private prefix is the
+//!   registry's, present or future. A stage of a module's own has the
+//!   vendor form `x-<vendor>-<name>` ([`OBC_PRIVATE_STAGE_PREFIX`];
+//!   `mic-x-<vendor>-<name>` for an audio stage, whose ids start with
+//!   `mic-`), within the 32 bytes of a stage id.
+//! * **Settings groups** likewise: the well-known groups are those of the
+//!   registry's stages (`cutout`, `video`, `lighting`, `eye_contact`,
+//!   `auto_frame`, `onnx` for video; `noise`, `echo`, `focus`,
+//!   `bandwidth`, `voice`, `cpu` for audio), and the daemon's own
+//!   (`background`, and `input` for audio). A group of a module's own has
+//!   the vendor form `x_<vendor>_<name>` ([`OBC_PRIVATE_GROUP_PREFIX`]; a
+//!   group id is one setting-id segment, so `_` and not `-`).
+//! * A host warns about a module that uses an id of neither form, and
+//!   still loads it.
+//! * **Configuration keys** of a module's table (`[module."<id>"]`) that
+//!   start with `_` ([`OBC_RESERVED_CONFIG_PREFIX`]) are the host's:
+//!   `_host` ([`OBC_HOST_CONFIG_KEY`]) carries facts of the host, and a
+//!   host passes no other key starting with `_` that it does not define.
+//! * **Status value names** that start with `obc.`
+//!   ([`OBC_RESERVED_VALUE_PREFIX`]), and any later metadata or event key
+//!   that does, are the host's: a host drops such a value a module
+//!   reports.
 
 // The names are the C names of the header, as in a `-sys` crate.
 #![allow(non_camel_case_types)]
@@ -147,6 +270,13 @@ use std::marker::{PhantomData, PhantomPinned};
 
 /// The major version of this ABI. A change of the major version is
 /// incompatible: the host refuses a module built for another major version.
+///
+/// ABI 1 is stable from 1.6: a module built for ABI 1.N loads and behaves
+/// as documented on every host of ABI 1.M with M >= N. It is defined for
+/// LP64 little-endian targets (x86_64, aarch64); this header refuses to
+/// compile for another pointer size or byte order. The structures without
+/// a `struct_size` (`obc_plane`, `obc_cuda`, `obc_value`, `obc_param`,
+/// `obc_timing`, `obc_status_value`) are frozen for the life of major 1.
 pub const OBC_MODULE_ABI_MAJOR: u32 = 1;
 
 /// The minor version of this ABI. A minor version only adds (structure
@@ -163,13 +293,35 @@ pub const OBC_MODULE_ABI_MAJOR: u32 = 1;
 ///   `instance_set_background` (see the crate documentation).
 /// * 1.5 adds the load's notice: [`obc_load_report::notice`], the first
 ///   field appended to a structure ([`OBC_LOAD_REPORT_SIZE_1_0`]).
-pub const OBC_MODULE_ABI_MINOR: u32 = 5;
+/// * 1.6, the release from which ABI 1 is stable, adds no capability: the
+///   base sizes (`OBC_*_SIZE_1_*`), the names of the `background` stage's
+///   parameters and of the namespaces, the required entries per module
+///   kind (an `audio-filter` module may leave the video entries null), and
+///   the rules of version gating, threads, GPU contexts and the process.
+///
+/// **Version gating.** The host presents itself to a module as a host of
+/// the module's declared minor version: it sets no flag bit, passes no
+/// constant (frame kind, pixel format, value kind, matrix, chroma siting,
+/// audio format), fills no field, sets no `struct_size` larger than that
+/// version's, sends no settings type or status value and calls no vtable
+/// entry that the declared version does not define, whatever the size of
+/// the module's vtable says. A module, for its part, ignores parameters
+/// whose key it does not know and unknown members of `_host`, accepts a
+/// `struct_size` larger than its own, and answers a constant it does not
+/// know with [`OBC_ERR_UNSUPPORTED`].
+///
+/// A manifest may say the lowest minor version the module needs
+/// (`abi_minor = N`, 0 when absent): a host of an older minor version lists
+/// the module as needing module ABI 1.N, and a host refuses a library built
+/// for a minor version lower than its manifest's `abi_minor`.
+pub const OBC_MODULE_ABI_MINOR: u32 = 6;
 
 /// The packed ABI version this crate describes: `major << 16 | minor`
 /// ([`obc_module_abi_pack`]).
 pub const OBC_MODULE_ABI_VERSION: u32 = (OBC_MODULE_ABI_MAJOR << 16) | OBC_MODULE_ABI_MINOR;
 
-/// The name of the exported [`obc_module_abi_version_fn`].
+/// The name of the exported [`obc_module_abi_version_fn`]. The name and the
+/// signature of this symbol are the same in every major version.
 pub const OBC_MODULE_ABI_VERSION_SYMBOL: &str = "obc_module_abi_version";
 
 /// The name of the exported [`obc_module_entry_fn`].
@@ -192,6 +344,10 @@ pub const fn obc_module_abi_minor(version: u32) -> u16 {
 
 /// The type of the exported `obc_module_abi_version` symbol: returns the
 /// packed ABI version the module was built against. Side-effect free.
+///
+/// Its name and its signature are the same in every major version of the
+/// ABI, so that a host can tell a library of another major version before
+/// it calls anything else of it.
 pub type obc_module_abi_version_fn = unsafe extern "C" fn() -> u32;
 
 /// The type of the exported `obc_module_entry` symbol. `host` stays valid,
@@ -274,6 +430,10 @@ pub const OBC_LOG_INFO: obc_log_level = 3;
 pub const OBC_LOG_DEBUG: obc_log_level = 4;
 /// Very verbose detail.
 pub const OBC_LOG_TRACE: obc_log_level = 5;
+
+/// `sizeof(obc_host)` in ABI 1.0: the smallest `struct_size` a module
+/// accepts.
+pub const OBC_HOST_SIZE_1_0: u32 = 24;
 
 /// What the host gives a module at [`obc_module_entry_fn`].
 #[repr(C)]
@@ -398,6 +558,10 @@ pub struct obc_cuda {
     /// The `CUstream` to enqueue work on.
     pub stream: *mut c_void,
 }
+
+/// `sizeof(obc_frame)` in ABI 1.0: the smallest `struct_size` a reader
+/// accepts.
+pub const OBC_FRAME_SIZE_1_0: u32 = 160;
 
 /// A frame handed to `instance_process`, or the background image of a
 /// chain request. The structure only describes the frame: its pixels belong
@@ -557,6 +721,10 @@ pub const OBC_CHROMA_SITING_JPEG: obc_chroma_siting = 2;
 /// Co-sited with the top-left luma sample in both directions.
 pub const OBC_CHROMA_SITING_COSITED: obc_chroma_siting = 3;
 
+/// `sizeof(obc_chain_request)` in ABI 1.0: the smallest `struct_size` a
+/// module accepts.
+pub const OBC_CHAIN_REQUEST_SIZE_1_0: u32 = 104;
+
 /// What `instance_load` loads: a chain of the module's stages, in order,
 /// for one frame geometry.
 #[repr(C)]
@@ -612,15 +780,23 @@ pub struct obc_chain_request {
 /// reader accepts.
 pub const OBC_LOAD_REPORT_SIZE_1_0: u32 = 16;
 
+/// `sizeof(obc_load_report)` in ABI 1.5, which appended
+/// [`obc_load_report::notice`]: the `struct_size` a host of 1.5 or later
+/// passes a module of 1.5 or later, and the smallest that has room for
+/// `notice`.
+pub const OBC_LOAD_REPORT_SIZE_1_5: u32 = 24;
+
 /// What `instance_load` reports. The host sets `struct_size` and zeroes the
 /// rest; the module fills in the fields that fit in `struct_size`. A host of
-/// ABI 1.4 or older passes [`OBC_LOAD_REPORT_SIZE_1_0`], so a module never
-/// writes `notice` for it; a module of ABI 1.4 or older never writes it, so
-/// the host reads the null it set.
+/// ABI 1.4 or older passes [`OBC_LOAD_REPORT_SIZE_1_0`], and so does a host
+/// of 1.6 or later to a module of ABI 1.4 or older (version gating), so a
+/// module never writes `notice` for it; a module of ABI 1.4 or older never
+/// writes it, so the host reads the null it set.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct obc_load_report {
-    /// `sizeof(obc_load_report)` as the host was built.
+    /// `sizeof(obc_load_report)` of the ABI version the host presents to
+    /// the module (see [`OBC_MODULE_ABI_MINOR`]): at most its own.
     pub struct_size: u32,
     /// How long the load took, in milliseconds.
     pub load_ms: f32,
@@ -661,6 +837,8 @@ pub struct obc_status_value {
     /// The stage id the value belongs to. NUL-terminated.
     pub stage: *const c_char,
     /// The name of the value, unique within the stage. NUL-terminated.
+    /// Names starting with `obc.` are the host's: a host drops a value of
+    /// such a name.
     pub name: *const c_char,
     /// The value.
     pub value: f64,
@@ -694,6 +872,10 @@ pub const OBC_AUDIO_FLAGS_ALL: u32 = OBC_AUDIO_FLAG_NEW_SOURCE | OBC_AUDIO_FLAG_
 
 /// The most channels an audio buffer has.
 pub const OBC_MAX_AUDIO_CHANNELS: usize = 8;
+
+/// `sizeof(obc_audio_buffer)` in ABI 1.2, which introduced it: the
+/// smallest `struct_size` a reader accepts.
+pub const OBC_AUDIO_BUFFER_SIZE_1_2: u32 = 104;
 
 /// A block of audio handed to `audio_instance_process`, as input or
 /// output. Since ABI 1.2. The structure only describes the block: its
@@ -732,6 +914,10 @@ pub struct obc_audio_buffer {
     pub voice_probability: f32,
 }
 
+/// `sizeof(obc_audio_request)` in ABI 1.2, which introduced it: the
+/// smallest `struct_size` a module accepts.
+pub const OBC_AUDIO_REQUEST_SIZE_1_2: u32 = 56;
+
 /// What `audio_instance_load` loads: a chain of the module's audio stages,
 /// in order, for one block format. Since ABI 1.2.
 #[repr(C)]
@@ -765,6 +951,10 @@ pub struct obc_audio_request {
     pub n_params: usize,
 }
 
+/// `sizeof(obc_audio_load_report)` in ABI 1.2, which introduced it: the
+/// smallest `struct_size` a module accepts.
+pub const OBC_AUDIO_LOAD_REPORT_SIZE_1_2: u32 = 24;
+
 /// What `audio_instance_load` reports. Since ABI 1.2. The host sets
 /// `struct_size`, sets `frame_samples` to the request's, `warmup_ms` to -1
 /// and zeroes the rest; the module fills in the fields that fit in
@@ -797,11 +987,59 @@ pub struct obc_audio_load_report {
 // The vtable
 // ---------------------------------------------------------------------------
 
+/// `sizeof(obc_module_vtable)` in ABI 1.0 (it ends after `check`): the
+/// smallest `struct_size` a host accepts.
+pub const OBC_MODULE_VTABLE_SIZE_1_0: u32 = 136;
+
+/// The size of the vtable of ABI 1.2, which appends `audio_instance_load`
+/// and `audio_instance_process` (1.1 appends no entry).
+pub const OBC_MODULE_VTABLE_SIZE_1_2: u32 = 152;
+
+/// The size of the vtable of ABI 1.3, which appends
+/// `instance_status_values`.
+pub const OBC_MODULE_VTABLE_SIZE_1_3: u32 = 160;
+
+/// The size of the vtable of ABI 1.4, which appends
+/// `instance_set_background` (1.5 and 1.6 append no entry).
+pub const OBC_MODULE_VTABLE_SIZE_1_4: u32 = 168;
+
 /// The module's entry points, returned by [`obc_module_entry_fn`].
 ///
 /// Every entry is declared nullable; those marked required must be set. A
 /// later minor version only appends entries, so a host reads an entry only
-/// when it fits in `struct_size`.
+/// when it fits in `struct_size` and the module's declared minor version
+/// defines it (see [`OBC_MODULE_ABI_MINOR`]).
+///
+/// **Required entries per kind.** `init`, `probe`, `describe_settings`,
+/// `instance_create`, `instance_destroy`, `instance_reset_temporal`,
+/// `instance_unload`, `last_error`, `instance_last_error` and `destroy`
+/// are required of every module. `instance_load` and `instance_process` are
+/// required of a `video-stage` module; `audio_instance_load` and
+/// `audio_instance_process` of an `audio-filter` module. A module of one
+/// kind may leave the entries of another kind null (since ABI 1.6; a host
+/// of 1.5 or older requires `instance_load` and `instance_process` of every
+/// module). A kind added later binds its own entries only.
+///
+/// **Threads.** Calls on one instance are serialised (never concurrent)
+/// and may come from different threads: there is no thread affinity. For
+/// CUDA frames the frames' context is current on the calling thread during
+/// the call. A module may run threads of its own; it stops (joins) them
+/// before `instance_destroy` (an instance's) or `destroy` (the module
+/// object's) returns, and from them only `obc_host::log` may be called, unless the
+/// documentation of a callback says otherwise.
+///
+/// **GPU contexts.** A module never creates a CUDA context for the host's
+/// frames and never touches their context. Its runtime may hold the
+/// device's primary context while a GPU session of the module lives, if
+/// the module counts its sessions, resets the primary context when the
+/// last one ends, restores the context current on the calling thread
+/// before it returns, and makes no GPU call in `init`, `probe` or `check`,
+/// nor at all under `_host.cuda = false`. An `audio-filter` module, in a
+/// process of its own, may create a context in `audio_instance_load`.
+///
+/// **The process.** A module assumes nothing of the process that hosts
+/// it: it sets no signal handler, changes no environment variable, working
+/// directory or locale, does not fork and does not exit.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct obc_module_vtable {
@@ -837,7 +1075,8 @@ pub struct obc_module_vtable {
     >,
     /// Required. Releases an instance (unloading it first if needed).
     pub instance_destroy: Option<unsafe extern "C" fn(instance: *mut obc_instance)>,
-    /// Required. Loads a chain of the module's stages. A load on a loaded
+    /// Required of a `video-stage` module (null allowed for another kind
+    /// since ABI 1.6). Loads a chain of the module's stages. A load on a loaded
     /// instance is a **switch** when the request keeps the frames of the
     /// loaded chain (the same input kind, input and output formats and
     /// sizes, matrix, chroma siting, range and CUDA handles: only stages,
@@ -857,7 +1096,8 @@ pub struct obc_module_vtable {
             out_report: *mut obc_load_report,
         ) -> obc_status,
     >,
-    /// Required. Enqueues one frame through the loaded chain. `out` equals
+    /// Required of a `video-stage` module (null allowed for another kind
+    /// since ABI 1.6). Enqueues one frame through the loaded chain. `out` equals
     /// `in` only for in-place chains. The `n_live` per-frame parameters
     /// (`live` may be null when 0) apply from this frame on.
     pub instance_process: Option<
@@ -891,10 +1131,13 @@ pub struct obc_module_vtable {
             n: *mut usize,
         ) -> obc_status,
     >,
-    /// Nullable (null: nothing to do). The stream is about to stop for a
-    /// while: release what can be rebuilt quickly.
+    /// Reserved, nullable (a module leaves it null). No host of ABI 1.x
+    /// calls it, unless a later minor version defines it, and then only for
+    /// a module that declares that version. (Meant for: the stream is about
+    /// to stop for a while, release what can be rebuilt quickly.)
     pub instance_park: Option<unsafe extern "C" fn(instance: *mut obc_instance) -> obc_status>,
-    /// Nullable (null: nothing to do). The stream resumes after a park.
+    /// Reserved, nullable, as `instance_park` (meant for: the stream
+    /// resumes after a park).
     pub instance_unpark: Option<unsafe extern "C" fn(instance: *mut obc_instance) -> obc_status>,
     /// Required. The reason of the last failed call on `module`, valid
     /// until the next call on it. When `module` is null: the reason of the
@@ -999,6 +1242,97 @@ pub struct obc_module_vtable {
         ) -> obc_status,
     >,
 }
+
+// ---------------------------------------------------------------------------
+// Names (since ABI 1.6)
+// ---------------------------------------------------------------------------
+//
+// cbindgen emits no string constants: the header defines these names in
+// the block that `cbindgen.toml` adds after the includes, and the header
+// test checks that the two agree.
+
+/// The well-known stage whose provider makes the matte and composites the
+/// picture (see the crate documentation).
+pub const OBC_STAGE_BACKGROUND: &str = "background";
+
+/// The load-time parameter of the `background` stage that says which
+/// effect it composites: a string, [`OBC_BACKGROUND_MODE_BLUR`] or
+/// [`OBC_BACKGROUND_MODE_REPLACE`].
+pub const OBC_BACKGROUND_PARAM_MODE: &str = "mode";
+
+/// The `mode` that blurs the room behind the person.
+pub const OBC_BACKGROUND_MODE_BLUR: &str = "blur";
+
+/// The `mode` that replaces the room behind the person with the
+/// background image (or the per-frame background).
+pub const OBC_BACKGROUND_MODE_REPLACE: &str = "replace";
+
+/// The live parameter of the `background` stage with the blur strength: a
+/// float from 0.0 to 1.0, with every frame while the chain has the stage.
+pub const OBC_BACKGROUND_PARAM_BLUR_STRENGTH: &str = "blur_strength";
+
+/// The prefix of a private stage id, of the vendor form
+/// `x-<vendor>-<name>` (`mic-x-<vendor>-<name>` for an audio stage).
+pub const OBC_PRIVATE_STAGE_PREFIX: &str = "x-";
+
+/// The prefix of a private settings group id, of the vendor form
+/// `x_<vendor>_<name>`.
+pub const OBC_PRIVATE_GROUP_PREFIX: &str = "x_";
+
+/// The prefix of the keys of a module's configuration table that are the
+/// host's.
+pub const OBC_RESERVED_CONFIG_PREFIX: &str = "_";
+
+/// The key of a module's configuration with the facts of the host (a JSON
+/// object; a module ignores the members it does not know).
+pub const OBC_HOST_CONFIG_KEY: &str = "_host";
+
+/// The prefix of the status value names (and of any later metadata or
+/// event key) that are the host's.
+pub const OBC_RESERVED_VALUE_PREFIX: &str = "obc.";
+
+/// The well-known stage ids (the registry) of this ABI version; every id
+/// without [`OBC_PRIVATE_STAGE_PREFIX`] (after the `mic-` of an audio stage)
+/// is the registry's, present or future.
+pub const OBC_WELL_KNOWN_STAGES: [&str; 13] = [
+    "background",
+    "enhance",
+    "frame-generation",
+    "denoise",
+    "relight",
+    "hdr",
+    "eye-contact",
+    "auto-frame",
+    "mic-denoise",
+    "mic-dereverb",
+    "mic-enhance",
+    "mic-focus",
+    "mic-bandwidth",
+];
+
+/// The well-known settings group ids of a video module of this ABI
+/// version (`background`, the daemon's own, included).
+pub const OBC_WELL_KNOWN_VIDEO_GROUPS: [&str; 7] = [
+    "background",
+    "cutout",
+    "video",
+    "lighting",
+    "eye_contact",
+    "auto_frame",
+    "onnx",
+];
+
+/// The well-known settings group ids of an audio module of this ABI
+/// version (`input`, the daemon's own, included).
+pub const OBC_WELL_KNOWN_AUDIO_GROUPS: [&str; 7] = [
+    "input",
+    "noise",
+    "echo",
+    "focus",
+    "bandwidth",
+    "voice",
+    "cpu",
+];
 
 // ---------------------------------------------------------------------------
 // Constructors
@@ -1197,8 +1531,8 @@ mod tests {
 
     #[test]
     fn version_packing() {
-        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0005);
-        assert_eq!(obc_module_abi_pack(1, 5), OBC_MODULE_ABI_VERSION);
+        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0006);
+        assert_eq!(obc_module_abi_pack(1, 6), OBC_MODULE_ABI_VERSION);
         assert_eq!(obc_module_abi_pack(2, 7), 0x0002_0007);
         assert_eq!(obc_module_abi_major(0x0002_0007), 2);
         assert_eq!(obc_module_abi_minor(0x0002_0007), 7);
@@ -1462,6 +1796,88 @@ mod tests {
         assert_eq!(offset_of!(obc_audio_load_report, latency_samples), 16);
         assert_eq!(offset_of!(obc_audio_load_report, reused_model), 20);
         assert_eq!(offset_of!(obc_audio_load_report, reserved0), 21);
+    }
+
+    /// The base sizes are the sizes of the structures in the minor version
+    /// that introduced them, and the vtable sizes end at the last entry of
+    /// each minor version: fixed for the life of major 1.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn base_sizes_are_pinned() {
+        let entry = size_of::<usize>();
+        assert_eq!(OBC_HOST_SIZE_1_0 as usize, size_of::<obc_host>());
+        assert_eq!(OBC_FRAME_SIZE_1_0 as usize, size_of::<obc_frame>());
+        assert_eq!(
+            OBC_CHAIN_REQUEST_SIZE_1_0 as usize,
+            size_of::<obc_chain_request>()
+        );
+        assert_eq!(
+            OBC_LOAD_REPORT_SIZE_1_0 as usize,
+            offset_of!(obc_load_report, notice)
+        );
+        assert_eq!(
+            OBC_LOAD_REPORT_SIZE_1_5 as usize,
+            size_of::<obc_load_report>()
+        );
+        assert_eq!(
+            OBC_AUDIO_BUFFER_SIZE_1_2 as usize,
+            size_of::<obc_audio_buffer>()
+        );
+        assert_eq!(
+            OBC_AUDIO_REQUEST_SIZE_1_2 as usize,
+            size_of::<obc_audio_request>()
+        );
+        assert_eq!(
+            OBC_AUDIO_LOAD_REPORT_SIZE_1_2 as usize,
+            size_of::<obc_audio_load_report>()
+        );
+        assert_eq!(
+            OBC_MODULE_VTABLE_SIZE_1_0 as usize,
+            offset_of!(obc_module_vtable, check) + entry
+        );
+        assert_eq!(
+            OBC_MODULE_VTABLE_SIZE_1_2 as usize,
+            offset_of!(obc_module_vtable, audio_instance_process) + entry
+        );
+        assert_eq!(
+            OBC_MODULE_VTABLE_SIZE_1_3 as usize,
+            offset_of!(obc_module_vtable, instance_status_values) + entry
+        );
+        assert_eq!(
+            OBC_MODULE_VTABLE_SIZE_1_4 as usize,
+            offset_of!(obc_module_vtable, instance_set_background) + entry
+        );
+        assert_eq!(
+            OBC_MODULE_VTABLE_SIZE_1_4 as usize,
+            size_of::<obc_module_vtable>()
+        );
+    }
+
+    #[test]
+    fn names_are_pinned() {
+        assert_eq!(OBC_STAGE_BACKGROUND, "background");
+        assert_eq!(
+            [
+                OBC_BACKGROUND_PARAM_MODE,
+                OBC_BACKGROUND_MODE_BLUR,
+                OBC_BACKGROUND_MODE_REPLACE,
+                OBC_BACKGROUND_PARAM_BLUR_STRENGTH
+            ],
+            ["mode", "blur", "replace", "blur_strength"]
+        );
+        assert_eq!(
+            [
+                OBC_PRIVATE_STAGE_PREFIX,
+                OBC_PRIVATE_GROUP_PREFIX,
+                OBC_RESERVED_CONFIG_PREFIX,
+                OBC_HOST_CONFIG_KEY,
+                OBC_RESERVED_VALUE_PREFIX
+            ],
+            ["x-", "x_", "_", "_host", "obc."]
+        );
+        assert!(OBC_WELL_KNOWN_STAGES.contains(&OBC_STAGE_BACKGROUND));
+        assert!(OBC_WELL_KNOWN_VIDEO_GROUPS.contains(&"background"));
+        assert!(OBC_WELL_KNOWN_AUDIO_GROUPS.contains(&"input"));
     }
 
     #[test]

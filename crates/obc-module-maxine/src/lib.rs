@@ -542,13 +542,18 @@ fn hdr_error(e: BackendError) -> Error {
     Error::stage(HDR, e.to_string())
 }
 
-fn value(v: &Value<'_>) -> BackendValue {
-    match v {
+/// The backend's value of `v`; `None` for a variant a later SDK adds
+/// (`Value` is non-exhaustive). The SDK answers a value kind it does not
+/// know with `OBC_ERR_UNSUPPORTED` before the module sees it, so this SDK
+/// never yields one.
+fn value(v: &Value<'_>) -> Option<BackendValue> {
+    Some(match v {
         Value::Bool(b) => BackendValue::Bool(*b),
         Value::Int(i) => BackendValue::Int(*i),
         Value::Float(f) => BackendValue::Float(*f),
         Value::Str(s) => BackendValue::Str((*s).to_string()),
-    }
+        _ => return None,
+    })
 }
 
 fn gpu_of(handles: obc_module_sdk::CudaHandles) -> Result<GpuContext, Error> {
@@ -689,9 +694,9 @@ fn effect_params(params: &[Param<'_>]) -> Result<BTreeMap<StageId, Params>, Erro
             }
         }
         let stage = StageId::new(p.stage).map_err(|e| Error::invalid(e.to_string()))?;
-        out.entry(stage)
-            .or_default()
-            .insert(p.key.to_string(), value(&p.value));
+        if let Some(v) = value(&p.value) {
+            out.entry(stage).or_default().insert(p.key.to_string(), v);
+        }
     }
     Ok(out)
 }
@@ -838,12 +843,9 @@ impl MaxineInstance {
             unreachable!("set above");
         };
         let report = backend.load(&gpu, &load).map_err(module_error)?;
-        Ok(LoadReport {
-            load_ms: report.load_ms as f32,
-            warmup_ms: report.warmup_ms.map(|w| w as f32),
-            reused_model: report.reused_model,
-            notice: None,
-        })
+        Ok(LoadReport::new(report.load_ms as f32)
+            .with_warmup_ms(report.warmup_ms.map(|w| w as f32))
+            .with_reused_model(report.reused_model))
     }
 
     fn load_enhance(
@@ -877,8 +879,11 @@ impl MaxineInstance {
             ChromaSiting::Mpeg2 => EnhanceSiting::Cosited,
             ChromaSiting::Jpeg => EnhanceSiting::Interstitial,
             ChromaSiting::Cosited => EnhanceSiting::TopLeft,
-            ChromaSiting::Other(c) => {
-                return Err(Error::unsupported(format!("unknown chroma siting {c}")));
+            other => {
+                return Err(Error::unsupported(format!(
+                    "unknown chroma siting {}",
+                    other.to_raw()
+                )));
             }
         };
         let enhance = EnhanceRequest {
@@ -907,12 +912,9 @@ impl MaxineInstance {
         let report = vsr
             .load_with(&gpu, &enhance, method)
             .map_err(module_error)?;
-        Ok(LoadReport {
-            load_ms: report.load_ms as f32,
-            warmup_ms: report.warmup_ms.map(|w| w as f32),
-            reused_model: report.reused_model,
-            notice: None,
-        })
+        Ok(LoadReport::new(report.load_ms as f32)
+            .with_warmup_ms(report.warmup_ms.map(|w| w as f32))
+            .with_reused_model(report.reused_model))
     }
 
     /// Loads frame generation for the request's frames, unless the loaded
@@ -945,15 +947,7 @@ impl MaxineInstance {
         let report = vfg
             .load(&gpu, width, height, colour)
             .map_err(framegen_error)?;
-        Ok(Some((
-            vfg,
-            LoadReport {
-                load_ms: report.load_ms as f32,
-                warmup_ms: None,
-                reused_model: false,
-                notice: None,
-            },
-        )))
+        Ok(Some((vfg, LoadReport::new(report.load_ms as f32))))
     }
 
     /// Loads the HDR look for the request's frames, unless the loaded one
@@ -984,15 +978,7 @@ impl MaxineInstance {
         }
         let mut hdr = self.truehdr.create_truehdr().map_err(hdr_error)?;
         let report = hdr.load(&gpu, width, height, colour).map_err(hdr_error)?;
-        Ok(Some((
-            hdr,
-            LoadReport {
-                load_ms: report.load_ms as f32,
-                warmup_ms: None,
-                reused_model: false,
-                notice: None,
-            },
-        )))
+        Ok(Some((hdr, LoadReport::new(report.load_ms as f32))))
     }
 
     fn unload_chain(&mut self) {
@@ -1148,12 +1134,7 @@ impl Instance for MaxineInstance {
         let result = if others.is_empty() {
             self.unload_chain();
             self.chain = Chain::Passthrough;
-            Ok(LoadReport {
-                load_ms: 0.0,
-                warmup_ms: None,
-                reused_model: framegen.is_none() && hdr.is_none(),
-                notice: None,
-            })
+            Ok(LoadReport::new(0.0).with_reused_model(framegen.is_none() && hdr.is_none()))
         } else if req.has_stage(StageId::ENHANCE.as_str()) {
             self.load_enhance(req, gpu)
         } else {
@@ -1219,10 +1200,12 @@ impl Instance for MaxineInstance {
                 continue;
             }
             let stage = StageId::new(p.stage).map_err(|e| Error::invalid(e.to_string()))?;
-            self.live
-                .entry(stage)
-                .or_default()
-                .insert(p.key.to_string(), value(&p.value));
+            if let Some(v) = value(&p.value) {
+                self.live
+                    .entry(stage)
+                    .or_default()
+                    .insert(p.key.to_string(), v);
+            }
         }
         if self.vfg_in_chain {
             self.process_framegen(&gpu, input, output)

@@ -528,13 +528,13 @@ fn request_flags(req: &ChainRequest<'_>) -> Result<u32, String> {
         ColourMatrix::Bt601 => ffi::NVCV_601,
         ColourMatrix::Bt709 => ffi::NVCV_709,
         ColourMatrix::Bt2020 => ffi::NVCV_2020,
-        ColourMatrix::Other(c) => return Err(format!("unknown colour matrix {c}")),
+        other => return Err(format!("unknown colour matrix {}", other.to_raw())),
     };
     let siting = match req.chroma_siting() {
         ChromaSiting::Mpeg2 => ffi::NVCV_CHROMA_COSITED,
         ChromaSiting::Jpeg => ffi::NVCV_CHROMA_INTSTITIAL,
         ChromaSiting::Cosited => ffi::NVCV_CHROMA_TOPLEFT,
-        ChromaSiting::Other(c) => return Err(format!("unknown chroma siting {c}")),
+        other => return Err(format!("unknown chroma siting {}", other.to_raw())),
     };
     Ok(image::colour_flags(matrix, req.full_range(), siting))
 }
@@ -798,11 +798,8 @@ impl Instance for ArInstance {
             // A first load or a reload: nothing of the previous chain stays.
             self.unload();
         }
-        let report = |reused: bool| LoadReport {
-            load_ms: start.elapsed().as_secs_f32() * 1000.0,
-            warmup_ms: None,
-            reused_model: reused,
-            notice: None,
+        let report = |reused: bool| {
+            LoadReport::new(start.elapsed().as_secs_f32() * 1000.0).with_reused_model(reused)
         };
         self.replay = false;
         if wanted.eye.is_none() && wanted.auto.is_none() {

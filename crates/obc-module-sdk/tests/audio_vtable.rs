@@ -83,17 +83,15 @@ impl AudioInstance for AudioOnly {
         self.dropped = false;
         let reused = self.loads > 0;
         self.loads += 1;
-        Ok(AudioLoadReport {
-            load_ms: 2.5,
-            warmup_ms: Some(0.5),
-            frame_samples: if told("zero") {
+        Ok(AudioLoadReport::new(2.5)
+            .with_warmup_ms(0.5)
+            .with_frame_samples(if told("zero") {
                 Some(0)
             } else {
                 told("big").then_some(960)
-            },
-            latency_samples: 120,
-            reused_model: reused,
-        })
+            })
+            .with_latency_samples(120)
+            .with_reused_model(reused))
     }
 
     fn process_audio(

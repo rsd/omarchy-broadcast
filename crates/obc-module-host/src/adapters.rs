@@ -54,9 +54,11 @@ use obc_backend::{
     StageList, StageTimings, StageValue, Value,
 };
 use obc_module_abi::{
-    OBC_CHROMA_SITING_COSITED, OBC_CHROMA_SITING_JPEG, OBC_CHROMA_SITING_MPEG2, OBC_FORMAT_I420,
-    OBC_FORMAT_NV12, OBC_FRAME_CUDA, OBC_FRAME_FLAG_REPEAT, OBC_FRAME_HOST, OBC_MATRIX_BT601,
-    OBC_MATRIX_BT709, obc_cuda, obc_frame, obc_matrix, obc_plane,
+    OBC_BACKGROUND_MODE_BLUR, OBC_BACKGROUND_MODE_REPLACE, OBC_BACKGROUND_PARAM_BLUR_STRENGTH,
+    OBC_BACKGROUND_PARAM_MODE, OBC_CHROMA_SITING_COSITED, OBC_CHROMA_SITING_JPEG,
+    OBC_CHROMA_SITING_MPEG2, OBC_FORMAT_I420, OBC_FORMAT_NV12, OBC_FRAME_CUDA,
+    OBC_FRAME_FLAG_REPEAT, OBC_FRAME_HOST, OBC_MATRIX_BT601, OBC_MATRIX_BT709, obc_cuda, obc_frame,
+    obc_matrix, obc_plane,
 };
 
 use crate::manifest::{Frames, Slot};
@@ -64,11 +66,24 @@ use crate::module::{ChainSpec, Instance, LoadOutcome, Module, ModuleError, Statu
 use crate::settings::{SettingType, SettingsDescription};
 
 /// The load-time parameter of the `background` stage that says which
-/// effect it composites: `blur` or `replace` (a string).
-pub const BACKGROUND_MODE: &str = "mode";
+/// effect it composites: `blur` or `replace` (a string). The ABI's
+/// [`OBC_BACKGROUND_PARAM_MODE`]: the provider of the stage composites
+/// (module-side compositing is the stage's contract for major 1).
+pub const BACKGROUND_MODE: &str = OBC_BACKGROUND_PARAM_MODE;
 /// The live parameter of the `background` stage with the blur strength, a
-/// float from 0 to 1.
-pub const BACKGROUND_BLUR_STRENGTH: &str = "blur_strength";
+/// float from 0 to 1: the ABI's [`OBC_BACKGROUND_PARAM_BLUR_STRENGTH`].
+pub const BACKGROUND_BLUR_STRENGTH: &str = OBC_BACKGROUND_PARAM_BLUR_STRENGTH;
+
+/// The value of [`BACKGROUND_MODE`] for `effect` (none for
+/// [`EffectKind::None`], whose chain has no `background` stage): the ABI's
+/// [`OBC_BACKGROUND_MODE_BLUR`] or [`OBC_BACKGROUND_MODE_REPLACE`].
+fn background_mode(effect: EffectKind) -> Option<&'static str> {
+    match effect {
+        EffectKind::None => None,
+        EffectKind::Blur => Some(OBC_BACKGROUND_MODE_BLUR),
+        EffectKind::Replace => Some(OBC_BACKGROUND_MODE_REPLACE),
+    }
+}
 
 /// A `&'static str` for a name that lives as long as the process: the seams
 /// want one, and module ids are few.
@@ -270,7 +285,6 @@ fn check_value(
             }
             _ => bad("a string"),
         },
-        SettingType::Action => Ok(()),
     }
 }
 
@@ -465,11 +479,11 @@ impl ModuleBackend {
                 )
             })
             .collect();
-        if req.effect != EffectKind::None {
+        if let Some(mode) = background_mode(req.effect) {
             params.push((
                 StageId::BACKGROUND,
                 BACKGROUND_MODE.into(),
-                Value::Str(req.effect.as_str().into()),
+                Value::Str(mode.into()),
             ));
         }
         ChainSpec {
@@ -1130,6 +1144,24 @@ mod tests {
             colour: ColourSpec::default(),
             background: None,
             params: BTreeMap::new(),
+        }
+    }
+
+    /// The `background` stage's names are the ABI's, and the modes are
+    /// the effects' own names.
+    #[test]
+    fn the_background_contract_uses_the_abi_names() {
+        assert_eq!(
+            (BACKGROUND_MODE, BACKGROUND_BLUR_STRENGTH),
+            ("mode", "blur_strength")
+        );
+        assert_eq!(
+            StageId::BACKGROUND.as_str(),
+            obc_module_abi::OBC_STAGE_BACKGROUND
+        );
+        assert_eq!(background_mode(EffectKind::None), None);
+        for effect in [EffectKind::Blur, EffectKind::Replace] {
+            assert_eq!(background_mode(effect), Some(effect.as_str()));
         }
     }
 

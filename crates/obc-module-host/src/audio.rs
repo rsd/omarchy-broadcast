@@ -24,15 +24,15 @@ use std::sync::Arc;
 
 use obc_backend::{StageId, StageList, Value};
 use obc_module_abi::{
-    OBC_AUDIO_F32_PLANAR, OBC_AUDIO_FLAGS_ALL, OBC_ERR_STAGE, OBC_MAX_AUDIO_CHANNELS, OBC_OK,
-    obc_audio_buffer, obc_audio_load_report, obc_audio_request, obc_instance, obc_status,
-    obc_timing,
+    OBC_AUDIO_F32_PLANAR, OBC_ERR_STAGE, OBC_MAX_AUDIO_CHANNELS, OBC_OK, obc_audio_buffer,
+    obc_audio_load_report, obc_audio_request, obc_instance, obc_status, obc_timing,
 };
 
+use crate::gating::{self, Constant, HostStruct};
 use crate::library::LogLevel;
 use crate::manifest::Manifest;
 use crate::module::{
-    ModuleCore, ModuleError, RawParams, Status, owned_text, reported_entries, reported_name,
+    ModuleCore, ModuleError, RawParams, Status, gate, owned_text, reported_entries, reported_name,
 };
 
 /// What [`AudioInstance::load`] loads, owned: the ABI's audio request with
@@ -322,7 +322,10 @@ impl AudioInstance {
                 .iter()
                 .map(|(s, k, v)| (s.as_str(), k.as_str(), v)),
         )?;
+        let minor = self.core.lib.abi_minor();
+        gate(minor, params.value_kinds())?;
         let mut req = obc_audio_request::empty();
+        req.struct_size = gating::struct_size(HostStruct::AudioRequest, minor);
         req.stages = ptrs.as_ptr();
         req.n_stages = ptrs.len();
         req.sample_rate = spec.sample_rate;
@@ -332,6 +335,7 @@ impl AudioInstance {
         req.params = params.as_ptr();
         req.n_params = params.len();
         let mut report = obc_audio_load_report::empty(spec.frame_samples);
+        report.struct_size = gating::struct_size(HostStruct::AudioLoadReport, minor);
         let f = self
             .core
             .lib
@@ -479,7 +483,15 @@ impl AudioInstance {
             )));
         }
         let params = RawParams::new(live.iter().copied())?;
+        let minor = self.core.lib.abi_minor();
+        gate(
+            minor,
+            std::iter::once(Constant::AudioFormat(OBC_AUDIO_F32_PLANAR))
+                .chain(params.value_kinds()),
+        )?;
+        let size = gating::struct_size(HostStruct::AudioBuffer, minor);
         let mut inb = obc_audio_buffer::empty();
+        inb.struct_size = size;
         inb.format = OBC_AUDIO_F32_PLANAR;
         inb.sample_rate = f.sample_rate;
         inb.channels = f.channels_in;
@@ -489,8 +501,10 @@ impl AudioInstance {
             *slot = plane.as_ptr().cast_mut();
         }
         inb.pts_ns = block.pts_ns.filter(|t| *t >= 0).unwrap_or(-1);
-        inb.flags = block.flags & OBC_AUDIO_FLAGS_ALL;
+        // Only the flags of the module's version (all of 1.2 today).
+        inb.flags = block.flags & gating::audio_flags(minor);
         let mut outb = obc_audio_buffer::empty();
+        outb.struct_size = size;
         outb.format = OBC_AUDIO_F32_PLANAR;
         outb.sample_rate = f.sample_rate;
         outb.channels = f.channels_out;

@@ -12,11 +12,14 @@
 //!    callback routes the module's lines to a [`LogSink`];
 //! 3. checks the vtable it returns: at least as large as the vtable of ABI
 //!    1.0 (an entry past its `struct_size` is taken as null), of the same
-//!    major version, with every required entry set. The audio entries of
-//!    ABI 1.2 ([`Library::has_audio`]) are required of an `audio-filter`
-//!    module only, which [`crate::Module::open_for`] checks. The
-//!    per-frame background entry of ABI 1.4 is kept only for a library
-//!    built for ABI 1.4 or later ([`Library::has_live_background`]).
+//!    major version, with every entry set that every kind requires. The
+//!    entries of a kind are checked by [`crate::Module::open_for`], which
+//!    knows the kind: `instance_load` and `instance_process` for a
+//!    `video-stage` module ([`Library::video_refusal`]), the audio entries
+//!    of ABI 1.2 for an `audio-filter` one ([`Library::audio_refusal`]).
+//!    Every entry appended after ABI 1.0 is kept only for a library built
+//!    for the minor version that defines it, and the reserved
+//!    `instance_park` and `instance_unpark` never ([`crate::gating`]).
 //!
 //! The [`Library`] is shared ([`Arc`]) by every module object and instance
 //! made from it, and closed when the last one goes. One path is opened
@@ -42,11 +45,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 use obc_module_abi::{
-    OBC_FRAME_FLAGS_1_0, OBC_FRAME_FLAGS_ALL, OBC_LOG_DEBUG, OBC_LOG_ERROR, OBC_LOG_INFO,
-    OBC_LOG_TRACE, OBC_LOG_WARN, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_MINOR,
-    OBC_MODULE_ABI_VERSION, obc_host, obc_log_level, obc_module_abi_major, obc_module_abi_minor,
-    obc_module_abi_version_fn, obc_module_entry_fn, obc_module_vtable,
+    OBC_LOG_DEBUG, OBC_LOG_ERROR, OBC_LOG_INFO, OBC_LOG_TRACE, OBC_LOG_WARN, OBC_MODULE_ABI_MAJOR,
+    OBC_MODULE_ABI_MINOR, OBC_MODULE_ABI_VERSION, OBC_MODULE_VTABLE_SIZE_1_0,
+    OBC_MODULE_VTABLE_SIZE_1_2, OBC_MODULE_VTABLE_SIZE_1_3, OBC_MODULE_VTABLE_SIZE_1_4, obc_host,
+    obc_log_level, obc_module_abi_major, obc_module_abi_minor, obc_module_abi_version_fn,
+    obc_module_entry_fn, obc_module_vtable,
 };
+
+use crate::gating;
 
 /// The level of a log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -164,88 +170,59 @@ pub fn check_abi_version(version: u32) -> Result<(), String> {
 /// The `OBC_FRAME_FLAG_*` bits a module built for ABI `version` (one this
 /// host accepts, [`check_abi_version`]) knows: the host clears the others
 /// on every frame it hands the module, so that a module of an older minor
-/// version never sees a flag added after it. ABI 1.0 knows
-/// `OBC_FRAME_FLAG_NEW_SOURCE`; 1.1 adds `OBC_FRAME_FLAG_REPEAT`.
+/// version never sees a flag added after it ([`gating::frame_flags`]).
 pub fn frame_flags_of(version: u32) -> u32 {
-    if obc_module_abi_minor(version) == 0 {
-        OBC_FRAME_FLAGS_1_0
-    } else {
-        OBC_FRAME_FLAGS_ALL
-    }
+    gating::frame_flags(gating::minor_of(version))
 }
 
 /// The size of the vtable of ABI 1.0, the smallest a host of this major
-/// version accepts: what a module built for 1.0 sets in `struct_size`. It is
-/// fixed: later minors append entries and must not move it.
-pub const VTABLE_SIZE_1_0: usize = 136;
-
-// `check` is the last entry of ABI 1.0, so the 1.0 vtable ends right after it.
-const _: () = assert!(
-    std::mem::offset_of!(obc_module_vtable, check)
-        + size_of::<
-            Option<
-                unsafe extern "C" fn(
-                    *mut obc_module_abi::obc_module,
-                    *const *const c_char,
-                    usize,
-                ) -> obc_module_abi::obc_status,
-            >,
-        >()
-        == VTABLE_SIZE_1_0
-);
+/// version accepts: what a module built for 1.0 sets in `struct_size`
+/// (`OBC_MODULE_VTABLE_SIZE_1_0`). It is fixed: later minors append
+/// entries and must not move it.
+pub const VTABLE_SIZE_1_0: usize = OBC_MODULE_VTABLE_SIZE_1_0 as usize;
 
 /// The size of the vtable of ABI 1.2, which appends the audio entries
 /// (`audio_instance_load`, `audio_instance_process`) to the 1.0 vtable
 /// (1.1 added no entry).
-pub const VTABLE_SIZE_1_2: usize = VTABLE_SIZE_1_0 + 2 * size_of::<usize>();
-
-// `audio_instance_process` is the last entry of ABI 1.2.
-const _: () = assert!(
-    std::mem::offset_of!(obc_module_vtable, audio_instance_load) == VTABLE_SIZE_1_0
-        && std::mem::offset_of!(obc_module_vtable, audio_instance_process) + size_of::<usize>()
-            == VTABLE_SIZE_1_2
-);
+pub const VTABLE_SIZE_1_2: usize = OBC_MODULE_VTABLE_SIZE_1_2 as usize;
 
 /// The size of the vtable of ABI 1.3, which appends
 /// `instance_status_values` to the 1.2 vtable.
-pub const VTABLE_SIZE_1_3: usize = VTABLE_SIZE_1_2 + size_of::<usize>();
-
-// `instance_status_values` is the last entry of ABI 1.3.
-const _: () = assert!(
-    std::mem::offset_of!(obc_module_vtable, instance_status_values) == VTABLE_SIZE_1_2
-        && std::mem::offset_of!(obc_module_vtable, instance_status_values) + size_of::<usize>()
-            == VTABLE_SIZE_1_3
-);
+pub const VTABLE_SIZE_1_3: usize = OBC_MODULE_VTABLE_SIZE_1_3 as usize;
 
 /// The size of the vtable of ABI 1.4, which appends
-/// `instance_set_background` to the 1.3 vtable.
-pub const VTABLE_SIZE_1_4: usize = VTABLE_SIZE_1_3 + size_of::<usize>();
+/// `instance_set_background` to the 1.3 vtable (1.5 and 1.6 append none).
+pub const VTABLE_SIZE_1_4: usize = OBC_MODULE_VTABLE_SIZE_1_4 as usize;
 
-// `instance_set_background` is the last entry of ABI 1.4.
+// Each size ends at the last entry of its minor version.
 const _: () = assert!(
-    std::mem::offset_of!(obc_module_vtable, instance_set_background) == VTABLE_SIZE_1_3
+    std::mem::offset_of!(obc_module_vtable, check) + size_of::<usize>() == VTABLE_SIZE_1_0
+        && std::mem::offset_of!(obc_module_vtable, audio_instance_load) == VTABLE_SIZE_1_0
+        && std::mem::offset_of!(obc_module_vtable, audio_instance_process) + size_of::<usize>()
+            == VTABLE_SIZE_1_2
+        && std::mem::offset_of!(obc_module_vtable, instance_status_values) == VTABLE_SIZE_1_2
+        && std::mem::offset_of!(obc_module_vtable, instance_status_values) + size_of::<usize>()
+            == VTABLE_SIZE_1_3
+        && std::mem::offset_of!(obc_module_vtable, instance_set_background) == VTABLE_SIZE_1_3
         && std::mem::offset_of!(obc_module_vtable, instance_set_background) + size_of::<usize>()
             == VTABLE_SIZE_1_4
 );
 
-/// The first minor version of ABI 1 with audio.
-pub const AUDIO_MINOR: u16 = 2;
+/// The first minor version of ABI 1 with audio ([`gating::AUDIO_MINOR`]).
+pub const AUDIO_MINOR: u16 = gating::AUDIO_MINOR;
 
 /// The first minor version of ABI 1 with the per-frame background
-/// (`instance_set_background`).
-pub const LIVE_BACKGROUND_MINOR: u16 = 4;
+/// (`instance_set_background`, [`gating::LIVE_BACKGROUND_MINOR`]).
+pub const LIVE_BACKGROUND_MINOR: u16 = gating::LIVE_BACKGROUND_MINOR;
 
 /// The vtable `vt` of a library built for ABI `version` (one this host
-/// accepts), less the entries that version does not know: a library built
-/// for an older minor version never has an entry appended after it called,
-/// whatever its `struct_size` says. Only the per-frame background of 1.4
-/// is masked so: the entries before it were read by size alone when they
-/// came, and stay so.
-fn mask_vtable(mut vt: obc_module_vtable, version: u32) -> obc_module_vtable {
-    if obc_module_abi_minor(version) < LIVE_BACKGROUND_MINOR {
-        vt.instance_set_background = None;
-    }
-    vt
+/// accepts), less the entries that version does not define and the
+/// reserved ones ([`gating::mask_vtable`]): a library built for an older
+/// minor version never has an entry appended after it called, whatever its
+/// `struct_size` says, and no library has `instance_park` or
+/// `instance_unpark` called.
+fn mask_vtable(vt: obc_module_vtable, version: u32) -> obc_module_vtable {
+    gating::mask_vtable(vt, gating::minor_of(version))
 }
 
 /// A loaded, checked module library.
@@ -302,7 +279,10 @@ unsafe fn read_vtable(raw: *const obc_module_vtable, size: usize) -> obc_module_
     unsafe { vt.assume_init() }
 }
 
-/// The entries of the vtable a module must set, by name.
+/// The entries of the vtable every module must set, whatever its kind, by
+/// name. The entries of a kind are checked when the module is opened as
+/// that kind ([`Library::video_refusal`], [`Library::audio_refusal`]):
+/// since ABI 1.6 a module may leave the entries of other kinds null.
 fn missing_required(vt: &obc_module_vtable) -> Vec<&'static str> {
     let required = [
         ("init", vt.init.is_some()),
@@ -310,8 +290,6 @@ fn missing_required(vt: &obc_module_vtable) -> Vec<&'static str> {
         ("describe_settings", vt.describe_settings.is_some()),
         ("instance_create", vt.instance_create.is_some()),
         ("instance_destroy", vt.instance_destroy.is_some()),
-        ("instance_load", vt.instance_load.is_some()),
-        ("instance_process", vt.instance_process.is_some()),
         (
             "instance_reset_temporal",
             vt.instance_reset_temporal.is_some(),
@@ -326,6 +304,18 @@ fn missing_required(vt: &obc_module_vtable) -> Vec<&'static str> {
         .filter(|(_, set)| !set)
         .map(|(name, _)| name)
         .collect()
+}
+
+/// The entries a `video-stage` module must set and `vt` lacks.
+fn missing_video(vt: &obc_module_vtable) -> Vec<&'static str> {
+    [
+        ("instance_load", vt.instance_load.is_some()),
+        ("instance_process", vt.instance_process.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, set)| !set)
+    .map(|(name, _)| name)
+    .collect()
 }
 
 impl Library {
@@ -468,6 +458,24 @@ impl Library {
         self.vtable.instance_set_background.is_some()
     }
 
+    /// Why this library cannot be a `video-stage` module, or `None` when it
+    /// can: a vtable without `instance_load` or `instance_process`, which
+    /// only a module of another kind may leave null.
+    pub fn video_refusal(&self) -> Option<String> {
+        let missing = missing_video(&self.vtable);
+        (!missing.is_empty()).then(|| {
+            format!(
+                "The module's vtable lacks required entries: {}",
+                missing.join(", ")
+            )
+        })
+    }
+
+    /// The minor version of ABI 1 the library is built for.
+    pub fn abi_minor(&self) -> u16 {
+        gating::minor_of(self.abi_version)
+    }
+
     /// Whether the vtable has both audio entries of ABI 1.2: what an
     /// `audio-filter` module needs. A library of ABI 1.0 or 1.1 never has
     /// them (its vtable ends before them).
@@ -520,14 +528,15 @@ mod tests {
         assert_eq!(check_abi_version(OBC_MODULE_ABI_VERSION), Ok(()));
         let e = check_abi_version(obc_module_abi_pack(2, 0)).unwrap_err();
         assert!(
-            e.contains("module ABI 2.0") && e.contains("module ABI 1.5"),
+            e.contains("module ABI 2.0") && e.contains("module ABI 1.6"),
             "{e}"
         );
         let e = check_abi_version(obc_module_abi_pack(0, 9)).unwrap_err();
         assert!(e.contains("0.9"), "{e}");
         let e = check_abi_version(obc_module_abi_pack(1, 7)).unwrap_err();
-        assert!(e.contains("1.7, newer than") && e.contains("1.5"), "{e}");
-        // A library built for ABI 1.0 to 1.5 loads.
+        assert!(e.contains("1.7, newer than") && e.contains("1.6"), "{e}");
+        // A library built for ABI 1.0 to 1.6 loads.
+        assert_eq!(check_abi_version(obc_module_abi_pack(1, 6)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 0)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 1)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 2)), Ok(()));
@@ -543,7 +552,7 @@ mod tests {
             frame_flags_of(obc_module_abi_pack(1, 0)),
             OBC_FRAME_FLAG_NEW_SOURCE
         );
-        for minor in [1, 2, 3, 4] {
+        for minor in [1, 2, 3, 4, 5, 6] {
             assert_eq!(
                 frame_flags_of(obc_module_abi_pack(1, minor)),
                 OBC_FRAME_FLAG_NEW_SOURCE | OBC_FRAME_FLAG_REPEAT

@@ -370,13 +370,16 @@ fn hello_is_discovered_loads_probes_describes_and_tints_a_host_frame() {
     let info = &registry.modules()[0];
     assert_eq!(info.stages.len(), 1);
     assert!(info.stages[0].available && info.stages[0].selected);
-    assert_eq!(registry.resolve("hello").provider.as_deref(), Some(ID));
-    assert_eq!(registry.order(), [s("hello")]);
+    assert_eq!(
+        registry.resolve("x-example-hello").provider.as_deref(),
+        Some(ID)
+    );
+    assert_eq!(registry.order(), [s("x-example-hello")]);
 
     let module = registry.module(ID).unwrap().clone();
     assert_eq!(
         module.probe().unwrap(),
-        [(s("hello"), Availability::Installed)]
+        [(s("x-example-hello"), Availability::Installed)]
     );
     let settings = module.settings().unwrap();
     assert_eq!(settings.groups.len(), 1);
@@ -385,13 +388,13 @@ fn hello_is_discovered_loads_probes_describes_and_tints_a_host_frame() {
             settings.groups[0].id.as_str(),
             settings.groups[0].label.as_str()
         ),
-        ("hello", "Hello module")
+        ("x_example_hello", "Hello module")
     );
     assert_eq!(
-        settings.enable_of("hello").unwrap().id,
-        "effect.hello.enabled"
+        settings.enable_of("x-example-hello").unwrap().id,
+        "effect.x_example_hello.enabled"
     );
-    let strength = settings.param("hello", "strength").unwrap();
+    let strength = settings.param("x-example-hello", "strength").unwrap();
     assert!(matches!(
         strength.kind,
         SettingType::Int {
@@ -403,14 +406,14 @@ fn hello_is_discovered_loads_probes_describes_and_tints_a_host_frame() {
         }
     ));
 
-    let factory = ModuleChainFactory::new(module, &[s("hello")]).unwrap();
+    let factory = ModuleChainFactory::new(module, &[s("x-example-hello")]).unwrap();
     assert_eq!(factory.name(), ID);
     assert_eq!(factory.kinds(), [FrameKind::Host]);
     let mut chain = factory.create().unwrap();
     let report = chain
         .load(&host_request(
-            &["hello"],
-            params("hello", &[("strength", Value::Int(100))]),
+            &["x-example-hello"],
+            params("x-example-hello", &[("strength", Value::Int(100))]),
         ))
         .unwrap();
     assert!(!report.reused_model);
@@ -427,12 +430,12 @@ fn hello_is_discovered_loads_probes_describes_and_tints_a_host_frame() {
     chain
         .process(
             ChainFrame::Host(&mut f),
-            &params("hello", &[("strength", Value::Int(0))]),
+            &params("x-example-hello", &[("strength", Value::Int(0))]),
         )
         .unwrap();
     assert_eq!(img.uv, [128; 4]);
     // The example refuses CUDA frames, as its manifest says.
-    let mut req = host_request(&["hello"], BTreeMap::new());
+    let mut req = host_request(&["x-example-hello"], BTreeMap::new());
     req.kind = FrameKind::Cuda;
     req.gpu = Some(fake_gpu());
     assert!(matches!(
@@ -513,11 +516,11 @@ fn broken_modules_are_unavailable_with_their_reasons_and_the_process_lives() {
     // would abort the process) is called.
     let r = reason("org.test.major");
     assert!(
-        r.contains("module ABI 2.0") && r.contains("module ABI 1.5"),
+        r.contains("module ABI 2.0") && r.contains("module ABI 1.6"),
         "{r}"
     );
     let r = reason("org.test.minor");
-    assert!(r.contains("1.99, newer than") && r.contains("1.5"), "{r}");
+    assert!(r.contains("1.99, newer than") && r.contains("1.6"), "{r}");
     let r = reason("org.test.refuse");
     assert!(r.contains("refused this daemon"), "{r}");
     let r = reason("org.test.init");
@@ -649,7 +652,8 @@ fn a_panic_in_process_is_an_error_and_the_process_survives() {
 #[test]
 fn a_repeat_is_flagged_for_a_module_of_abi_1_1_and_reprocessed_by_one_of_1_0() {
     for (features, abi, flagged) in [
-        ("", "1.5", true),
+        ("", "1.6", true),
+        ("abi-1-5", "1.5", true),
         ("abi-1-3", "1.3", true),
         ("abi-1-2", "1.2", true),
         ("abi-1-1", "1.1", true),
@@ -707,7 +711,11 @@ fn status_values_cross_from_a_module_of_abi_1_3_and_none_from_one_of_1_2() {
         name: name.into(),
         value,
     };
-    for (features, abi, reports) in [("", "1.5", true), ("abi-1-2", "1.2", false)] {
+    for (features, abi, reports) in [
+        ("", "1.6", true),
+        ("abi-1-5", "1.5", true),
+        ("abi-1-2", "1.2", false),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let lib = own_copy(&fixture_lib(features), dir.path(), "fixture");
         let m = manifest(
@@ -754,7 +762,11 @@ fn status_values_cross_from_a_module_of_abi_1_3_and_none_from_one_of_1_2() {
 #[test]
 fn a_load_notice_crosses_from_a_module_of_abi_1_5_and_none_from_one_of_1_4() {
     const NOTICE: &str = "Engine A was chosen and cannot run: no device; using B";
-    for (features, abi, reports) in [("", "1.5", true), ("abi-1-4", "1.4", false)] {
+    for (features, abi, reports) in [
+        ("", "1.6", true),
+        ("abi-1-5", "1.5", true),
+        ("abi-1-4", "1.4", false),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let lib = own_copy(&fixture_lib(features), dir.path(), "fixture");
         let m = manifest(
@@ -1799,7 +1811,7 @@ fn an_audio_module_loads_only_through_the_audio_kinds_and_runs_blocks() {
     let module = registry.module("org.test.audio").unwrap().clone();
     assert_eq!(
         obc_module_host::library::version_text(module.library().abi_version()),
-        "1.5"
+        "1.6"
     );
     assert!(module.library().has_audio());
     assert!(module.matte_stages().is_empty());
@@ -2275,7 +2287,7 @@ fn hello_audio_is_discovered_in_the_worker_and_shapes_the_voice() {
     assert_eq!(settings.groups[0].surface.as_deref(), Some("mic"));
     assert_eq!(
         settings.enable_of("mic-enhance").unwrap().id,
-        "mic.hello.enabled"
+        "mic.x_example_hello_audio.enabled"
     );
     assert!(matches!(
         settings.param("mic-enhance", "gain_db").unwrap().kind,
@@ -2343,4 +2355,460 @@ fn hello_audio_is_discovered_in_the_worker_and_shapes_the_voice() {
     inst.process(&[&silence], &mut [&mut out], AudioBlock::default(), &[])
         .unwrap();
     assert!(out[0].abs() < 1e-4 && (out[12] - 0.5).abs() < 1e-4);
+}
+
+// ---------------------------------------------------------------------------
+// Module ABI 1.6: version gating, kinds, namespaces and the C example
+// ---------------------------------------------------------------------------
+
+/// The value of `key=` in a log line (up to the next space).
+fn field<'a>(line: &'a str, key: &str) -> &'a str {
+    let start = line
+        .find(&format!(" {key}="))
+        .unwrap_or_else(|| panic!("no {key}= in {line:?}"))
+        + key.len()
+        + 2;
+    line[start..].split(' ').next().unwrap_or_default()
+}
+
+/// The standing compatibility test of every later host: a module built for
+/// ABI 1.5 (and each older minor version) is handed nothing newer than its
+/// version. The fixture logs, raw, the `struct_size`s the host set in the
+/// request, the load report and the frames, the request's constants, the
+/// value kinds of the parameters and the frame flags; the host's view of
+/// the vtable has only the entries of the version. A later minor version
+/// that hands a module something new adds its expectation here.
+#[test]
+fn a_module_of_an_older_minor_is_handed_nothing_newer_than_its_version() {
+    use obc_module_abi::{
+        OBC_CHAIN_REQUEST_SIZE_1_0, OBC_FORMAT_NV12, OBC_FRAME_FLAG_REPEAT, OBC_FRAME_HOST,
+        OBC_FRAME_SIZE_1_0, OBC_LOAD_REPORT_SIZE_1_0, OBC_LOAD_REPORT_SIZE_1_5, OBC_VALUE_INT,
+    };
+    use obc_module_host::gating;
+    for minor in (0..=5u16).rev() {
+        let features = format!("abi-1-{minor}");
+        let dir = tempfile::tempdir().unwrap();
+        let lib = own_copy(&fixture_lib(&features), dir.path(), "fixture");
+        let m = manifest(
+            &fixture_manifest("org.test.fixture", &lib, 1),
+            dir.path(),
+            "fixture",
+        );
+        let (sink, lines) = capture();
+        let module = Module::open(&m, &serde_json::json!({}), sink).expect("the fixture opens");
+        assert_eq!(module.library().abi_minor(), minor);
+        // The entries of the version only (the 1.3 fixture sets the
+        // per-frame background of 1.4 in a vtable large enough for it).
+        assert_eq!(
+            module.library().has_live_background(),
+            minor >= 4,
+            "1.{minor}"
+        );
+        assert!(!module.library().has_audio(), "1.{minor}");
+
+        let factory = ModuleChainFactory::new(module, &[s("alpha")]).unwrap();
+        let mut chain = factory.create().unwrap();
+        chain
+            .load(&host_request(
+                &["alpha"],
+                params("alpha", &[("step", Value::Int(1))]),
+            ))
+            .unwrap();
+        let line = last_line(&lines, "fixture-abi load");
+        let report_size = if minor >= 5 {
+            OBC_LOAD_REPORT_SIZE_1_5
+        } else {
+            OBC_LOAD_REPORT_SIZE_1_0
+        };
+        assert_eq!(
+            field(&line, "request_size"),
+            OBC_CHAIN_REQUEST_SIZE_1_0.to_string(),
+            "1.{minor}: {line}"
+        );
+        assert_eq!(
+            field(&line, "report_size"),
+            report_size.to_string(),
+            "1.{minor}: {line}"
+        );
+        assert_eq!(field(&line, "kind"), OBC_FRAME_HOST.to_string());
+        assert_eq!(field(&line, "format"), OBC_FORMAT_NV12.to_string());
+        assert_eq!(field(&line, "values"), OBC_VALUE_INT.to_string());
+
+        let mut img = HostImage::new(4, 2, 50, 128);
+        let mut f = img.frame();
+        chain
+            .process(ChainFrame::Host(&mut f), &BTreeMap::new())
+            .unwrap();
+        chain
+            .process_repeat(ChainFrame::Host(&mut f), &BTreeMap::new())
+            .unwrap();
+        let line = last_line(&lines, "fixture-abi process");
+        let known = gating::frame_flags(minor);
+        for flags in field(&line, "flags").split('/') {
+            let flags: u32 = flags.parse().unwrap();
+            assert_eq!(flags & !known, 0, "1.{minor}: {line}");
+        }
+        let input: u32 = field(&line, "flags")
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            input & OBC_FRAME_FLAG_REPEAT != 0,
+            minor >= 1,
+            "1.{minor}: the repeat is marked from 1.1: {line}"
+        );
+        assert_eq!(
+            field(&line, "size"),
+            format!("{OBC_FRAME_SIZE_1_0}/{OBC_FRAME_SIZE_1_0}"),
+            "1.{minor}: {line}"
+        );
+        // Status values (1.3) are asked of 1.3 and later only.
+        assert_eq!(chain.status_values().is_empty(), minor < 3, "1.{minor}");
+        chain.unload();
+    }
+}
+
+/// Since ABI 1.6 an `audio-filter` module may leave the video entries
+/// null: it loads in the audio worker and runs blocks. A `video-stage`
+/// module still needs them.
+#[test]
+fn an_audio_module_may_leave_the_video_entries_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib("audio-null-video"), dir.path(), "audio");
+    std::fs::write(
+        dir.path().join("audio.toml"),
+        fixture_audio_manifest("org.test.audio", &lib),
+    )
+    .unwrap();
+    let (registry, _lines) = audio_registry(dir.path());
+    assert_eq!(
+        registry.status("org.test.audio"),
+        Some(ModuleStatus::Available)
+    );
+    let module = registry.module("org.test.audio").unwrap().clone();
+    let mut inst = module.create_audio_instance().unwrap();
+    inst.load(&audio_spec(&["mic-denoise"], &[])).unwrap();
+    let input = ramp(480);
+    let mut out = vec![0.0f32; 480];
+    inst.process(&[&input], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap();
+    assert_eq!(out, input);
+
+    // The same library as a video module is refused before its init.
+    let other = tempfile::tempdir().unwrap();
+    let video = own_copy(&lib, other.path(), "video");
+    let m = manifest(
+        &fixture_manifest("org.test.video", &video, 1),
+        other.path(),
+        "video",
+    );
+    let e = Module::open(&m, &serde_json::json!({}), obc_module_host::stderr_log()).unwrap_err();
+    assert_eq!(
+        e,
+        "The module's vtable lacks required entries: instance_load, instance_process"
+    );
+}
+
+/// A manifest's `abi_minor` (since ABI 1.6) is checked against the
+/// library's version, and a newer one than the host's is listed with the
+/// version it needs, even with keys of that version.
+#[test]
+fn the_manifest_abi_minor_is_checked_against_the_library_and_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib("abi-1-4"), dir.path(), "fixture");
+    let text = fixture_manifest("org.test.fixture", &lib, 1);
+    let needs = |n: u32| text.replacen("abi = 1\n", &format!("abi = 1\nabi_minor = {n}\n"), 1);
+    let m = manifest(&needs(5), dir.path(), "fixture");
+    assert_eq!(m.abi_minor, 5);
+    let e = Module::open(&m, &serde_json::json!({}), obc_module_host::stderr_log()).unwrap_err();
+    assert_eq!(
+        e,
+        "The library is built for module ABI 1.4, older than the module ABI 1.5 its manifest \
+         needs"
+    );
+    let m = manifest(&needs(4), dir.path(), "fixture");
+    Module::open(&m, &serde_json::json!({}), obc_module_host::stderr_log())
+        .expect("a library of the manifest's minor version opens");
+
+    // Newer than this host: listed with the version it needs, never opened.
+    let later = tempfile::tempdir().unwrap();
+    std::fs::write(
+        later.path().join("later.toml"),
+        needs(99).replacen("abi_minor = 99\n", "abi_minor = 99\nlater_key = 1\n", 1),
+    )
+    .unwrap();
+    let mut registry = Registry::new(scan(&[later.path().to_path_buf()]));
+    let (sink, _) = capture();
+    registry.open_all(|_| serde_json::json!({}), &sink);
+    assert_eq!(
+        registry.status("org.test.fixture"),
+        Some(ModuleStatus::Unavailable(format!(
+            "Needs module ABI 1.99; this daemon has module ABI 1.{}",
+            obc_module_abi::OBC_MODULE_ABI_MINOR
+        )))
+    );
+}
+
+/// The namespaces of ABI 1.6: a stage id or settings group outside the
+/// registry and not of the vendor form is warned about and kept; a
+/// configuration key starting with `_` that the host does not define is
+/// not passed, with a warning; a status value named `obc.*` is dropped,
+/// logged once per instance.
+#[test]
+fn ids_outside_the_namespaces_are_warned_about_and_reserved_names_kept_from_modules() {
+    let (_dir, module, lines) = fixture(serde_json::json!({"_debug": true, "_host": {}}));
+    let warnings = |what: &str| {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, level, m)| *level == LogLevel::Warn && m.contains(what))
+            .count()
+    };
+    for id in ["alpha", "beta", "gamma"] {
+        assert_eq!(
+            warnings(&format!("the stage id {id:?} is not a well-known stage id")),
+            1,
+            "{id}"
+        );
+    }
+    assert_eq!(warnings("the stage id \"background\""), 0);
+    assert_eq!(warnings("the stage id \"enhance\""), 0);
+    assert_eq!(
+        warnings("the configuration key \"_debug\" was not passed to the module"),
+        1
+    );
+    assert_eq!(warnings("\"_host\""), 0);
+    // The group, once, at the first read of the settings.
+    module.settings().unwrap();
+    module.settings().unwrap();
+    assert_eq!(
+        warnings("the settings group \"fixture\" is not a well-known group"),
+        1
+    );
+
+    let factory = ModuleChainFactory::new(module, &[s("alpha")]).unwrap();
+    let mut chain = factory.create().unwrap();
+    chain
+        .load(&host_request(
+            &["alpha"],
+            params("alpha", &[("value_name", Value::Str("obc.zoom".into()))]),
+        ))
+        .unwrap();
+    let mut img = HostImage::new(4, 2, 50, 128);
+    for _ in 0..2 {
+        let mut f = img.frame();
+        chain
+            .process(ChainFrame::Host(&mut f), &BTreeMap::new())
+            .unwrap();
+        let names: Vec<String> = chain.status_values().into_iter().map(|v| v.name).collect();
+        assert_eq!(names, ["step", "frames"]);
+    }
+    assert_eq!(warnings("names starting with `obc.` are reserved"), 1);
+    // A name of the module's own crosses.
+    chain
+        .load(&host_request(
+            &["alpha"],
+            params("alpha", &[("value_name", Value::Str("zoom".into()))]),
+        ))
+        .unwrap();
+    let mut f = img.frame();
+    chain
+        .process(ChainFrame::Host(&mut f), &BTreeMap::new())
+        .unwrap();
+    let names: Vec<String> = chain.status_values().into_iter().map(|v| v.name).collect();
+    assert_eq!(names, ["step", "frames", "zoom"]);
+}
+
+/// The reserved names hold a module of ABI 1.6 or later only: a module of
+/// ABI 1.5 is passed a configuration key starting with `_` and keeps a
+/// status value named `obc.*`, as a host of 1.5 did, each with a warning
+/// (the value's logged once per instance).
+#[test]
+fn reserved_names_are_passed_to_a_module_of_abi_1_5_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib("abi-1-5"), dir.path(), "fixture");
+    let m = manifest(
+        &fixture_manifest("org.test.fixture", &lib, 1),
+        dir.path(),
+        "fixture",
+    );
+    let (sink, lines) = capture();
+    let module = Module::open(&m, &serde_json::json!({"_debug": true, "_host": {}}), sink)
+        .expect("the fixture opens");
+    assert_eq!(module.library().abi_minor(), 5);
+    let warnings = |what: &str| {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, level, m)| *level == LogLevel::Warn && m.contains(what))
+            .count()
+    };
+    assert_eq!(
+        warnings(
+            "the configuration key \"_debug\" starts with `_`, which is reserved for the host: \
+             it is passed to this module of ABI 1.5"
+        ),
+        1
+    );
+    assert_eq!(warnings("was not passed to the module"), 0);
+    assert_eq!(warnings("\"_host\""), 0);
+
+    let factory = ModuleChainFactory::new(module, &[s("alpha")]).unwrap();
+    let mut chain = factory.create().unwrap();
+    chain
+        .load(&host_request(
+            &["alpha"],
+            params("alpha", &[("value_name", Value::Str("obc.zoom".into()))]),
+        ))
+        .unwrap();
+    let mut img = HostImage::new(4, 2, 50, 128);
+    for _ in 0..2 {
+        let mut f = img.frame();
+        chain
+            .process(ChainFrame::Host(&mut f), &BTreeMap::new())
+            .unwrap();
+        let names: Vec<String> = chain.status_values().into_iter().map(|v| v.name).collect();
+        assert_eq!(names, ["step", "frames", "obc.zoom"]);
+    }
+    assert_eq!(
+        warnings("it is kept from this module of ABI 1.5, but dropped from a module of ABI 1.6"),
+        1
+    );
+    assert_eq!(warnings("was dropped"), 0);
+}
+
+/// The C example, `examples/module-hello-c`, built with `cc` from the
+/// header alone into a temporary directory; `None` when there is no `cc`.
+fn hello_c_lib() -> Option<PathBuf> {
+    static BUILT: Mutex<Option<PathBuf>> = Mutex::new(None);
+    let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = built.as_ref() {
+        return Some(p.clone());
+    }
+    let libs = Path::new(env!("CARGO_TARGET_TMPDIR")).join("module-libs");
+    std::fs::create_dir_all(&libs).unwrap();
+    let out = libs.join("libobc_module_hello_c.so");
+    let result = Command::new("cc")
+        .args([
+            "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC", "-I",
+        ])
+        .arg(repo().join("crates/obc-module-abi/include"))
+        .arg("-o")
+        .arg(&out)
+        .arg(repo().join("examples/module-hello-c/hello.c"))
+        .output();
+    let output = match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("run cc: {e}"),
+        Ok(o) => o,
+    };
+    assert!(
+        output.status.success(),
+        "cc rejected examples/module-hello-c/hello.c:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    *built = Some(out.clone());
+    Some(out)
+}
+
+/// The C example, built from the header alone, is discovered with its
+/// shipped manifest, probed, described, and tints a host NV12 frame:
+/// instance, load, process, unload, destroy. Its ids are of the vendor
+/// form, so the host warns about none.
+#[test]
+fn the_c_example_built_from_the_header_alone_loads_and_tints_a_host_frame() {
+    let Some(lib) = hello_c_lib() else {
+        eprintln!("note: no `cc` on PATH; the C example was not built or loaded");
+        return;
+    };
+    const ID: &str = "org.example.hello-c";
+    const STAGE: &str = "x-example-hello-c";
+    let modules_d = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        repo().join("examples/module-hello-c/hello-c.toml"),
+        modules_d.path().join("hello-c.toml"),
+    )
+    .unwrap();
+    std::fs::copy(&lib, modules_d.path().join("libobc_module_hello_c.so")).unwrap();
+    let mut registry = Registry::new(scan(&[modules_d.path().to_path_buf()]));
+    let (sink, lines) = capture();
+    registry.open_all(|_| serde_json::json!({"_host": {}}), &sink);
+    assert_eq!(registry.status(ID), Some(ModuleStatus::Available));
+    assert_eq!(registry.resolve(STAGE).provider.as_deref(), Some(ID));
+
+    let module = registry.module(ID).unwrap().clone();
+    assert_eq!(module.manifest().abi_minor, 6);
+    assert_eq!(
+        obc_module_host::library::version_text(module.library().abi_version()),
+        format!("1.{}", obc_module_abi::OBC_MODULE_ABI_MINOR)
+    );
+    assert_eq!(
+        module.probe().unwrap(),
+        [(s(STAGE), Availability::Installed)]
+    );
+    let settings = module.settings().unwrap();
+    assert_eq!(settings.groups.len(), 1);
+    assert_eq!(settings.groups[0].id, "x_example_hello_c");
+    assert_eq!(
+        settings.enable_of(STAGE).unwrap().id,
+        "effect.x_example_hello_c.enabled"
+    );
+    assert!(matches!(
+        settings.param(STAGE, "strength").unwrap().kind,
+        SettingType::Int {
+            min: 0,
+            max: 100,
+            step: 5,
+            default: 50,
+            ..
+        }
+    ));
+    let warned: Vec<String> = lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, level, _)| *level <= LogLevel::Warn)
+        .map(|(_, _, m)| m.clone())
+        .collect();
+    assert!(warned.is_empty(), "{warned:?}");
+
+    let factory = ModuleChainFactory::new(module, &[s(STAGE)]).unwrap();
+    assert_eq!(factory.kinds(), [FrameKind::Host]);
+    let mut chain = factory.create().unwrap();
+    chain
+        .load(&host_request(
+            &[STAGE],
+            params(STAGE, &[("strength", Value::Int(100))]),
+        ))
+        .unwrap();
+    let mut img = HostImage::new(4, 2, 60, 128);
+    let mut f = img.frame();
+    chain
+        .process(ChainFrame::Host(&mut f), &BTreeMap::new())
+        .unwrap();
+    assert_eq!(img.y, [60; 8], "luma untouched");
+    assert_eq!(img.uv, [104, 152, 104, 152], "the tint of module-hello");
+    let mut img = HostImage::new(4, 2, 60, 128);
+    let mut f = img.frame();
+    chain
+        .process(
+            ChainFrame::Host(&mut f),
+            &params(STAGE, &[("strength", Value::Int(0))]),
+        )
+        .unwrap();
+    assert_eq!(img.uv, [128; 4], "a live strength of 0");
+    // CUDA frames are refused, as the manifest says.
+    let mut req = host_request(&[STAGE], BTreeMap::new());
+    req.kind = FrameKind::Cuda;
+    req.gpu = Some(fake_gpu());
+    assert!(chain.load(&req).is_err());
+    chain.unload();
+    // Destroys the instance, then the module object.
+    drop(chain);
+    drop(factory);
+    drop(registry);
 }

@@ -9,7 +9,11 @@ use obc_module_abi::{
 
 /// What kind of failure an [`Error`] is; each maps to an `OBC_ERR_*`
 /// status code.
+///
+/// A later release may add kinds, for status codes of a later ABI minor
+/// version: a `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// An argument is invalid ([`OBC_ERR_INVALID`]): a null pointer, a
     /// structure too small, malformed JSON, an unknown stage or parameter.

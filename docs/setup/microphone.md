@@ -48,7 +48,7 @@ The package installs:
 - the worker, `/usr/bin/omarchy-broadcast-audiod`, with its units `omarchy-broadcast-audiod.service` and `omarchy-broadcast-audiod.socket` and the D-Bus activation file `br.com.dias.OmarchyBroadcast.AudioWorker.service`;
 - the CPU voice module, with its manifest, in `/usr/lib/omarchy-broadcast/modules` and `modules.d`, and the third-party licence notices.
 
-The Maxine audio effects module is a package of its own from the same build, `omarchy-broadcast-maxine-afx-git`, which depends on the core and on `maxine-afx-sdk-local` (the SDK, which the packages never contain). Install it with the core to get the GPU module; no drop-in is needed (the worker applies the SDK package's environment to itself, [below](#the-workers-sdk-environment)).
+The Maxine audio effects module is a package of its own from the same build, `omarchy-broadcast-maxine-afx-git`, which depends on the module ABI that the core provides and on `maxine-afx-sdk-local` (the SDK, which the packages never contain). Install it with the core to get the GPU module; no drop-in is needed (the worker applies the SDK package's environment to itself, [below](#the-workers-sdk-environment)).
 
 Building the package fetches the DeepFilterNet source from its upstream repository (a git dependency pinned by commit), so `makepkg` needs network access.
 

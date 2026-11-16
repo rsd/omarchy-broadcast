@@ -78,7 +78,7 @@ sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
 systemctl --user enable --now omarchy-broadcastd
 ```
 
-The last two commands install the core. Add the modules wanted, from the same build (each depends on the core of the same version, because the module interface is not pinned across versions):
+The last two commands install the core. Add the modules wanted. Each module package depends on the module ABI range it was built for (`omarchy-broadcast-module-abi>=1.6` and `<2`), which the core provides; the daemon refuses a module built for a newer ABI minor than its own:
 
 | Package | What it adds | Depends on |
 |---|---|---|

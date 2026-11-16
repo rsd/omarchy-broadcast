@@ -101,13 +101,10 @@ impl Instance for TestInstance {
         }
         let reused = !self.stages.is_empty();
         self.stages = req.stages().iter().map(|s| s.to_string()).collect();
-        Ok(LoadReport {
-            load_ms: 1.5,
-            warmup_ms: None,
-            reused_model: reused,
-            notice: (req.param("test", "notice") == Some(Value::Bool(true)))
-                .then(|| "the chosen engine cannot run; using another".to_string()),
-        })
+        let mut report = LoadReport::new(1.5).with_reused_model(reused);
+        report.notice = (req.param("test", "notice") == Some(Value::Bool(true)))
+            .then(|| "the chosen engine cannot run; using another".to_string());
+        Ok(report)
     }
 
     fn process(
@@ -296,7 +293,8 @@ fn load(vt: &obc_module_vtable, instance: *mut obc_instance) -> (obc_status, obc
 
 #[test]
 fn abi_version_is_packed() {
-    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 5));
+    // Release 2.0 of the SDK emits module ABI 1.6.
+    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 6));
     assert_eq!(obc_module_abi_major(obc_module_abi_version()), 1);
     let vt = vtable();
     assert_eq!(vt.struct_size as usize, size_of::<obc_module_vtable>());
@@ -322,7 +320,8 @@ fn entry_refuses_a_bad_host() {
     // SAFETY: as above.
     assert!(unsafe { obc_module_entry(&other_major) }.is_null());
     let mut newer_minor = *host();
-    newer_minor.abi_version = obc_module_abi_pack(1, 5);
+    // A host of a later minor version than the module's.
+    newer_minor.abi_version = obc_module_abi_pack(1, OBC_MODULE_ABI_MINOR as u16 + 1);
     // SAFETY: as above.
     assert!(!unsafe { obc_module_entry(&newer_minor) }.is_null());
 }

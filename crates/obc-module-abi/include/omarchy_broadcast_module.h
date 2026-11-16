@@ -12,9 +12,74 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/*
+ * ABI 1 is defined for LP64 little-endian targets (x86_64, aarch64).
+ */
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ != 8
+#error "omarchy-broadcast module ABI 1 is defined for LP64 targets only"
+#endif
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "omarchy-broadcast module ABI 1 is defined for little-endian targets only"
+#endif
+
+/*
+ * Names (since ABI 1.6).
+ *
+ * The `background` stage: its provider makes the matte and composites the
+ * picture itself. The host passes it the load-time string parameter
+ * OBC_BACKGROUND_PARAM_MODE, OBC_BACKGROUND_MODE_BLUR or
+ * OBC_BACKGROUND_MODE_REPLACE (a chain without the effect has no
+ * `background` stage), and, with every frame while the chain has the
+ * stage, the live float parameter OBC_BACKGROUND_PARAM_BLUR_STRENGTH, 0.0
+ * to 1.0, under either mode (a module ignores it under replace). Under
+ * replace the background is the chain request's `background` image (a host
+ * BGR frame of the output size) or the per-frame background of ABI 1.4
+ * (`instance_set_background`). Module-side compositing is the contract of
+ * the stage for the life of major 1; a later minor version may add, beside
+ * it, an optional contract in which the module returns the matte only and
+ * the host composites.
+ */
+#define OBC_STAGE_BACKGROUND "background"
+#define OBC_BACKGROUND_PARAM_MODE "mode"
+#define OBC_BACKGROUND_MODE_BLUR "blur"
+#define OBC_BACKGROUND_MODE_REPLACE "replace"
+#define OBC_BACKGROUND_PARAM_BLUR_STRENGTH "blur_strength"
+
+/*
+ * Namespaces. Stage ids are one namespace across modules. The well-known
+ * stage ids (the registry): background, enhance, frame-generation,
+ * denoise, relight, hdr, eye-contact, auto-frame, mic-denoise,
+ * mic-dereverb, mic-enhance, mic-focus, mic-bandwidth; every id without the
+ * private prefix is the registry's, present or future. A stage of a
+ * module's own is `x-<vendor>-<name>` (`mic-x-<vendor>-<name>` for an audio
+ * stage), within the 32 bytes of a stage id. The well-known settings
+ * groups: background (the daemon's), cutout, video, lighting, eye_contact,
+ * auto_frame, onnx for video; input (the daemon's), noise, echo, focus,
+ * bandwidth, voice, cpu for audio. A group of a module's own is
+ * `x_<vendor>_<name>`. A host warns about an id of neither form and still
+ * loads the module. The keys of a module's configuration table starting
+ * with `_` are the host's (`_host` carries the host's facts); status value
+ * names starting with `obc.` are the host's, and a host drops such a value
+ * a module reports.
+ */
+#define OBC_PRIVATE_STAGE_PREFIX "x-"
+#define OBC_PRIVATE_GROUP_PREFIX "x_"
+#define OBC_RESERVED_CONFIG_PREFIX "_"
+#define OBC_HOST_CONFIG_KEY "_host"
+#define OBC_RESERVED_VALUE_PREFIX "obc."
+
+
 /**
  * The major version of this ABI. A change of the major version is
  * incompatible: the host refuses a module built for another major version.
+ *
+ * ABI 1 is stable from 1.6: a module built for ABI 1.N loads and behaves
+ * as documented on every host of ABI 1.M with M >= N. It is defined for
+ * LP64 little-endian targets (x86_64, aarch64); this header refuses to
+ * compile for another pointer size or byte order. The structures without
+ * a `struct_size` (`obc_plane`, `obc_cuda`, `obc_value`, `obc_param`,
+ * `obc_timing`, `obc_status_value`) are frozen for the life of major 1.
  */
 #define OBC_MODULE_ABI_MAJOR 1
 
@@ -33,14 +98,41 @@
  *   `instance_set_background` (see the crate documentation).
  * * 1.5 adds the load's notice: `obc_load_report::notice`, the first
  *   field appended to a structure (`OBC_LOAD_REPORT_SIZE_1_0`).
+ * * 1.6, the release from which ABI 1 is stable, adds no capability: the
+ *   base sizes (`OBC_*_SIZE_1_*`), the names of the `background` stage's
+ *   parameters and of the namespaces, the required entries per module
+ *   kind (an `audio-filter` module may leave the video entries null), and
+ *   the rules of version gating, threads, GPU contexts and the process.
+ *
+ * **Version gating.** The host presents itself to a module as a host of
+ * the module's declared minor version: it sets no flag bit, passes no
+ * constant (frame kind, pixel format, value kind, matrix, chroma siting,
+ * audio format), fills no field, sets no `struct_size` larger than that
+ * version's, sends no settings type or status value and calls no vtable
+ * entry that the declared version does not define, whatever the size of
+ * the module's vtable says. A module, for its part, ignores parameters
+ * whose key it does not know and unknown members of `_host`, accepts a
+ * `struct_size` larger than its own, and answers a constant it does not
+ * know with `OBC_ERR_UNSUPPORTED`.
+ *
+ * A manifest may say the lowest minor version the module needs
+ * (`abi_minor = N`, 0 when absent): a host of an older minor version lists
+ * the module as needing module ABI 1.N, and a host refuses a library built
+ * for a minor version lower than its manifest's `abi_minor`.
  */
-#define OBC_MODULE_ABI_MINOR 5
+#define OBC_MODULE_ABI_MINOR 6
 
 /**
  * The packed ABI version this crate describes: `major << 16 | minor`
  * (`obc_module_abi_pack`).
  */
 #define OBC_MODULE_ABI_VERSION ((OBC_MODULE_ABI_MAJOR << 16) | OBC_MODULE_ABI_MINOR)
+
+/**
+ * `sizeof(obc_host)` in ABI 1.0: the smallest `struct_size` a module
+ * accepts.
+ */
+#define OBC_HOST_SIZE_1_0 24
 
 /**
  * A bit of `obc_frame::flags`: this is the first frame of a new source
@@ -79,11 +171,31 @@
 #define OBC_MAX_PLANES 4
 
 /**
+ * `sizeof(obc_frame)` in ABI 1.0: the smallest `struct_size` a reader
+ * accepts.
+ */
+#define OBC_FRAME_SIZE_1_0 160
+
+/**
+ * `sizeof(obc_chain_request)` in ABI 1.0: the smallest `struct_size` a
+ * module accepts.
+ */
+#define OBC_CHAIN_REQUEST_SIZE_1_0 104
+
+/**
  * `sizeof(obc_load_report)` in ABI 1.0 to 1.4, before
  * `obc_load_report::notice` was appended: the smallest `struct_size` a
  * reader accepts.
  */
 #define OBC_LOAD_REPORT_SIZE_1_0 16
+
+/**
+ * `sizeof(obc_load_report)` in ABI 1.5, which appended
+ * `obc_load_report::notice`: the `struct_size` a host of 1.5 or later
+ * passes a module of 1.5 or later, and the smallest that has room for
+ * `notice`.
+ */
+#define OBC_LOAD_REPORT_SIZE_1_5 24
 
 /**
  * A bit of `obc_audio_buffer::flags`: this is the first block of a new
@@ -107,6 +219,48 @@
  * The most channels an audio buffer has.
  */
 #define OBC_MAX_AUDIO_CHANNELS 8
+
+/**
+ * `sizeof(obc_audio_buffer)` in ABI 1.2, which introduced it: the
+ * smallest `struct_size` a reader accepts.
+ */
+#define OBC_AUDIO_BUFFER_SIZE_1_2 104
+
+/**
+ * `sizeof(obc_audio_request)` in ABI 1.2, which introduced it: the
+ * smallest `struct_size` a module accepts.
+ */
+#define OBC_AUDIO_REQUEST_SIZE_1_2 56
+
+/**
+ * `sizeof(obc_audio_load_report)` in ABI 1.2, which introduced it: the
+ * smallest `struct_size` a module accepts.
+ */
+#define OBC_AUDIO_LOAD_REPORT_SIZE_1_2 24
+
+/**
+ * `sizeof(obc_module_vtable)` in ABI 1.0 (it ends after `check`): the
+ * smallest `struct_size` a host accepts.
+ */
+#define OBC_MODULE_VTABLE_SIZE_1_0 136
+
+/**
+ * The size of the vtable of ABI 1.2, which appends `audio_instance_load`
+ * and `audio_instance_process` (1.1 appends no entry).
+ */
+#define OBC_MODULE_VTABLE_SIZE_1_2 152
+
+/**
+ * The size of the vtable of ABI 1.3, which appends
+ * `instance_status_values`.
+ */
+#define OBC_MODULE_VTABLE_SIZE_1_3 160
+
+/**
+ * The size of the vtable of ABI 1.4, which appends
+ * `instance_set_background` (1.5 and 1.6 append no entry).
+ */
+#define OBC_MODULE_VTABLE_SIZE_1_4 168
 
 /**
  * An instance of a module (one chain of its stages for one stream),
@@ -166,6 +320,10 @@ typedef uint32_t obc_audio_format;
 /**
  * The type of the exported `obc_module_abi_version` symbol: returns the
  * packed ABI version the module was built against. Side-effect free.
+ *
+ * Its name and its signature are the same in every major version of the
+ * ABI, so that a host can tell a library of another major version before
+ * it calls anything else of it.
  */
 typedef uint32_t (*obc_module_abi_version_fn)(void);
 
@@ -417,13 +575,15 @@ typedef struct obc_chain_request {
 /**
  * What `instance_load` reports. The host sets `struct_size` and zeroes the
  * rest; the module fills in the fields that fit in `struct_size`. A host of
- * ABI 1.4 or older passes `OBC_LOAD_REPORT_SIZE_1_0`, so a module never
- * writes `notice` for it; a module of ABI 1.4 or older never writes it, so
- * the host reads the null it set.
+ * ABI 1.4 or older passes `OBC_LOAD_REPORT_SIZE_1_0`, and so does a host
+ * of 1.6 or later to a module of ABI 1.4 or older (version gating), so a
+ * module never writes `notice` for it; a module of ABI 1.4 or older never
+ * writes it, so the host reads the null it set.
  */
 typedef struct obc_load_report {
     /**
-     * `sizeof(obc_load_report)` as the host was built.
+     * `sizeof(obc_load_report)` of the ABI version the host presents to
+     * the module (see `OBC_MODULE_ABI_MINOR`): at most its own.
      */
     uint32_t struct_size;
     /**
@@ -636,6 +796,8 @@ typedef struct obc_status_value {
     const char *stage;
     /**
      * The name of the value, unique within the stage. NUL-terminated.
+     * Names starting with `obc.` are the host's: a host drops a value of
+     * such a name.
      */
     const char *name;
     /**
@@ -657,7 +819,39 @@ typedef struct obc_status_value {
  *
  * Every entry is declared nullable; those marked required must be set. A
  * later minor version only appends entries, so a host reads an entry only
- * when it fits in `struct_size`.
+ * when it fits in `struct_size` and the module's declared minor version
+ * defines it (see `OBC_MODULE_ABI_MINOR`).
+ *
+ * **Required entries per kind.** `init`, `probe`, `describe_settings`,
+ * `instance_create`, `instance_destroy`, `instance_reset_temporal`,
+ * `instance_unload`, `last_error`, `instance_last_error` and `destroy`
+ * are required of every module. `instance_load` and `instance_process` are
+ * required of a `video-stage` module; `audio_instance_load` and
+ * `audio_instance_process` of an `audio-filter` module. A module of one
+ * kind may leave the entries of another kind null (since ABI 1.6; a host
+ * of 1.5 or older requires `instance_load` and `instance_process` of every
+ * module). A kind added later binds its own entries only.
+ *
+ * **Threads.** Calls on one instance are serialised (never concurrent)
+ * and may come from different threads: there is no thread affinity. For
+ * CUDA frames the frames' context is current on the calling thread during
+ * the call. A module may run threads of its own; it stops (joins) them
+ * before `instance_destroy` (an instance's) or `destroy` (the module
+ * object's) returns, and from them only `obc_host::log` may be called, unless the
+ * documentation of a callback says otherwise.
+ *
+ * **GPU contexts.** A module never creates a CUDA context for the host's
+ * frames and never touches their context. Its runtime may hold the
+ * device's primary context while a GPU session of the module lives, if
+ * the module counts its sessions, resets the primary context when the
+ * last one ends, restores the context current on the calling thread
+ * before it returns, and makes no GPU call in `init`, `probe` or `check`,
+ * nor at all under `_host.cuda = false`. An `audio-filter` module, in a
+ * process of its own, may create a context in `audio_instance_load`.
+ *
+ * **The process.** A module assumes nothing of the process that hosts
+ * it: it sets no signal handler, changes no environment variable, working
+ * directory or locale, does not fork and does not exit.
  */
 typedef struct obc_module_vtable {
     /**
@@ -699,7 +893,8 @@ typedef struct obc_module_vtable {
      */
     void (*instance_destroy)(struct obc_instance *instance);
     /**
-     * Required. Loads a chain of the module's stages. A load on a loaded
+     * Required of a `video-stage` module (null allowed for another kind
+     * since ABI 1.6). Loads a chain of the module's stages. A load on a loaded
      * instance is a **switch** when the request keeps the frames of the
      * loaded chain (the same input kind, input and output formats and
      * sizes, matrix, chroma siting, range and CUDA handles: only stages,
@@ -717,7 +912,8 @@ typedef struct obc_module_vtable {
                                 const struct obc_chain_request *request,
                                 struct obc_load_report *out_report);
     /**
-     * Required. Enqueues one frame through the loaded chain. `out` equals
+     * Required of a `video-stage` module (null allowed for another kind
+     * since ABI 1.6). Enqueues one frame through the loaded chain. `out` equals
      * `in` only for in-place chains. The `n_live` per-frame parameters
      * (`live` may be null when 0) apply from this frame on.
      */
@@ -747,12 +943,15 @@ typedef struct obc_module_vtable {
                                    const struct obc_timing **out,
                                    size_t *n);
     /**
-     * Nullable (null: nothing to do). The stream is about to stop for a
-     * while: release what can be rebuilt quickly.
+     * Reserved, nullable (a module leaves it null). No host of ABI 1.x
+     * calls it, unless a later minor version defines it, and then only for
+     * a module that declares that version. (Meant for: the stream is about
+     * to stop for a while, release what can be rebuilt quickly.)
      */
     obc_status (*instance_park)(struct obc_instance *instance);
     /**
-     * Nullable (null: nothing to do). The stream resumes after a park.
+     * Reserved, nullable, as `instance_park` (meant for: the stream
+     * resumes after a park).
      */
     obc_status (*instance_unpark)(struct obc_instance *instance);
     /**

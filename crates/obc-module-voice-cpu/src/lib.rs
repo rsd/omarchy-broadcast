@@ -228,13 +228,9 @@ impl AudioInstance for VoiceInstance {
             engine.latency_samples(),
             if reused { ", reused" } else { "" }
         );
-        Ok(AudioLoadReport {
-            load_ms,
-            warmup_ms: None,
-            frame_samples: None,
-            latency_samples: engine.latency_samples(),
-            reused_model: reused,
-        })
+        Ok(AudioLoadReport::new(load_ms)
+            .with_latency_samples(engine.latency_samples())
+            .with_reused_model(reused))
     }
 
     fn process_audio(
