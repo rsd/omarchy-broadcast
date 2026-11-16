@@ -118,6 +118,7 @@ pkgrel=1
 # package() fails when it does not.
 _module_abi=1.6
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
+url='https://github.com/rsd/omarchy-broadcast'
 arch=('x86_64')
 # The project is MIT OR Apache-2.0. The CPU voice module statically includes
 # nnnoiseless (RNNoise, BSD-3-Clause) and the daemon and the worker libloading (ISC), whose
@@ -144,7 +145,6 @@ makedepends=(
   'cargo'
   'git'
   'clang'                  # bindgen (libspa-sys, pipewire-sys) for the PipeWire node
-  'libpipewire'            # the libpipewire and SPA headers
 )
 checkdepends=(
   'dbus'                   # /usr/bin/dbus-daemon: the process and CLI tests run a private bus
