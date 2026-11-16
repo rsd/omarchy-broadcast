@@ -28,9 +28,25 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    omarchy_broadcastd::log::set_verbose(args.verbose);
+    // SAFETY: nothing has started a thread yet (the async runtime and every
+    // worker thread start in `daemon::run`), so the environment can change.
+    unsafe { obc_core::sdk_env::apply(&obc_core::sdk_env::BROADCASTD, &mut log_sdk_env) };
     omarchy_broadcastd::daemon::run(omarchy_broadcastd::daemon::Options {
         config: args.config,
         state: args.state,
         verbose: args.verbose,
     })
+}
+
+/// Logs a line of the SDK environment check ([`obc_core::sdk_env`]).
+fn log_sdk_env(level: obc_core::sdk_env::Level, msg: &str) {
+    use obc_core::sdk_env::Level as L;
+    use omarchy_broadcastd::log::{Level, line};
+    let level = match level {
+        L::Debug => Level::Debug,
+        L::Info => Level::Info,
+        L::Warning => Level::Warning,
+    };
+    line(level, msg);
 }

@@ -2,9 +2,12 @@ Third-party licence notices for Omarchy Broadcast
 =================================================
 
 Omarchy Broadcast itself is licensed under MIT OR Apache-2.0 (LICENSE-MIT and
-LICENSE-APACHE). The audio module libobc_module_voice_cpu.so and the audio
-worker omarchy-broadcast-audiod statically include the third-party code
-below, whose licences require that these notices accompany the binaries. The
+LICENSE-APACHE). The audio module libobc_module_voice_cpu.so, the daemon
+omarchy-broadcastd, the audio worker omarchy-broadcast-audiod and the module
+libraries (libobc_module_maxine.so, libobc_module_maxine_ar.so,
+libobc_module_afx.so and libobc_module_onnx.so) statically include the
+third-party code below, whose licences require that these notices accompany
+the binaries; every package built from this repository installs this file. The
 texts are reproduced verbatim (indented) from the licence files of the
 crates named, at the versions locked in Cargo.lock. The remaining
 dependencies are under MIT, Apache-2.0 or similar permissive licences, each
@@ -82,10 +85,17 @@ stated in its own crate; their sources carry the licence files.
     CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
-3. libloading 0.8.9 (ISC)
+3. libloading 0.8.9 and 0.9.0 (ISC)
    https://github.com/nagisa/rust_libloading
-   Statically linked into omarchy-broadcast-audiod, which loads the module
-   libraries with it. Licence file: LICENSE.
+   Version 0.8.9 is statically linked into omarchy-broadcastd and
+   omarchy-broadcast-audiod, which load the module libraries with it, and into
+   libobc_module_maxine.so, libobc_module_maxine_ar.so, libobc_module_afx.so
+   and libobc_module_onnx.so, which open the SDKs' and the GPU's libraries
+   with it. Version 0.9.0 is statically linked into libobc_module_onnx.so as
+   well: the module itself and the ort crate (its bindings to ONNX Runtime)
+   use it. libobc_module_voice_cpu.so, the command-line client and the
+   microphone host's plug-in do not include libloading. Licence file:
+   LICENSE, with the same text in both versions.
 
     Copyright © 2015, Simonas Kazlauskas
 

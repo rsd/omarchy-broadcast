@@ -413,9 +413,9 @@ relight_brightness = 100
 # directory, the one that contains lib/, features/ and external/. The daemon
 # loads the SDK's libraries from it itself, so LD_LIBRARY_PATH is not needed.
 # The SDK root is, in this order: the MAXINE_VFX_ROOT environment variable
-# when it is set and not empty (the maxine-vfx-sdk-local environment file
-# sets it, so a daemon started with that file ignores this key, and logs
-# so); this key; /opt/nvidia/maxine/videofx when that directory exists
+# when it is set and not empty (the daemon never applies the root that the
+# maxine-vfx-sdk-local environment file sets, so the package does not hide
+# this key; a variable you set yourself does, and the daemon logs so); this key; /opt/nvidia/maxine/videofx when that directory exists
 # (where the maxine-vfx-sdk-local package installs it); else the library
 # search path. A missing directory is found out when an effect starts (see
 # privacy). The root is taken when the SDK is first loaded, by the first
@@ -627,8 +627,9 @@ force_conflicts = false
 #
 # The Maxine AR module (eye contact and auto-framing) takes the same key for
 # the NVIDIA Maxine AR SDK, whose root is, in this order: the MAXINE_AR_ROOT
-# environment variable when it is set and not empty (the maxine-ar-sdk-local
-# environment file sets it, and then this key is ignored); this key;
+# environment variable when it is set and not empty (never applied from the
+# maxine-ar-sdk-local environment file, so the package does not hide this
+# key); this key;
 # /opt/nvidia/maxine/arsdk when that directory exists. It takes no other key.
 # See docs/setup/maxine.md.
 #   [module."br.com.dias.maxine-ar"]
@@ -638,9 +639,10 @@ force_conflicts = false
 # echo removal and studio voice, run by the audio worker) takes the same key
 # for the NVIDIA Maxine Audio Effects SDK. Its root is, in this order, the
 # reverse of the video modules': this key when set; else the MAXINE_AFX_ROOT
-# environment variable (the maxine-afx-sdk-local environment file sets it, and
-# this key still wins); else /opt/nvidia/maxine/afx when that directory
-# exists. The worker's LD_LIBRARY_PATH must lead to that root's libraries (the
-# worker's drop-in sets it). It takes no other key. See docs/setup/microphone.md.
+# environment variable (never applied from the maxine-afx-sdk-local
+# environment file, and this key wins over it); else /opt/nvidia/maxine/afx
+# when that directory exists. The worker's LD_LIBRARY_PATH must lead to that
+# root's libraries (the worker sets it from the package's environment file
+# when it starts; for another root, set it in a drop-in). It takes no other key. See docs/setup/microphone.md.
 #   [module."br.com.dias.maxine-afx"]
 #   sdk_root = "/home/user/.local/opt/maxine/afx"

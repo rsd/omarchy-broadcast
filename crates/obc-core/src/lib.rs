@@ -6,8 +6,10 @@
 //! isolation. The only filesystem access is reading the daemon's config files
 //! and reading and writing its state file ([`config`]), and writing the one
 //! managed drop-in of the config set, `config.d/50-panel.toml`
-//! ([`config_d`]). Nothing here knows
-//! about a particular camera model.
+//! ([`config_d`]), and the daemons' start-up check for an installed
+//! NVIDIA Maxine SDK, which reads its environment file and executes the
+//! process again with it ([`sdk_env`]). Nothing here knows about a
+//! particular camera model.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,7 @@ pub mod config;
 pub mod config_d;
 pub mod config_schema;
 pub mod modules;
+pub mod sdk_env;
 
 /// Card label of the dedicated virtual camera (see
 /// `docs/adr/0004-v4l2loopback-first.md`).

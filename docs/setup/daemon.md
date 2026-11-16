@@ -12,7 +12,7 @@
 
 ### Arch package
 
-`packaging/arch/PKGBUILD` builds `omarchy-broadcast-git` from the committed HEAD of the local checkout (uncommitted changes are not included). Build from `packaging/arch`, then install the result:
+`packaging/arch/PKGBUILD` builds, from the committed HEAD of the local checkout (uncommitted changes are not included), one split package of five: the core `omarchy-broadcast-git` and a package per loadable module (see the table in the README, "Install"). Build from `packaging/arch`, then install the core, and the module packages you want from the same build:
 
 ```sh
 cd packaging/arch
@@ -20,15 +20,15 @@ makepkg -s
 sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
 ```
 
-The package installs:
+The core package, `omarchy-broadcast-git`, installs:
 
 - `/usr/bin/omarchy-broadcastd` and `/usr/bin/omarchy-broadcast`;
 - the unit `/usr/lib/systemd/user/omarchy-broadcastd.service`;
 - the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service`;
-- the Maxine module, `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so`, with its manifest in `/usr/lib/omarchy-broadcast/modules.d/` ([maxine.md](maxine.md#the-maxine-module), [../modules.md](../modules.md)), and the C header of the module interface, `/usr/include/omarchy-broadcast/omarchy_broadcast_module.h`;
+- the directories modules are found in, `/usr/lib/omarchy-broadcast/modules` (libraries) and `/usr/lib/omarchy-broadcast/modules.d` (manifests), with the CPU voice module in them; the other modules are packages of their own built from the same `PKGBUILD` (`omarchy-broadcast-maxine-vfx-git`, `-maxine-ar-git`, `-maxine-afx-git` and `-onnx-git`; [maxine.md](maxine.md#the-maxine-module), [onnx.md](onnx.md), [../modules.md](../modules.md)), each depending on the core of the same version; and the C header of the module interface, `/usr/include/omarchy-broadcast/omarchy_broadcast_module.h`;
 - the udev rule for the MX Brio, `/usr/lib/udev/rules.d/70-omarchy-broadcast-mx-brio.rules`, which lets the daemon read the camera's Show Mode ([below](#the-udev-rule-for-the-mx-brio));
 - the licences and this documentation, in `/usr/share/doc/omarchy-broadcast/`;
-- the optional drop-ins as inactive examples in `/usr/share/doc/omarchy-broadcast/examples/systemd/` (`wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire", and `omarchy-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#3-enable-the-drop-in)).
+- the optional WirePlumber drop-in as an inactive example in `/usr/share/doc/omarchy-broadcast/examples/systemd/wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire". The Maxine SDKs need no drop-in: the daemon applies the SDK package's environment to itself at start ([maxine.md](maxine.md#3-the-sdk-environment)).
 
 Nothing is enabled. Each user runs:
 
@@ -342,7 +342,7 @@ systemctl --user disable --now omarchy-broadcastd
 
 Then, depending on how it was installed:
 
-- Arch package: `sudo pacman -R omarchy-broadcast-git`, which removes the udev rule too. Remove any drop-in you copied from the examples. The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
+- Arch package: `sudo pacman -R omarchy-broadcast-git` (after any module package, which depends on it), which removes the udev rule too. Remove any drop-in you copied from the examples (the WirePlumber one; a Maxine drop-in copied for an earlier version is not needed any more, see [maxine.md](maxine.md#3-the-sdk-environment)). The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
 - Per-user install: `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed, the Maxine module's library and manifest among them, and refuses while the unit is still enabled, hence the command above comes first. A hand-made Maxine manifest stops it too; remove the files named in [maxine.md](maxine.md#8-uninstall) first.
 - Manual install:
 

@@ -8,7 +8,7 @@
 - Both need the face. Gaze redirection finds and tracks the largest face inside its own feature; auto-framing needs the same face to move its crop.
 - The module interface at this point has no stage that changes the size or the region of the frame, and the host's ingest scales the camera picture to the output size before the stages run. A framing stage therefore works on a frame that is already at the output size.
 - A stage that cannot run must never take the camera down. Eye contact and framing hide nothing the user wants hidden, unlike the cut-out ([../modules.md](../modules.md#failure-semantics)).
-- The AR SDK's libraries read `/etc/os-release` as the Video Effects SDK's do, so the same os-release preload shim applies ([../setup/maxine.md](../setup/maxine.md#3-enable-the-drop-in)).
+- The AR SDK's libraries read `/etc/os-release` as the Video Effects SDK's do, so the same os-release preload shim applies ([../setup/maxine.md](../setup/maxine.md#3-the-sdk-environment)).
 - Both SDKs may be installed on one machine, and the daemon may load both in one process (the Maxine module's stages and these). Both ship a `libNVCVImage` of the same soname.
 
 ## Decision
@@ -16,7 +16,7 @@
 
 ### One module for both stages
 - The two stages share one SDK root, one set of loaded libraries and the face the SDK tracked on the frame: when `eye-contact` runs first on a frame, `auto-frame` takes its face and runs no detector of its own. They remain independent for availability and failure: each has its own probe (eye contact needs gaze redirection, face detection and 126-point landmark models for the GPU; auto-framing needs face box detection only), its own switch and its own failure.
-- A manifest `maxine-ar.toml` with the module id, the library `libobc_module_maxine_ar.so`, and two `[[stage]]` tables (`pre-matte`, positions 10 and 20, CUDA frames, NV12), installed like the Maxine module's: by the Arch package, with `maxine-ar-sdk-local` as an optional dependency, and by `scripts/install-user.sh`.
+- A manifest `maxine-ar.toml` with the module id, the library `libobc_module_maxine_ar.so`, and two `[[stage]]` tables (`pre-matte`, positions 10 and 20, CUDA frames, NV12), installed like the Maxine module's: by the Arch package, with `maxine-ar-sdk-local` as an optional dependency, and by `scripts/install-user.sh`. *Amended by [ADR-0039](0039-self-applied-sdk-environment-and-module-packages.md): the module is the Arch package `omarchy-broadcast-maxine-ar-git`, which depends on `maxine-ar-sdk-local`.*
 - The library has no NVIDIA code and opens the SDK at run time, so it builds, installs and loads on a machine without the SDK or the GPU. The probe reads the SDK tree only (no `dlopen`, no CUDA), so it never wakes a suspended GPU; a stage the SDK or the models for this GPU cannot serve is greyed with a reason in plain words.
 
 ### Its own SDK loading, not the Maxine module's
@@ -54,7 +54,7 @@
 ## Consequences
 - A user with the AR SDK gets two new switches in the settings tree, in the bar and in `omarchy-broadcast settings`, with no change to the clients. Without the SDK or the models for the GPU they are greyed, with the reason.
 - The AR SDK's `libNVCVImage` exports the GCC 8 `libstdc++` it links statically. The module opens the system `libstdc++.so.6` globally before the SDK's libraries, so that one runtime serves the process. Without it, `NvAR_Load` of the face-box model could abort with `free(): invalid size` when the system runtime was loaded first, for example by GStreamer's CUDA plugins.
-- The shim of the Video Effects drop-in is process-wide, so it serves both SDKs. A machine with only the AR SDK needs the AR package's own shim and environment, and the shipped drop-in names the Video Effects package's files ([../setup/maxine.md](../setup/maxine.md#the-maxine-ar-module)).
+- The shim of the Video Effects drop-in is process-wide, so it serves both SDKs. A machine with only the AR SDK needs the AR package's own shim and environment, and the shipped drop-in names the Video Effects package's files ([../setup/maxine.md](../setup/maxine.md#the-maxine-ar-module)). *Amended by [ADR-0039](0039-self-applied-sdk-environment-and-module-packages.md): there is no drop-in. The daemon applies the AR package's environment as well, after the Video Effects one, and preloads one shim, the first complete SDK's (the AR package's when it is the only one).*
 - Auto-framing costs detail at high zoom (above). Eye contact changes the eyes only, and only for one face.
 - The NVIDIA licence applies as for the other module: the SDK is the user's own download, is never distributed here, and no figures are published.
 - Two copies of the loading code exist (the Video Effects backend's and this module's). They are small and describe two SDK trees; a change to one is not automatically a change to the other.

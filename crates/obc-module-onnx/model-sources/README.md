@@ -6,7 +6,7 @@ The module's catalogue (`src/catalogue.rs`) names four ONNX files and their SHA-
 https://github.com/rsd/omarchy-onnx-models/releases/download/<tag>/<file>
 ```
 
-The current release is [`v1.0.0`](https://github.com/rsd/omarchy-onnx-models/releases/tag/v1.0.0); its assets are the four files below, `LICENSE-Apache-2.0`, `NOTICE`, `MANIFEST.toml` and `SHA256SUMS`. `packaging/arch-onnx/PKGBUILD` downloads the four files from it and checks each against the SHA-256 below; a file that differs fails the build.
+The current release is [`v1.0.0`](https://github.com/rsd/omarchy-onnx-models/releases/tag/v1.0.0); its assets are the four files below, `LICENSE-Apache-2.0`, `NOTICE`, `MANIFEST.toml` and `SHA256SUMS`. The model packages `omarchy-onnx-model-<id>` (`packaging/arch/PKGBUILD` of that repository, version 1.0.0) download the files from it and check each against the release's SHA-256, the same as below; a file that differs fails the build. omarchy-broadcast builds none of them: its module package `omarchy-broadcast-onnx-git` depends on the default model's package.
 
 | Catalogue file | Made from | SHA-256 |
 |---|---|---|
@@ -15,4 +15,4 @@ The current release is [`v1.0.0`](https://github.com/rsd/omarchy-onnx-models/rel
 | `pp_humansegv2_lite_192x192.onnx` | The same recipe; `paddle2onnx` raises it to opset 14 | `ca96b4436f1ce6a76059e8902e20a9617f6829fb11f6c6c9e876563e6352e6b4` |
 | `modnet_photographic.onnx` | The upstream ONNX export, unmodified | `07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9` |
 
-The licences and notices that the module package installs beside the files are in [LICENSES.md](LICENSES.md) and [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0).
+The licences and notices that each model package installs (in `/usr/share/licenses/omarchy-onnx-model-<id>/`, beside the file in `/usr/share/omarchy-onnx-models/`) are in [LICENSES.md](LICENSES.md) and [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0).

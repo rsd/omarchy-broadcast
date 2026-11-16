@@ -22,9 +22,9 @@
 //! [`Sdk::create`] calls the SDK only when the first `LD_LIBRARY_PATH`
 //! directory that holds the file leads to the feature's `lib` directory
 //! of this root ([`search_path`]); otherwise the stage fails with a reason
-//! that names [`ENV`] and the worker's systemd drop-in [`DROP_IN`], which
-//! sets the variable from the SDK package's environment file. So the
-//! library always comes from the root in use.
+//! that names [`ENV`] and the SDK package [`PACKAGE`], whose environment
+//! file sets the variable: the audio worker applies that file to itself
+//! when it starts. So the library always comes from the root in use.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -41,8 +41,9 @@ pub const CORE_UNVERSIONED: &str = "libnv_audiofx.so";
 
 /// The library search path variable the feature libraries are found on.
 pub const ENV: &str = "LD_LIBRARY_PATH";
-/// The audio worker's systemd drop-in that sets [`ENV`] for the SDK.
-pub const DROP_IN: &str = "omarchy-broadcast-audiod.service.d/maxine-afx.conf";
+/// The SDK package whose environment file sets [`ENV`]; the audio worker
+/// applies that file to itself when it starts.
+pub const PACKAGE: &str = "maxine-afx-sdk-local";
 
 /// The SDK's status codes the module names in its messages.
 pub mod status {
@@ -198,7 +199,7 @@ pub fn feature_library(selector: &str) -> String {
 /// Whether the library search path `ld_library_path` leads to the
 /// feature library `name` of `dir`: the first of its directories that
 /// holds `name` must lead (links resolved) to a file of `dir`. `Err`: why
-/// not, naming [`ENV`] and [`DROP_IN`] (or that `name` is not in `dir`).
+/// not, naming [`ENV`] and [`PACKAGE`] (or that `name` is not in `dir`).
 pub fn search_path(dir: &Path, name: &str, ld_library_path: Option<&str>) -> Result<(), String> {
     let canon = |p: &Path| std::fs::canonicalize(p).ok();
     let want = canon(dir);
@@ -228,7 +229,8 @@ pub fn search_path(dir: &Path, name: &str, ld_library_path: Option<&str>) -> Res
     };
     Err(format!(
         "the library search path does not lead to {name} of this SDK root ({ENV}: {why}); \
-         start the audio worker with the drop-in {DROP_IN}, which sets {ENV}"
+         install the {PACKAGE} package: the audio worker applies its environment file, \
+         which sets {ENV}, when it starts and logs it (unless OBC_NO_SDK_ENV is set)"
     ))
 }
 
@@ -553,10 +555,10 @@ mod tests {
             Ok(())
         );
         // Not on it, or another directory's copy first: refused, naming
-        // the variable and the drop-in.
+        // the variable and the package.
         for ld in [None, Some(b_dir.to_string())] {
             let e = search_path(a.path(), &name, ld.as_deref()).unwrap_err();
-            assert!(e.contains(ENV) && e.contains(DROP_IN), "{e}");
+            assert!(e.contains(ENV) && e.contains(PACKAGE), "{e}");
         }
         std::fs::write(b.path().join(&name), b"").unwrap();
         let e = search_path(a.path(), &name, Some(&format!("{b_dir}:{a_dir}"))).unwrap_err();

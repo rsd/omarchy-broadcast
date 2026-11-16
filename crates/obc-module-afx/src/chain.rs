@@ -426,9 +426,10 @@ pub fn build(
     }
     effect.load().map_err(|x| {
         fail(format!(
-            "{x}. Is the worker started with the SDK's environment and its os-release shim \
-             (the drop-in {})?",
-            ffi::DROP_IN
+            "{x}. Is the worker started with the SDK's environment and its os-release shim? \
+             The worker applies those of the {} package when it starts and logs it, unless \
+             OBC_NO_SDK_ENV is set",
+            ffi::PACKAGE
         ))
     })?;
     let frame = effect.get_u32(param::FRAME).map_err(e)?;

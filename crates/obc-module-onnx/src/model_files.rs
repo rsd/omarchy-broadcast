@@ -8,7 +8,9 @@
 //! 2. `$OBC_ONNX_MODEL_DIR`;
 //! 3. `$XDG_DATA_HOME/omarchy-broadcast/models/onnx/` (by default
 //!    `~/.local/share/omarchy-broadcast/models/onnx/`);
-//! 4. `/usr/share/omarchy-broadcast/models/onnx/`.
+//! 4. `/usr/share/omarchy-onnx-models/` (the per-model packages
+//!    `omarchy-onnx-model-<id>`);
+//! 5. `/usr/share/omarchy-broadcast/models/onnx/`.
 //!
 //! The file found is read once, and its bytes checked against the
 //! catalogue's SHA-256 and handed to ONNX Runtime; a file that differs fails the load (it is not skipped for a
@@ -24,7 +26,10 @@ use crate::catalogue::ModelSpec;
 
 /// The environment variable naming a model directory.
 pub const MODEL_DIR_ENV: &str = "OBC_ONNX_MODEL_DIR";
-/// The packaged model directory.
+/// The directory the per-model packages `omarchy-onnx-model-<id>` install
+/// into.
+pub const MODELS_PACKAGE_DIR: &str = "/usr/share/omarchy-onnx-models";
+/// The model directory of the omarchy-broadcast package.
 pub const SYSTEM_MODEL_DIR: &str = "/usr/share/omarchy-broadcast/models/onnx";
 /// The model directory under the user's data directory.
 pub const USER_MODEL_SUBDIR: &str = "omarchy-broadcast/models/onnx";
@@ -49,6 +54,7 @@ pub fn search_dirs(
     if let Some(d) = data {
         dirs.push(d.join(USER_MODEL_SUBDIR));
     }
+    dirs.push(PathBuf::from(MODELS_PACKAGE_DIR));
     dirs.push(PathBuf::from(SYSTEM_MODEL_DIR));
     dirs
 }
@@ -119,7 +125,12 @@ pub fn read_checked(path: &Path, expected: &str) -> Result<Vec<u8>, String> {
 
 /// Finds the file of `model` in `dirs`, reads it and checks it.
 pub fn resolve(model: &ModelSpec, dirs: &[PathBuf]) -> Result<Checked, String> {
-    let path = locate(model.file, dirs)?;
+    let path = locate(model.file, dirs).map_err(|e| {
+        format!(
+            "{e}; install the package omarchy-onnx-model-{} ({MODELS_PACKAGE_DIR}/{})",
+            model.id, model.file
+        )
+    })?;
     let bytes =
         read_checked(&path, model.sha256).map_err(|e| format!("{e} (searched: {})", list(dirs)))?;
     Ok(Checked { path, bytes })
@@ -154,6 +165,7 @@ mod tests {
                 PathBuf::from("/cfg"),
                 PathBuf::from("/env"),
                 PathBuf::from("/data/omarchy-broadcast/models/onnx"),
+                PathBuf::from(MODELS_PACKAGE_DIR),
                 PathBuf::from(SYSTEM_MODEL_DIR),
             ]
         );
@@ -171,13 +183,26 @@ mod tests {
             dirs,
             [
                 PathBuf::from("/home/u/.local/share/omarchy-broadcast/models/onnx"),
+                PathBuf::from(MODELS_PACKAGE_DIR),
                 PathBuf::from(SYSTEM_MODEL_DIR),
             ]
         );
         assert_eq!(
             search_dirs(None, env(&[])),
-            [PathBuf::from(SYSTEM_MODEL_DIR)]
+            [
+                PathBuf::from(MODELS_PACKAGE_DIR),
+                PathBuf::from(SYSTEM_MODEL_DIR)
+            ]
         );
+    }
+
+    #[test]
+    fn the_per_model_package_directory_is_just_before_the_broadcast_one() {
+        let dirs = search_dirs(None, env(&[("HOME", "/home/u")]));
+        let at = |d: &str| dirs.iter().position(|p| p == Path::new(d)).unwrap();
+        assert_eq!(MODELS_PACKAGE_DIR, "/usr/share/omarchy-onnx-models");
+        assert_eq!(at(MODELS_PACKAGE_DIR) + 1, at(SYSTEM_MODEL_DIR));
+        assert_eq!(at(SYSTEM_MODEL_DIR), dirs.len() - 1);
     }
 
     fn spec(file: &'static str, sha256: &'static str) -> ModelSpec {
@@ -228,6 +253,19 @@ mod tests {
             "{e}"
         );
         assert!(e.contains("searched"), "{e}");
+    }
+
+    #[test]
+    fn a_missing_model_names_its_package_and_the_system_path() {
+        let d = tempfile::tempdir().unwrap();
+        let e = resolve(&spec("m.onnx", ABC), &[d.path().to_path_buf()])
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("install the package omarchy-onnx-model-t"),
+            "{e}"
+        );
+        assert!(e.contains("/usr/share/omarchy-onnx-models/m.onnx"), "{e}");
     }
 
     #[test]

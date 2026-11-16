@@ -84,8 +84,9 @@
 //! feature library and its models for this GPU ([`tree::unavailable`]),
 //! and whether the library search path leads to the feature library
 //! ([`ffi::search_path`]: the SDK finds it there, so a worker started
-//! without the drop-in `omarchy-broadcast-audiod.service.d/maxine-afx.conf`
-//! has the stages unavailable, with that reason). The check opens the
+//! without the environment of the SDK package `maxine-afx-sdk-local`,
+//! which the worker applies to itself when it starts, has the stages
+//! unavailable, with that reason). The check opens the
 //! SDK's core library (once per process) and makes the same check of the
 //! feature libraries, creating no CUDA context. The GPU is used from
 //! `audio_instance_load` on only, and every effect is destroyed on unload.
@@ -129,9 +130,11 @@ pub const REASON_NO_DRIVER: &str = "NVIDIA driver not loaded";
 
 /// The probe's reason when the library search path does not lead to an
 /// effect's feature library.
-pub const REASON_NO_SEARCH_PATH: &str = "The audio worker's LD_LIBRARY_PATH does not name the \
-     Maxine feature libraries: install the drop-in \
-     omarchy-broadcast-audiod.service.d/maxine-afx.conf";
+pub const REASON_NO_SEARCH_PATH: &str = "The audio worker's LD_LIBRARY_PATH does not lead to \
+     the Maxine feature libraries of the SDK root in use: for the default root, install the \
+     maxine-afx-sdk-local package (the worker applies its environment when it starts and logs \
+     it, unless OBC_NO_SDK_ENV is set); for another SDK tree, start the worker with \
+     LD_LIBRARY_PATH naming that tree's feature libraries";
 
 /// The parameter key of a strength, in percent.
 pub const STRENGTH_KEY: &str = "strength";
