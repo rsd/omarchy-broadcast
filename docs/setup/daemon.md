@@ -36,7 +36,32 @@ Nothing is enabled. Each user runs:
 systemctl --user enable --now omarchy-broadcastd
 ```
 
-The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). `ffmpeg` is an optional dependency (`optdepends`): the daemon runs it, at low priority, to convert an animated GIF, WebP or APNG at import and to make the poster of an imported video. On a machine without an NVIDIA GPU it is also the program of the command that converts a video the CPU cannot play ([Playing a video without an NVIDIA GPU](#playing-a-video-without-an-nvidia-gpu)); the daemon never runs that command. The bundled video loops need none of it, and with an NVIDIA GPU a video plays as it is ([../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md)). The NVIDIA Maxine VFX SDK is never part of the package; it is an optional dependency (`optdepends`) on `maxine-vfx-sdk-local`, which you build yourself from the omarchy-nvidia-sdks repository and install as in [maxine.md](maxine.md).
+The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). `ffmpeg` is an optional dependency (`optdepends`): the daemon runs it, at low priority, to convert an animated GIF, WebP or APNG at import and to make the poster of an imported video. On a machine without an NVIDIA GPU it is also the program of the command that converts a video the CPU cannot play ([Playing a video without an NVIDIA GPU](#playing-a-video-without-an-nvidia-gpu)); the daemon never runs that command. The bundled video loops need none of it, and with an NVIDIA GPU a video plays as it is ([../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md)). The NVIDIA Maxine SDKs are never part of the packages: each Maxine module package depends on the SDK package of its own (`maxine-vfx-sdk-local`, `maxine-ar-sdk-local` or `maxine-afx-sdk-local`), which you build yourself from the omarchy-nvidia-sdks repository and install as in [maxine.md](maxine.md).
+
+### Publishing to the AUR
+
+The recipe for the AUR is the same split package under the pkgbase `omarchy-broadcast-git`; once it is published there, it can be installed from the AUR. The AUR copy of `packaging/arch/PKGBUILD` differs from it only in where it builds from: it clones `https://github.com/rsd/omarchy-broadcast.git` instead of the local checkout, and its header comment says so. `scripts/aur.sh` makes that copy: it replaces exactly the local-checkout header paragraph, the build hint and the `source=` line, and fails when one of them is not in the PKGBUILD exactly once (a change to one of those lines is made in the script too). It generates the `.SRCINFO` with `LC_ALL=C makepkg --printsrcinfo` on the copy, alone in an empty directory, in an environment holding only `PATH` and an empty `HOME`. The AUR repository holds exactly `PKGBUILD`, `.SRCINFO` and `LICENSE` (0BSD, written by the script too); `--aur` and `--check` refuse any other file in it.
+
+```sh
+scripts/aur.sh                  # prints the AUR PKGBUILD
+scripts/aur.sh --srcinfo        # prints its .SRCINFO
+scripts/aur.sh --check DIR      # fails, with a diff, when DIR's files are stale or DIR holds another file
+scripts/aur.sh --aur DIR        # writes PKGBUILD, .SRCINFO and LICENSE into DIR
+```
+
+`DIR` must be the top of a git clone of the AUR repository; the script commits nothing. The clone is kept in `aur/omarchy-broadcast-git`, which this repository ignores. To publish, after the release commit is pushed to GitHub:
+
+```sh
+git clone ssh://aur@aur.archlinux.org/omarchy-broadcast-git.git aur/omarchy-broadcast-git   # once
+scripts/aur.sh --aur aur/omarchy-broadcast-git
+cd aur/omarchy-broadcast-git
+git diff                        # review
+git add PKGBUILD .SRCINFO LICENSE
+git commit -m '0.55.0-1'
+git push
+```
+
+The committed `pkgver=` is the release version; makepkg replaces it with the output of `pkgver()` (`<version>.r<commits>.g<hash>`), which sorts after it. A new AUR commit is needed only when the PKGBUILD changes (a dependency, a file installed, a new version in `pkgver=`), not for every commit of the repository.
 
 ### Per-user install from a checkout
 

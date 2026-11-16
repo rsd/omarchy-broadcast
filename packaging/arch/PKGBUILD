@@ -1,4 +1,4 @@
-# Maintainer: Raul Dias
+# Maintainer: Raul Dias <raul@dias.com.br>
 #
 # Arch packages of omarchy-broadcast, built from the local git checkout that
 # holds this file (two directories up). Only committed content is built:
@@ -6,7 +6,8 @@
 # makepkg rewrites pkgver= below on each build; that change need not be
 # committed. The committed pkgver= is the workspace version in Cargo.toml: a
 # version bump changes both files, and scripts/check-all.sh fails while they
-# differ.
+# differ. scripts/aur.sh makes the AUR copy of this file, which builds from
+# the public repository instead (docs/setup/daemon.md, "Publishing to the AUR").
 #
 # One build makes five packages (a split package):
 #   omarchy-broadcast-git             the core: everything below that is not
@@ -37,6 +38,7 @@
 # is not part of these packages. Nothing is enabled: each user runs
 #   systemctl --user enable --now omarchy-broadcastd.service
 # The v4l2loopback device must be configured as in docs/setup/loopback.md.
+# (The docs/ files named here are installed in /usr/share/doc/omarchy-broadcast.)
 #
 # The daemon is built with PipeWire support (cargo feature
 # omarchy-broadcastd/pipewire): it can also offer the camera as a native
@@ -108,7 +110,7 @@ pkgname=(
   'omarchy-broadcast-onnx-git'
 )
 _pkgname=omarchy-broadcast
-pkgver=0.55.0
+pkgver=0.55.1
 pkgrel=1
 # The module ABI (<major>.<minor>) that the core provides and that the module
 # packages require. It must equal OBC_MODULE_ABI_MAJOR.OBC_MODULE_ABI_MINOR in
