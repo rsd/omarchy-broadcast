@@ -43,6 +43,17 @@
 //!   ([`REASON_FULL_RESOLUTION`]), or when its frames come in a format the
 //!   stage cannot read ([`REASON_FORMAT`]); enabled with no camera (it
 //!   applies when a camera is used).
+//! - The `disabled_kind` (revision 28) says which: `parent_off` for an
+//!   `enabled_when` condition that does not hold (the blur strength with
+//!   another mode than `blur` included), `not_applicable` for enhancement
+//!   refused by the capture mode or format, and for a stage that cannot
+//!   run its kind from the modules ([`Modules::stage_reason`]):
+//!   `other_provider`, or, while it cannot take the session's frames,
+//!   `needs_hardware` (the machine is known to have no NVIDIA GPU),
+//!   `not_applicable` (the configuration or the battery saver chose system
+//!   memory) or `unavailable` (CUDA found unusable, or a CUDA start fell
+//!   back: [`crate::modules::HostMemory::disabled_kind`]), else
+//!   `unavailable` with the module's reason.
 //!
 //! The typed `[effect]` keys of revision 8 (`denoise`, `enhance`,
 //! `relight`, `relight_light`, `relight_direction`, `relight_brightness`)
@@ -52,7 +63,7 @@
 use obc_core::EffectMode;
 use obc_core::config::{Config, EffectConfig, RuntimeState};
 use obc_core::modules::StoredValue;
-use obc_ipc::settings::SCOPE_GLOBAL;
+use obc_ipc::settings::{SCOPE_GLOBAL, disabled};
 use obc_ipc::{Condition, ConditionOp, Setting, SettingKind, SettingValue};
 use obc_module_host::registry::FRAME_GENERATION;
 use obc_module_host::settings::{Apply, Op, Role};
@@ -255,6 +266,7 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
     // module's reason, as `GetModules` gives it.
     let cannot_run = (declared && inp.modules.declares_in_memory(stage).is_none())
         .then(|| inp.modules.absent_reason(stage).1);
+    let cannot_run_kind = inp.modules.memory_kind();
     let offered = declared && cannot_run.is_none();
     if declared || effect.mode != EffectMode::None {
         let setting =
@@ -266,6 +278,7 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
                 stored,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
                 enabled_when: Vec::new(),
                 hint: Some(hint.into()),
                 description: None,
@@ -311,6 +324,7 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
         if effect.mode != EffectMode::Blur {
             blur.enabled = false;
             blur.disabled_reason = REASON_CHOOSE_BLUR.into();
+            blur.disabled_kind = disabled::PARENT_OFF.into();
         }
         let shown = match (offered, cannot_run) {
             (true, _) => vec![(mode, Binding::Mode), (blur, Binding::BlurStrength)],
@@ -320,9 +334,11 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
                 if effect.mode == EffectMode::None {
                     mode.enabled = false;
                     mode.disabled_reason.clone_from(&why);
+                    mode.disabled_kind = cannot_run_kind.into();
                 }
                 blur.enabled = false;
                 blur.disabled_reason.clone_from(&why);
+                blur.disabled_kind = cannot_run_kind.into();
                 vec![
                     (mode, Binding::ModeOffOnly(why)),
                     (blur, Binding::BlurStrength),
@@ -420,16 +436,17 @@ fn module_setting(
     let conditions_hold = enabled_when
         .iter()
         .all(|c| values(&c.id).is_none_or(|v| holds(c.op.clone(), &v, &c.value)));
-    let (enabled, reason) = match (&unavailable, refused) {
-        (Some(why), _) => (false, why.clone()),
-        (None, Some(why)) => (false, why.to_string()),
+    let (enabled, reason, why_kind) = match (&unavailable, refused) {
+        (Some(why), _) => (false, why.reason.clone(), why.kind),
+        (None, Some(why)) => (false, why.to_string(), disabled::NOT_APPLICABLE),
         (None, None) if !conditions_hold => (
             false,
             d.disabled_reason
                 .clone()
                 .unwrap_or_else(|| "Unavailable".to_string()),
+            disabled::PARENT_OFF,
         ),
-        _ => (true, String::new()),
+        _ => (true, String::new(), ""),
     };
     // A switch that cannot take effect is published off, which is what
     // runs; the stored choice is kept.
@@ -485,6 +502,7 @@ fn module_setting(
         stored: inp.runtime.settings.contains_key(&d.id),
         enabled,
         disabled_reason: reason,
+        disabled_kind: why_kind.into(),
         enabled_when,
         hint: d.hint.clone(),
         description: None,

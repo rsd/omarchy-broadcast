@@ -1835,9 +1835,9 @@ pub struct Controller<B: MediaBackend> {
     /// CUDA output failed for want of CUDA). System memory stays in force
     /// until the next reload.
     memory_fallback: Option<String>,
-    /// Why the CUDA presence probe found CUDA unusable at the last
+    /// The check of the CUDA presence probe that failed at the last
     /// resolution of [`Self::memory`] (`None`: usable, or not probed).
-    cuda_probe: Option<String>,
+    cuda_probe: Option<obc_gpu::presence::Cause>,
     /// The battery saver as last read ([`Self::read_saver`]).
     saver: SaverState,
     /// The power supplies could not be read at the last read: logged once.
@@ -1870,6 +1870,14 @@ pub struct Controller<B: MediaBackend> {
     /// Bumped when the worker's modules change: `ModulesSerial` is the
     /// registry's serial plus this.
     mic_serial: u32,
+    /// "Use as default microphone" requests handed to the agent and not
+    /// answered yet ([`MicEvent::DefaultMade`], [`MicEvent::DefaultNotMade`]):
+    /// the record they set is not known until then.
+    mic_making_default: u32,
+    /// The reply of a `mic.input.use_as_default` `false` written while
+    /// [`Self::mic_making_default`] was not 0: the restore runs once the
+    /// last of them is answered ([`Self::run_held_restore`]).
+    mic_held_restore: Option<Reply>,
 }
 
 /// Where a stage the user may have selected stands for a plan (the
@@ -2034,7 +2042,7 @@ impl<B: MediaBackend> Controller<B> {
             &self.config,
             self.paths.ledger.as_deref(),
             self.compute_capability,
-            HostMemory::of(&self.memory),
+            HostMemory::of(&self.memory, self.cuda_probe),
         );
         // The empty list was published before: the loaded one is a change.
         loaded.follow(&self.modules);
@@ -2121,7 +2129,7 @@ impl<B: MediaBackend> Controller<B> {
         let (saver, power) = saver_of(&mut backend, &config);
         let power_unreadable = note_power(&power, false);
         let cuda_probe = probe_of(&mut backend, &config, None);
-        let memory = effective_memory(&config, None, cuda_probe.as_deref(), &saver);
+        let memory = effective_memory(&config, None, cuda_reason(cuda_probe), &saver);
         info!("video memory: {memory}");
         let modules = if load_modules {
             Modules::load(
@@ -2129,7 +2137,7 @@ impl<B: MediaBackend> Controller<B> {
                 &config,
                 paths.ledger.as_deref(),
                 compute_capability,
-                HostMemory::of(&memory),
+                HostMemory::of(&memory, cuda_probe),
             )
         } else {
             Modules::empty()
@@ -2257,6 +2265,8 @@ impl<B: MediaBackend> Controller<B> {
             mic_gain_serial: 0,
             mic_device_sent: None,
             mic_serial: 0,
+            mic_making_default: 0,
+            mic_held_restore: None,
         };
         c.rescan_cameras();
         // The output modes the cameras found offer are known from the
@@ -2695,7 +2705,7 @@ impl<B: MediaBackend> Controller<B> {
         let memory = effective_memory(
             &self.config,
             self.memory_fallback.as_deref(),
-            self.cuda_probe.as_deref(),
+            cuda_reason(self.cuda_probe),
             &self.saver,
         );
         if memory != self.memory {
@@ -2781,7 +2791,7 @@ impl<B: MediaBackend> Controller<B> {
         let now = effective_memory(
             &self.config,
             self.memory_fallback.as_deref(),
-            self.cuda_probe.as_deref(),
+            cuda_reason(self.cuda_probe),
             &self.saver,
         );
         if now.memory != s.memory && now.battery_saver != s.saver {
@@ -2818,7 +2828,7 @@ impl<B: MediaBackend> Controller<B> {
         self.modules.set_memory(
             &mut self.backend,
             &self.config,
-            HostMemory::of(&self.memory),
+            HostMemory::of(&self.memory, self.cuda_probe),
         );
     }
 
@@ -3614,7 +3624,7 @@ impl<B: MediaBackend> Controller<B> {
         effective_memory(
             &self.config,
             self.memory_fallback.as_deref(),
-            self.cuda_probe.as_deref(),
+            cuda_reason(self.cuda_probe),
             &self.saver,
         )
     }
@@ -9542,7 +9552,7 @@ impl<B: MediaBackend> Controller<B> {
         let memory = if self.session.is_some() {
             self.modules.memory()
         } else {
-            HostMemory::of(&self.memory)
+            HostMemory::of(&self.memory, self.cuda_probe)
         };
         self.modules.reload(
             &mut self.backend,
@@ -9737,30 +9747,70 @@ impl<B: MediaBackend> Controller<B> {
                 res
             }
             mic::Write::MakeDefault => {
+                // A later write: an off held for an earlier one is done
+                // with (the switch ends on).
+                if let Some(held) = self.mic_held_restore.take() {
+                    let _ = held.send(Ok(()));
+                }
                 let target = match self.config.mic.device.as_str() {
                     obc_core::config::MIC_DEVICE_DEFAULT => String::new(),
                     d => d.to_string(),
                 };
-                return self.ask_mic(reply, |reply| MicRequest::MakeDefault { target, reply });
+                if self.ask_mic(reply, |reply| MicRequest::MakeDefault { target, reply }) {
+                    self.mic_making_default += 1;
+                }
+                return;
             }
-            mic::Write::RestoreDefault => {
-                let previous = self
-                    .runtime
-                    .mic_previous_default
-                    .clone()
-                    .unwrap_or_default();
-                return self.ask_mic(reply, |reply| MicRequest::RestoreDefault {
-                    previous,
-                    reply,
-                });
+            // Off while a "use as default" is still out: the record it sets
+            // is not known yet, so the off waits for its answer (a later off
+            // takes the place of this one, answered now).
+            mic::Write::Unchanged | mic::Write::RestoreDefault if self.mic_making_default > 0 => {
+                if let Some(earlier) = self.mic_held_restore.replace(reply) {
+                    let _ = earlier.send(Ok(()));
+                }
+                return;
             }
+            mic::Write::Unchanged => Ok(()),
+            mic::Write::RestoreDefault => return self.restore_default(reply),
         };
         let _ = reply.send(res);
     }
 
+    /// Hands the restore of the previous default microphone, the one on
+    /// record, to the agent.
+    fn restore_default(&self, reply: Reply) {
+        let previous = self
+            .runtime
+            .mic_previous_default
+            .clone()
+            .unwrap_or_default();
+        self.ask_mic(reply, |reply| MicRequest::RestoreDefault {
+            previous,
+            reply,
+        });
+    }
+
+    /// A "use as default microphone" answered: the off held for it
+    /// ([`Self::mic_held_restore`]) runs once none is out, a restore while
+    /// a default is on record, else nothing (answered `Ok`).
+    fn run_held_restore(&mut self) {
+        self.mic_making_default = self.mic_making_default.saturating_sub(1);
+        if self.mic_making_default > 0 {
+            return;
+        }
+        let Some(reply) = self.mic_held_restore.take() else {
+            return;
+        };
+        if self.runtime.mic_previous_default.is_some() {
+            self.restore_default(reply);
+        } else {
+            let _ = reply.send(Ok(()));
+        }
+    }
+
     /// Hands a request with its reply to the agent; without one, the reply
-    /// is `Unavailable`.
-    fn ask_mic(&self, reply: Reply, make: impl FnOnce(Reply) -> MicRequest) {
+    /// is `Unavailable`. Whether it was handed over.
+    fn ask_mic(&self, reply: Reply, make: impl FnOnce(Reply) -> MicRequest) -> bool {
         match &self.mic {
             Some(link) => {
                 if let Err(e) = link.send(make(reply)) {
@@ -9768,17 +9818,20 @@ impl<B: MediaBackend> Controller<B> {
                         MicRequest::Host { reply, .. }
                         | MicRequest::MakeDefault { reply, .. }
                         | MicRequest::RestoreDefault { reply, .. } => reply,
-                        _ => return,
+                        _ => return false,
                     };
                     let _ = reply.send(Err(IpcError::Unavailable(
                         "the microphone cannot be controlled: the daemon is stopping".into(),
                     )));
+                    return false;
                 }
+                true
             }
             None => {
                 let _ = reply.send(Err(IpcError::Unavailable(
                     "this daemon does not control the microphone".into(),
                 )));
+                false
             }
         }
     }
@@ -9862,6 +9915,11 @@ impl<B: MediaBackend> Controller<B> {
                 };
                 self.publish();
                 let _ = reply.send(res);
+                self.run_held_restore();
+            }
+            MicEvent::DefaultNotMade { error, reply } => {
+                let _ = reply.send(Err(error));
+                self.run_held_restore();
             }
             MicEvent::DefaultRestored { result, reply } => {
                 let res = result.and_then(|()| self.remember_default(None, None));
@@ -9887,7 +9945,8 @@ impl<B: MediaBackend> Controller<B> {
     /// `ResetSettings` of a microphone group or setting: a module's values
     /// forgotten (their defaults apply), the daemon's own settings removed
     /// from the managed file (an earlier file's value, or the default,
-    /// applies).
+    /// applies); [`mic::USE_AS_DEFAULT`], which stores nothing, is refused
+    /// alone and left alone by a reset of its group.
     fn reset_mic(&mut self, what: &ResetWhat, now: Instant) -> Result<(), IpcError> {
         let groups = self.mic_groups();
         let (keys, ids): (Vec<&'static str>, Vec<String>) = match what {
@@ -9898,6 +9957,14 @@ impl<B: MediaBackend> Controller<B> {
                     return Err(IpcError::UnknownSetting(format!("there is no group {g:?}")));
                 }
             },
+            // Not a stored value (it shows a record of the default made
+            // here): refused as an action's reset is; a reset of the group
+            // leaves it, and the default microphone, alone.
+            ResetWhat::Setting(id) if id == mic::USE_AS_DEFAULT => {
+                return Err(IpcError::InvalidArgument(format!(
+                    "{id} has no stored value to reset: turn it off to restore the previous default"
+                )));
+            }
             ResetWhat::Setting(id) => match mic::config_key_of(id) {
                 Some(key) => (vec![key], Vec::new()),
                 None if mic::find(&groups, id).is_some()
@@ -10565,18 +10632,23 @@ fn migrate_choices(paths: &Paths, set: ConfigSet, runtime: &mut RuntimeState) ->
     }
 }
 
-/// The CUDA presence probe's finding for `config`: why CUDA is unusable,
-/// `None` when it is usable. Probed only under `auto` with no `fallback`
+/// The CUDA presence probe's finding for `config`: the check that failed,
+/// `None` when CUDA is usable. Probed only under `auto` with no `fallback`
 /// in force: `cuda` and `system` need no probe, and a fallback stands until
 /// the next reload.
 fn probe_of<B: MediaBackend>(
     backend: &mut B,
     config: &Config,
     fallback: Option<&str>,
-) -> Option<String> {
+) -> Option<obc_gpu::presence::Cause> {
     (config.video.memory == MemoryChoice::Auto && fallback.is_none())
         .then(|| backend.cuda_unusable())
         .flatten()
+}
+
+/// Why CUDA is unusable, in a user's words, for a probe's finding.
+fn cuda_reason(probe: Option<obc_gpu::presence::Cause>) -> Option<&'static str> {
+    probe.map(obc_gpu::presence::Cause::reason)
 }
 
 /// The effective video memory of `config`: under `auto`, system memory for

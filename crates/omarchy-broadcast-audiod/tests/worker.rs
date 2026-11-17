@@ -394,6 +394,7 @@ fn the_control_interface_lists_describes_and_applies() {
             .starts_with("Cannot run together with"),
         "{denoise}"
     );
+    assert_eq!(denoise["disabled_kind"], "busy", "{denoise}");
     assert_eq!(denoise["value"], true);
     assert_eq!(denoise["scope"], "global");
 

@@ -565,6 +565,7 @@ fn setting(id: &str, label: &str, kind: SettingKind, hint: Option<&str>) -> Sett
         stored: false,
         enabled: true,
         disabled_reason: String::new(),
+        disabled_kind: String::new(),
         enabled_when: Vec::new(),
         hint: hint.map(String::from),
         description: None,
@@ -616,6 +617,7 @@ fn depends(mut s: Setting, master: &str, op: ConditionOp, value: SettingValue) -
     }];
     s.enabled = false;
     s.disabled_reason = reason_of(&s.id).into();
+    s.disabled_kind = "parent_off".into();
     s
 }
 
@@ -950,6 +952,7 @@ impl Mock {
                 } else {
                     reason_of(&s.id).into()
                 };
+                s.disabled_kind = if on { "" } else { "parent_off" }.into();
                 flipped.push(s.id.clone());
             }
         }
@@ -970,6 +973,7 @@ impl Mock {
                     stored: s.stored,
                     enabled: s.enabled,
                     disabled_reason: s.disabled_reason.clone(),
+                    disabled_kind: s.disabled_kind.clone(),
                 }
                 .to_wire()
             })
@@ -4589,25 +4593,25 @@ fn exposure_group_line(rev: u32, serial: u32) -> Value {
         "group": {"id": "exposure", "label": "Exposure", "settings": [
             {"id": "camera.exposure.auto_exposure", "scope": "camera", "label": "Exposure mode", "type": "enum",
              "value": "aperture_priority", "default": "aperture_priority", "stored": false,
-             "enabled": true, "disabled_reason": "", "enabled_when": [],
+             "enabled": true, "disabled_reason": "", "disabled_kind": "", "enabled_when": [],
              "options": [{"value": "manual", "label": "Manual"},
                          {"value": "aperture_priority", "label": "Auto"}],
              "hint": "segmented"},
             {"id": "camera.exposure.exposure_time_absolute", "scope": "camera", "label": "Exposure time",
              "type": "int", "value": 1250, "default": 156, "stored": false, "enabled": false,
-             "disabled_reason": "Set exposure to manual to change this",
+             "disabled_reason": "Set exposure to manual to change this", "disabled_kind": "parent_off",
              "enabled_when": [{"id": "camera.exposure.auto_exposure", "op": "in",
                                "value": ["manual", "shutter_priority"]}],
              "min": 3, "max": 2047, "step": 1, "unit": "\u{d7}100 \u{b5}s", "hint": "slider"},
             {"id": "camera.exposure.gain", "scope": "camera", "label": "Gain", "type": "int", "value": 0,
-             "default": 0, "stored": false, "enabled": true, "disabled_reason": "",
+             "default": 0, "stored": false, "enabled": true, "disabled_reason": "", "disabled_kind": "",
              "enabled_when": [], "min": 0, "max": 255, "step": 1, "hint": "slider"},
             {"id": "camera.exposure.keep_framerate", "scope": "camera", "label": "Keep 30 fps in low light",
              "type": "bool", "value": false, "default": true, "stored": false, "enabled": true,
-             "disabled_reason": "", "enabled_when": [], "hint": "switch"},
+             "disabled_reason": "", "disabled_kind": "", "enabled_when": [], "hint": "switch"},
             {"id": "camera.exposure.power_line_frequency", "scope": "camera", "label": "Anti-flicker",
              "type": "enum", "value": "60hz", "default": "60hz", "stored": false,
-             "enabled": true, "disabled_reason": "", "enabled_when": [],
+             "enabled": true, "disabled_reason": "", "disabled_kind": "", "enabled_when": [],
              "options": [{"value": "disabled", "label": "Off"}, {"value": "50hz", "label": "50 Hz"},
                          {"value": "60hz", "label": "60 Hz"}],
              "hint": "segmented"},
@@ -4674,7 +4678,7 @@ fn settings_human_and_json() {
         find_setting(&lines, "camera.focus.pan_reset"),
         &serde_json::json!({"id": "camera.focus.pan_reset", "scope": "camera", "label": "Recentre pan",
                             "type": "action", "stored": false, "enabled": true,
-                            "disabled_reason": "", "enabled_when": []})
+                            "disabled_reason": "", "disabled_kind": "", "enabled_when": []})
     );
     assert_eq!(
         find_setting(&lines, "camera.focus.field_of_view")["options"],
@@ -5504,9 +5508,9 @@ fn watch_json_follows_the_settings() {
             "camera": "usb-1234_abcd",
             "changes": [
                 {"id": "camera.exposure.auto_exposure", "value": "manual", "stored": true,
-                 "enabled": true, "disabled_reason": ""},
+                 "enabled": true, "disabled_reason": "", "disabled_kind": ""},
                 {"id": "camera.exposure.exposure_time_absolute", "value": 1250,
-                 "stored": false, "enabled": true, "disabled_reason": ""},
+                 "stored": false, "enabled": true, "disabled_reason": "", "disabled_kind": ""},
             ],
         })
     );
@@ -5520,7 +5524,7 @@ fn watch_json_follows_the_settings() {
     assert_eq!(
         v["changes"],
         serde_json::json!([{"id": "camera.focus.pan_reset", "stored": false,
-                            "enabled": true, "disabled_reason": ""}])
+                            "enabled": true, "disabled_reason": "", "disabled_kind": ""}])
     );
     assert_eq!(v["rev"], 3);
 
@@ -5788,7 +5792,7 @@ fn settings_show_the_global_settings_after_the_cameras_and_without_one() {
         find_setting(&lines, "effect.background.blur_strength"),
         &serde_json::json!({"id": "effect.background.blur_strength", "scope": "global", "label": "Blur strength",
             "type": "int", "value": 50, "default": 50, "stored": false, "enabled": false,
-            "disabled_reason": BLUR_REASON,
+            "disabled_reason": BLUR_REASON, "disabled_kind": "parent_off",
             "enabled_when": [{"id": "effect.background.mode", "op": "eq", "value": "blur"}],
             "min": 0, "max": 100, "step": 1, "unit": "%", "hint": "slider"})
     );
@@ -5984,6 +5988,12 @@ fn mock_global_with_enhance(reason: &str) -> Vec<SettingsGroup> {
     enhance.scope = "global".into();
     enhance.enabled = reason.is_empty();
     enhance.disabled_reason = reason.into();
+    enhance.disabled_kind = if reason.is_empty() {
+        ""
+    } else {
+        "not_applicable"
+    }
+    .into();
     groups[1].settings.push(enhance);
     groups
 }
@@ -6000,7 +6010,7 @@ fn settings_show_and_set_the_enhance_switch() {
         find_setting(&lines, "effect.video.enhance"),
         &serde_json::json!({"id": "effect.video.enhance", "scope": "global",
             "label": "Enhance low-resolution camera", "type": "bool", "value": false,
-            "default": false, "stored": false, "enabled": true, "disabled_reason": "",
+            "default": false, "stored": false, "enabled": true, "disabled_reason": "", "disabled_kind": "",
             "enabled_when": [], "hint": "switch"})
     );
     let out = bus.run(&["settings", "set", "--", "effect.video.enhance", "on"]);
@@ -6052,6 +6062,7 @@ fn mock_global_with_lighting(on: bool) -> Vec<SettingsGroup> {
             } else {
                 LIGHT_REASON.into()
             };
+            s.disabled_kind = if on { "" } else { "parent_off" }.into();
         }
         s
     };
@@ -6139,7 +6150,7 @@ fn settings_show_the_lighting_group_and_set_a_negative_direction() {
         find_setting(&lines, "effect.lighting.direction"),
         &serde_json::json!({"id": "effect.lighting.direction", "scope": "global",
             "label": "Light direction", "type": "int", "value": 0, "default": 0,
-            "stored": false, "enabled": false, "disabled_reason": LIGHT_REASON,
+            "stored": false, "enabled": false, "disabled_reason": LIGHT_REASON, "disabled_kind": "parent_off",
             "enabled_when": [{"id": "effect.lighting.relight", "op": "eq", "value": true}],
             "min": -90, "max": 90, "step": 5, "unit": "°", "hint": "slider"})
     );

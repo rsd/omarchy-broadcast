@@ -14,12 +14,14 @@
 //!   the effects' groups, each with `surface` `mic`: the daemon's own
 //!   `input` group (`mic.input.enabled`, `mic.input.device` and, while the
 //!   worker reports one, `mic.input.hardware_gain_db`, which are the config
-//!   keys `mic.enabled`, `mic.device` and `mic.hardware_gain_db`; the actions
-//!   `mic.input.make_default` and `mic.input.restore_default`), then the
-//!   audio modules' groups as the worker describes them ([`parse_groups`]:
-//!   one group per id, the active provider's, decision G4), their values
-//!   those of the state file.
-//! - [`check`]: what a `SetSetting` of a `mic.*` id does ([`Write`]).
+//!   keys `mic.enabled`, `mic.device` and `mic.hardware_gain_db`; the switch
+//!   `mic.input.use_as_default`, on while the Omarchy Broadcast Mic is the
+//!   default made here), then the audio modules' groups as the worker
+//!   describes them ([`parse_groups`]: one group per id, the active
+//!   provider's, decision G4), their values those of the state file.
+//! - [`check`]: what a `SetSetting` of a `mic.*` id does ([`Write`]); the
+//!   actions `mic.input.make_default` and `mic.input.restore_default`,
+//!   published before revision 28, are still taken.
 //! - [`snapshot`]: the audio settings snapshot the worker runs with, which
 //!   the daemon writes to `audio-settings.json` beside the state file and
 //!   pushes with `ApplySnapshot`.
@@ -38,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use obc_core::config::{Config, MIC_DEVICE_DEFAULT, RuntimeState};
 use obc_core::config_d::{ConfigSet, MANAGED_REL};
 use obc_core::modules::StoredValue;
-use obc_ipc::settings::{MIC_ID_PREFIX, SCOPE_GLOBAL, SURFACE_MIC};
+use obc_ipc::settings::{MIC_ID_PREFIX, SCOPE_GLOBAL, SURFACE_MIC, disabled};
 use obc_ipc::{
     Condition, ConditionOp, MIC_OFF, MicStatus, ModuleInfo, Setting, SettingKind, SettingValue,
     SettingsGroup, StageInfo,
@@ -73,10 +75,19 @@ pub const DEVICE: &str = "mic.input.device";
 /// [`KEY_HARDWARE_GAIN`]): offered while the worker reports the control
 /// ([`HardwareGain`]).
 pub const HARDWARE_GAIN: &str = "mic.input.hardware_gain_db";
-/// The action that makes the Omarchy Broadcast Mic the default microphone.
+/// The switch of the default microphone (revision 28): on while the
+/// Omarchy Broadcast Mic is the default made here (a previous default is
+/// on record, [`RuntimeState::mic_previous_default`]); on makes it the
+/// default ([`Write::MakeDefault`]), off puts the previous default back
+/// ([`Write::RestoreDefault`]).
+pub const USE_AS_DEFAULT: &str = "mic.input.use_as_default";
+/// The action that makes the Omarchy Broadcast Mic the default microphone:
+/// published before revision 28, no longer in the tree, still taken by
+/// `SetSetting` as it was (refused while the mic host is off).
 pub const MAKE_DEFAULT: &str = "mic.input.make_default";
 /// The action that makes the previous default microphone the default
-/// again.
+/// again: published before revision 28, no longer in the tree, still taken
+/// by `SetSetting` as it was (refused until [`MAKE_DEFAULT`] was used).
 pub const RESTORE_DEFAULT: &str = "mic.input.restore_default";
 /// The config key of [`ENABLED`].
 pub const KEY_ENABLED: &str = "mic.enabled";
@@ -123,10 +134,10 @@ pub const TEXT_MAX: usize = 256;
 /// The longest `MicState`, in bytes.
 pub const STATE_MAX: usize = 32;
 
-/// Why the default-microphone actions are greyed while the mic host is
+/// Why the default-microphone switch is greyed while the mic host is
 /// off.
 pub const REASON_HOST_OFF: &str = "Turn the microphone on first";
-/// Why the restore action is greyed until "Use as default microphone" was
+/// Why the restore action is refused until "Use as default microphone" was
 /// used.
 pub const REASON_NOT_DEFAULT: &str = "The Omarchy Broadcast Mic was not made the default here";
 
@@ -212,6 +223,7 @@ fn setting(id: &str, label: &str, kind: SettingKind) -> Setting {
         stored: false,
         enabled: true,
         disabled_reason: String::new(),
+        disabled_kind: String::new(),
         enabled_when: Vec::new(),
         hint: None,
         description: None,
@@ -219,13 +231,15 @@ fn setting(id: &str, label: &str, kind: SettingKind) -> Setting {
 }
 
 /// A setting bound to the config key `key`: stored when the managed file
-/// sets it, greyed when a later file does.
+/// sets it, greyed when a later file does (kind `not_applicable`: it
+/// cannot be changed from here while that file sets it).
 fn bound(mut s: Setting, key: &str, set: &ConfigSet) -> Setting {
     s.stored = set.source(key) == MANAGED_REL;
     let over = set.overridden_by(key);
     if !over.is_empty() {
         s.enabled = false;
         s.disabled_reason = format!("Overridden by {over}");
+        s.disabled_kind = disabled::NOT_APPLICABLE.into();
     }
     s
 }
@@ -404,34 +418,29 @@ fn input_group(inp: &Inputs<'_>) -> SettingsGroup {
         KEY_DEVICE,
         inp.config_set,
     );
-    // "Use as default microphone" stays offered while the host runs, even
-    // with a previous default on record: the user may have chosen another
-    // microphone since, and making it the default again is harmless (the
-    // worker does not say whether the Omarchy Broadcast Mic is the default
-    // now).
-    let previous = inp.runtime.mic_previous_default.is_some();
-    let mut make = setting(
-        MAKE_DEFAULT,
+    // On while a previous default is on record: the Omarchy Broadcast Mic
+    // was made the default here and not put back since. The worker does
+    // not say whether it is the default now (the user may have chosen
+    // another microphone since), so turning it on again while on stays
+    // allowed and harmless.
+    let mut use_as_default = setting(
+        USE_AS_DEFAULT,
         "Use as default microphone",
-        SettingKind::Action,
+        SettingKind::Bool {
+            default: false,
+            value: inp.runtime.mic_previous_default.is_some(),
+        },
     );
-    let mut restore = setting(
-        RESTORE_DEFAULT,
-        "Use the previous default microphone",
-        SettingKind::Action,
-    );
+    use_as_default.hint = Some("switch".into());
     if !inp.host_on {
-        make.enabled = false;
-        make.disabled_reason = REASON_HOST_OFF.into();
-    }
-    if !previous {
-        restore.enabled = false;
-        restore.disabled_reason = REASON_NOT_DEFAULT.into();
+        use_as_default.enabled = false;
+        use_as_default.disabled_reason = REASON_HOST_OFF.into();
+        use_as_default.disabled_kind = disabled::BUSY.into();
     }
     SettingsGroup {
         id: INPUT.into(),
         label: INPUT_LABEL.into(),
-        settings: [Some(enabled), Some(device), gain, Some(make), Some(restore)]
+        settings: [Some(enabled), Some(device), gain, Some(use_as_default)]
             .into_iter()
             .flatten()
             .collect(),
@@ -501,6 +510,8 @@ pub enum Write {
     MakeDefault,
     /// Makes the previous default microphone the default again.
     RestoreDefault,
+    /// Nothing to do: [`USE_AS_DEFAULT`] turned off while it is off.
+    Unchanged,
     /// Keeps a module setting's value in the state file.
     Value(String, StoredValue),
 }
@@ -513,13 +524,54 @@ pub fn find<'a>(groups: &'a [SettingsGroup], id: &str) -> Option<&'a Setting> {
         .find(|s| s.id == id)
 }
 
+/// The actions published before revision 28 ([`MAKE_DEFAULT`],
+/// [`RESTORE_DEFAULT`]), checked as they were, from the switch that took
+/// their place: making the default is refused while the switch is greyed
+/// (the mic host is off), restoring while it is off (nothing on record).
+fn check_legacy(
+    groups: &[SettingsGroup],
+    id: &str,
+    value: Option<&SettingValue>,
+) -> Option<Result<Write, Refusal>> {
+    if id != MAKE_DEFAULT && id != RESTORE_DEFAULT {
+        return None;
+    }
+    let Some(switch) = find(groups, USE_AS_DEFAULT) else {
+        return Some(Err(Refusal::Unknown(format!("there is no setting {id:?}"))));
+    };
+    // Greyed first, then the value, as the published actions were checked.
+    let on_record = matches!(switch.kind, SettingKind::Bool { value: true, .. });
+    if id == MAKE_DEFAULT && !switch.enabled {
+        return Some(Err(Refusal::Disabled(switch.disabled_reason.clone())));
+    }
+    if id == RESTORE_DEFAULT && !on_record {
+        return Some(Err(Refusal::Disabled(REASON_NOT_DEFAULT.into())));
+    }
+    if value != Some(&SettingValue::Bool(true)) {
+        return Some(Err(Refusal::Invalid(format!(
+            "{id}: expects true (an action)"
+        ))));
+    }
+    Some(Ok(if id == MAKE_DEFAULT {
+        Write::MakeDefault
+    } else {
+        Write::RestoreDefault
+    }))
+}
+
 /// Checks `value` for the setting `id` of `groups` (as [`groups`] built
 /// them): unknown, greyed (its reason), or a value its type does not take.
+/// [`USE_AS_DEFAULT`] on makes the default, off restores the previous one
+/// (nothing to do while it is off); the actions it replaced are taken as
+/// before ([`MAKE_DEFAULT`], [`RESTORE_DEFAULT`]).
 pub fn check(
     groups: &[SettingsGroup],
     id: &str,
     value: Option<&SettingValue>,
 ) -> Result<Write, Refusal> {
+    if let Some(legacy) = check_legacy(groups, id, value) {
+        return legacy;
+    }
     let Some(s) = find(groups, id) else {
         return Err(Refusal::Unknown(format!("there is no setting {id:?}")));
     };
@@ -556,13 +608,9 @@ pub fn check(
         }
         (SettingKind::Enum { .. }, _) => return Err(wrong("one of its options")),
         (SettingKind::Action, Some(SettingValue::Bool(true))) => {
-            return match id {
-                MAKE_DEFAULT => Ok(Write::MakeDefault),
-                RESTORE_DEFAULT => Ok(Write::RestoreDefault),
-                _ => Err(Refusal::Invalid(format!(
-                    "{id}: an audio module's action cannot be run"
-                ))),
-            };
+            return Err(Refusal::Invalid(format!(
+                "{id}: an audio module's action cannot be run"
+            )));
         }
         (SettingKind::Action, _) => return Err(wrong("true (an action)")),
         (SettingKind::Unknown(t), _) => {
@@ -573,6 +621,14 @@ pub fn check(
     };
     use obc_core::config_schema::ConfigValue as C;
     Ok(match (id, stored) {
+        (USE_AS_DEFAULT, StoredValue::Bool(true)) => Write::MakeDefault,
+        (USE_AS_DEFAULT, StoredValue::Bool(false)) => {
+            if matches!(s.kind, SettingKind::Bool { value: true, .. }) {
+                Write::RestoreDefault
+            } else {
+                Write::Unchanged
+            }
+        }
         (ENABLED, StoredValue::Bool(b)) => Write::Config(KEY_ENABLED, C::Bool(b)),
         (DEVICE, StoredValue::Str(s)) => Write::Config(KEY_DEVICE, C::Str(s)),
         // Within the reported range (checked above), so within the key's.
@@ -846,6 +902,17 @@ fn parse_setting(v: &Json) -> Option<Setting> {
         })
         .unwrap_or_default();
     let enabled = flag(v, "enabled").unwrap_or(true);
+    // Greyed, it carries a kind: a kind this version does not know, or
+    // none (an older worker), is `unavailable` (a reason the daemon cannot
+    // type). Enabled, none.
+    let kind_of_reason = if enabled {
+        ""
+    } else {
+        v.get("disabled_kind")
+            .and_then(Json::as_str)
+            .filter(|k| disabled::is_known(k))
+            .unwrap_or(disabled::UNAVAILABLE)
+    };
     Some(Setting {
         id: id.to_string(),
         label: text(v, "label", LABEL_MAX),
@@ -858,6 +925,7 @@ fn parse_setting(v: &Json) -> Option<Setting> {
         } else {
             text(v, "disabled_reason", REASON_MAX)
         },
+        disabled_kind: kind_of_reason.to_string(),
         enabled_when,
         hint: v
             .get("hint")
@@ -868,11 +936,11 @@ fn parse_setting(v: &Json) -> Option<Setting> {
 }
 
 /// Whether a group is offered by a module that does not run its stage (a
-/// setting says "Provided by" another).
+/// setting's kind is `other_provider`).
 fn of_another_provider(g: &SettingsGroup) -> bool {
     g.settings
         .iter()
-        .any(|s| !s.enabled && s.disabled_reason.starts_with("Provided by"))
+        .any(|s| !s.enabled && s.disabled_kind == disabled::OTHER_PROVIDER)
 }
 
 /// The groups of the worker's `GetSettings` document (`{"groups": [...]}`),

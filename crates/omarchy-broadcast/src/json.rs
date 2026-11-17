@@ -142,6 +142,9 @@ pub const MAX_DESCRIPTION_BYTES: usize = 160;
 /// Bound of a setting's `scope` (`camera` or `global`, or one a newer
 /// daemon adds).
 pub const MAX_SCOPE_BYTES: usize = 16;
+/// Bound of a setting's `disabled_kind` (revision 28: `parent_off`, ...,
+/// or one a newer daemon adds).
+pub const MAX_DISABLED_KIND_BYTES: usize = 16;
 /// At most this many `camera_health` warnings are listed (revision 20).
 pub const MAX_HEALTH_WARNINGS: usize = 4;
 /// Bound of a `camera_health` warning.
@@ -953,6 +956,9 @@ struct SettingJson<'a> {
     stored: bool,
     enabled: bool,
     disabled_reason: Cow<'a, str>,
+    /// Revision 28: always present, `""` while enabled or from an older
+    /// daemon.
+    disabled_kind: Cow<'a, str>,
     enabled_when: Vec<ConditionJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min: Option<i64>,
@@ -991,6 +997,7 @@ impl<'a> SettingJson<'a> {
             stored: s.stored,
             enabled: s.enabled,
             disabled_reason: clip(&s.disabled_reason, MAX_REASON_BYTES),
+            disabled_kind: clip(&s.disabled_kind, MAX_DISABLED_KIND_BYTES),
             enabled_when: s
                 .enabled_when
                 .iter()
@@ -1103,6 +1110,8 @@ struct ChangeJson<'a> {
     stored: bool,
     enabled: bool,
     disabled_reason: Cow<'a, str>,
+    /// Revision 28, as in a setting.
+    disabled_kind: Cow<'a, str>,
 }
 
 #[derive(Serialize)]
@@ -1267,6 +1276,7 @@ pub fn settings_delta_lines(
                 stored: c.stored,
                 enabled: c.enabled,
                 disabled_reason: clip(&c.disabled_reason, MAX_REASON_BYTES),
+                disabled_kind: clip(&c.disabled_kind, MAX_DISABLED_KIND_BYTES),
             };
             let len = to_line(&j).len();
             (j, len)
@@ -1935,6 +1945,7 @@ mod tests {
             stored: false,
             enabled: true,
             disabled_reason: String::new(),
+            disabled_kind: String::new(),
             enabled_when: Vec::new(),
             hint: None,
             description: None,
@@ -1957,6 +1968,7 @@ mod tests {
         );
         time.enabled = false;
         time.disabled_reason = "Set exposure to manual to change this".into();
+        time.disabled_kind = "parent_off".into();
         time.enabled_when = vec![Condition {
             id: "camera.exposure.auto_exposure".into(),
             op: obc_ipc::ConditionOp::In,
@@ -2040,11 +2052,11 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(
             lines[0],
-            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":0,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","scope":"camera","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","scope":"camera","type":"int","value":1250,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs"},{"id":"camera.exposure.keep_framerate","label":"Keep 30 fps in low light","scope":"camera","type":"bool","value":false,"default":true,"stored":true,"enabled":true,"disabled_reason":"","enabled_when":[],"hint":"switch","description":"Off lets the camera lower its frame rate in low light"}]}}"#
+            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":0,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","scope":"camera","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","disabled_kind":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","scope":"camera","type":"int","value":1250,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","disabled_kind":"parent_off","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs"},{"id":"camera.exposure.keep_framerate","label":"Keep 30 fps in low light","scope":"camera","type":"bool","value":false,"default":true,"stored":true,"enabled":true,"disabled_reason":"","disabled_kind":"","enabled_when":[],"hint":"switch","description":"Off lets the camera lower its frame rate in low light"}]}}"#
         );
         assert_eq!(
             lines[1],
-            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":1,"count":2,"part":1,"parts":1,"group":{"id":"white_balance","label":"White balance","settings":[{"id":"camera.white_balance.do_white_balance","label":"Balance once","scope":"camera","type":"action","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[]}]}}"#
+            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":1,"count":2,"part":1,"parts":1,"group":{"id":"white_balance","label":"White balance","settings":[{"id":"camera.white_balance.do_white_balance","label":"Balance once","scope":"camera","type":"action","stored":false,"enabled":true,"disabled_reason":"","disabled_kind":"","enabled_when":[]}]}}"#
         );
         for line in &lines {
             parse(line);
@@ -2090,6 +2102,7 @@ mod tests {
                 stored: true,
                 enabled: false,
                 disabled_reason: "Not installed".into(),
+                disabled_kind: "unavailable".into(),
                 enabled_when: Vec::new(),
                 hint: Some("switch".into()),
                 description: None,
@@ -2102,7 +2115,7 @@ mod tests {
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(
             lines[2].ends_with(
-                r#""index":2,"count":3,"part":1,"parts":1,"group":{"id":"video","label":"Video","settings":[{"id":"effect.video.denoise","label":"Noise removal","scope":"global","type":"bool","value":false,"default":false,"stored":true,"enabled":false,"disabled_reason":"Not installed","enabled_when":[],"hint":"switch"}]}}"#
+                r#""index":2,"count":3,"part":1,"parts":1,"group":{"id":"video","label":"Video","settings":[{"id":"effect.video.denoise","label":"Noise removal","scope":"global","type":"bool","value":false,"default":false,"stored":true,"enabled":false,"disabled_reason":"Not installed","disabled_kind":"unavailable","enabled_when":[],"hint":"switch"}]}}"#
             ),
             "{}",
             lines[2]
@@ -2135,6 +2148,7 @@ mod tests {
                 stored: true,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
             SettingChange {
                 id: "camera.exposure.exposure_time_absolute".into(),
@@ -2142,6 +2156,7 @@ mod tests {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
             SettingChange {
                 id: "camera.white_balance.do_white_balance".into(),
@@ -2149,13 +2164,14 @@ mod tests {
                 stored: false,
                 enabled: false,
                 disabled_reason: "Not now".into(),
+                disabled_kind: "busy".into(),
             },
         ];
         let lines = settings_delta_lines(13, 3, "usb-046d_0944", &changes);
         assert_eq!(
             lines,
             [
-                r#"{"v":1,"type":"settings_delta","schema":1,"rev":13,"serial":3,"camera":"usb-046d_0944","changes":[{"id":"camera.exposure.auto_exposure","value":"manual","stored":true,"enabled":true,"disabled_reason":""},{"id":"camera.exposure.exposure_time_absolute","value":1250,"stored":false,"enabled":true,"disabled_reason":""},{"id":"camera.white_balance.do_white_balance","stored":false,"enabled":false,"disabled_reason":"Not now"}]}"#
+                r#"{"v":1,"type":"settings_delta","schema":1,"rev":13,"serial":3,"camera":"usb-046d_0944","changes":[{"id":"camera.exposure.auto_exposure","value":"manual","stored":true,"enabled":true,"disabled_reason":"","disabled_kind":""},{"id":"camera.exposure.exposure_time_absolute","value":1250,"stored":false,"enabled":true,"disabled_reason":"","disabled_kind":""},{"id":"camera.white_balance.do_white_balance","stored":false,"enabled":false,"disabled_reason":"Not now","disabled_kind":"busy"}]}"#
             ]
         );
         parse(&lines[0]);
@@ -2168,6 +2184,7 @@ mod tests {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             })
             .collect();
         let lines = settings_delta_lines(14, 3, "c", &many);
@@ -2271,6 +2288,7 @@ mod tests {
             stored: false,
             enabled: false,
             disabled_reason: nasty.clone(),
+            disabled_kind: nasty.clone(),
             enabled_when: (0..10)
                 .map(|_| Condition {
                     id: nasty.clone(),
@@ -2340,6 +2358,11 @@ mod tests {
             let s = &v["group"]["settings"][0];
             assert!(s["label"].as_str().unwrap().ends_with(ELLIPSIS));
             assert!(s["disabled_reason"].as_str().unwrap().len() <= MAX_REASON_BYTES);
+            let kind = s["disabled_kind"].as_str().unwrap();
+            assert!(
+                kind.ends_with(ELLIPSIS) && kind.len() <= MAX_DISABLED_KIND_BYTES,
+                "{kind:?}"
+            );
             // The scope too: clipped to its bound, never left out.
             let scope = s["scope"].as_str().unwrap();
             assert!(scope.ends_with(ELLIPSIS), "{scope:?}");
@@ -2397,6 +2420,7 @@ mod tests {
                 stored: false,
                 enabled: false,
                 disabled_reason: nasty.clone(),
+                disabled_kind: nasty.clone(),
             })
             .collect();
         let lines = settings_delta_lines(u32::MAX, u32::MAX, &nasty, &changes);
@@ -2524,6 +2548,7 @@ mod tests {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
                 enabled_when: Vec::new(),
                 hint: None,
                 description: None,

@@ -53,6 +53,12 @@
 //!   `no_master` reason instead when its master is one the node has but the
 //!   model left out (hidden or a menu without an item): nothing can make it
 //!   active.
+//! - **Kind** (revision 28, `disabled_kind`): `device` for a control the
+//!   device flags disabled or read-only, an Extension Unit row with an
+//!   unknown byte and a control whose master the model left out; `busy`
+//!   for a grabbed control and one the device flags inactive while its
+//!   rule holds (or it has none); `parent_off` for a rule that does not
+//!   hold.
 //! - **Writes.** [`CameraSettings::check`] validates a `SetSetting` value
 //!   (unknown, then disabled, then invalid) and gives the raw value to
 //!   write. [`CameraSettings::apply_order`] puts masters (settings without
@@ -69,7 +75,7 @@
 
 use obc_core::config::{CameraControlState, valid_control_name};
 use obc_core::{ModeRequest, UsbId, VideoMode};
-use obc_ipc::settings::SCOPE_CAMERA;
+use obc_ipc::settings::{SCOPE_CAMERA, disabled};
 use obc_ipc::{
     Condition, ConditionOp, IntDisplay, Setting, SettingChange, SettingKind, SettingValue,
     SettingsGroup, SettingsTree, valid_setting_id,
@@ -444,7 +450,8 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
         let master_gone = c
             .rule
             .is_some_and(|r| hidden.iter().chain(&absent).any(|n| n == r.master));
-        let (enabled, reason) = enabled(c, !conditions.is_empty(), held, inp.open, master_gone);
+        let (enabled, reason, why) =
+            enabled(c, !conditions.is_empty(), held, inp.open, master_gone);
         let value = effective[i];
         let kind = kind(c, value);
         let setting = Setting {
@@ -457,6 +464,7 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
                 .is_some_and(|s| s.values.contains_key(&c.name) && c.values != Values::Action),
             enabled,
             disabled_reason: reason.to_string(),
+            disabled_kind: why.to_string(),
             enabled_when: conditions.into_iter().map(|(_, cond)| cond).collect(),
             hint: hint(&c.values),
             description: c.description.clone(),
@@ -540,6 +548,7 @@ pub fn mode_setting(modes: &[VideoMode], stored: Option<&ModeRequest>) -> Option
         stored: stored.is_some(),
         enabled: true,
         disabled_reason: String::new(),
+        disabled_kind: String::new(),
         enabled_when: Vec::new(),
         hint: None,
         description: None,
@@ -891,40 +900,47 @@ pub(crate) fn holds(cond: &Condition, master: Option<SettingValue>) -> bool {
     }
 }
 
-/// `(enabled, disabled_reason)` (see the module docs). `master_gone`: the
-/// node has the master of `c`'s rule but the model left it out.
+/// `(enabled, disabled_reason, disabled_kind)` (see the module docs).
+/// `master_gone`: the node has the master of `c`'s rule but the model left
+/// it out.
 fn enabled(
     c: &Candidate,
     ruled: bool,
     held: bool,
     open: bool,
     master_gone: bool,
-) -> (bool, &'static str) {
+) -> (bool, &'static str, &'static str) {
     if c.flags & (CTRL_FLAG_DISABLED | CTRL_FLAG_READ_ONLY) != 0 {
-        return (false, REASON_FIXED);
+        return (false, REASON_FIXED, disabled::DEVICE);
     }
     if c.flags & CTRL_FLAG_GRABBED != 0 {
-        return (false, REASON_GRABBED);
+        return (false, REASON_GRABBED, disabled::BUSY);
     }
     if let Some(reason) = c.unknown_xu {
-        return (false, reason);
+        return (false, reason, disabled::DEVICE);
     }
     let inactive = c.flags & CTRL_FLAG_INACTIVE != 0;
     match c.rule {
         Some(rule) if ruled => {
-            if !held || (open && inactive) {
-                return (false, rule.reason);
+            if !held {
+                return (false, rule.reason, disabled::PARENT_OFF);
+            }
+            // The rule holds, the device says not now.
+            if open && inactive {
+                return (false, rule.reason, disabled::BUSY);
             }
         }
         // Its master is left out: nothing makes it active.
-        Some(rule) if inactive && master_gone => return (false, rule.no_master),
+        Some(rule) if inactive && master_gone => {
+            return (false, rule.no_master, disabled::DEVICE);
+        }
         _ => {
             if inactive {
-                return (false, REASON_INACTIVE);
+                return (false, REASON_INACTIVE, disabled::BUSY);
             }
         }
     }
-    (true, "")
+    (true, "", "")
 }
 
 /// The published type with its value (`raw`, the effective value).
@@ -1182,6 +1198,7 @@ fn shape(s: &Setting) -> Setting {
     s.stored = false;
     s.enabled = false;
     s.disabled_reason.clear();
+    s.disabled_kind.clear();
     match &mut s.kind {
         SettingKind::Bool { value, .. } => *value = false,
         SettingKind::Int { value, .. } => *value = 0,
@@ -1199,6 +1216,7 @@ pub fn change_of(s: &Setting) -> SettingChange {
         stored: s.stored,
         enabled: s.enabled,
         disabled_reason: s.disabled_reason.clone(),
+        disabled_kind: s.disabled_kind.clone(),
     }
 }
 

@@ -140,7 +140,7 @@ The settings are in the settings tree, which `omarchy-broadcast settings` shows 
 | `mic.input.enabled` ("Noise and echo processing") | The master switch. Off, the microphone's audio passes unchanged, at the same delay: never muted |
 | `mic.input.device` ("Input device") | The microphone captured (above) |
 | `mic.input.hardware_gain_db` ("Hardware gain", in dB; daemon interface revision 25) | The capture gain of a USB microphone's own mixer, in the range the device reports. Offered only while the microphone captured is a USB device with one capture volume control; [Hardware gain](#hardware-gain-of-a-usb-microphone) |
-| `mic.input.make_default`, `mic.input.restore_default` | The actions behind `mic default` and `mic restore-default` |
+| `mic.input.use_as_default` ("Use as default microphone"; daemon interface revision 28) | On while the Omarchy Broadcast Mic is the default made here; turning it on is `mic default`, turning it off is `mic restore-default`. Greyed while the microphone is off. Before revision 28 the tree had the two actions `mic.input.make_default` and `mic.input.restore_default` in its place, which the daemon still takes and the CLI still sends |
 | `mic.noise.enabled` ("Noise removal") | Noise removal on or off |
 | `mic.noise.strength` ("Strength", 0 to 100 %) | How much noise goes. One control for every provider of noise removal: each engine maps it its own way. 100 % is the strongest. Applies live, with no break in the sound |
 | `mic.cpu.engine` ("Engine") | `deepfilternet` (the default) or `rnnoise`. Reloads the engine; the audio stays raw for the moment the new one loads |

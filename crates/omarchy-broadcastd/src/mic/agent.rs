@@ -122,6 +122,9 @@ pub enum MicEvent {
         already: bool,
         reply: Reply,
     },
+    /// The Omarchy Broadcast Mic could not be made the default (`error`),
+    /// nothing changed; `reply` is answered with it.
+    DefaultNotMade { error: IpcError, reply: Reply },
     /// The previous default microphone is the default again (`Ok`), or not.
     DefaultRestored {
         result: Result<(), IpcError>,
@@ -521,8 +524,10 @@ impl<W: Worker, U: Units> Agent<W, U> {
                         });
                     }
                     Err(e) => {
-                        let _ =
-                            reply.send(Err(e.to_ipc("the default microphone cannot be changed")));
+                        self.send(MicEvent::DefaultNotMade {
+                            error: e.to_ipc("the default microphone cannot be changed"),
+                            reply,
+                        });
                     }
                 }
             }

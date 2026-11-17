@@ -15,11 +15,16 @@ pub struct Group {
 
 /// The groups, in display order. A group with no setting is not published.
 /// The first, [`CAPTURE`], holds the daemon's own capture mode setting
-/// (`crate::settings::MODE`), no control.
+/// (`crate::settings::MODE`), no control; framing and focus come next, the
+/// controls people reach for first.
 pub const GROUPS: [Group; 6] = [
     Group {
         id: CAPTURE,
         label: "Capture",
+    },
+    Group {
+        id: "focus",
+        label: "Framing & focus",
     },
     Group {
         id: "image",
@@ -32,10 +37,6 @@ pub const GROUPS: [Group; 6] = [
     Group {
         id: "exposure",
         label: "Exposure",
-    },
-    Group {
-        id: "focus",
-        label: "Focus & zoom",
     },
     Group {
         id: OTHER,
@@ -312,6 +313,9 @@ pub const CATALOGUE: &[Known] = &[
         ),
         POWER_LINE_OPTIONS,
     ),
+    // Framing first: the field of view, then zoom.
+    known("field_of_view", XU, "focus", "Field of view"),
+    known("zoom_absolute", 0x009a_090d, "focus", "Zoom"),
     known(
         "focus_automatic_continuous",
         0x009a_090c,
@@ -322,12 +326,10 @@ pub const CATALOGUE: &[Known] = &[
         known("focus_absolute", 0x009a_090a, "focus", "Focus"),
         FOCUS_RULE,
     ),
-    known("zoom_absolute", 0x009a_090d, "focus", "Zoom"),
     known("pan_absolute", 0x009a_0908, "focus", "Pan"),
     known("tilt_absolute", 0x009a_0909, "focus", "Tilt"),
     known("pan_reset", 0x009a_0906, "focus", "Recentre pan"),
     known("tilt_reset", 0x009a_0907, "focus", "Recentre tilt"),
-    known("field_of_view", XU, "focus", "Field of view"),
     known("show_mode", XU, "focus", "Show Mode"),
 ];
 

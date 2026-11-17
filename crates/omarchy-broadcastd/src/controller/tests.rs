@@ -5370,6 +5370,8 @@ fn change(id: &str, value: Option<SettingValue>, stored: bool, reason: &str) -> 
         stored,
         enabled: reason.is_empty(),
         disabled_reason: reason.into(),
+        // Every greyed change of these tests is a rule's.
+        disabled_kind: if reason.is_empty() { "" } else { "parent_off" }.into(),
     }
 }
 
@@ -5390,10 +5392,10 @@ fn get_settings_gives_the_tree_from_revision_one_and_no_camera_is_no_error() {
     assert_eq!(
         groups,
         [
+            "Framing & focus",
             "Image",
             "White balance",
             "Exposure",
-            "Focus & zoom",
             "Background effect",
             "Video",
             "Lighting"
@@ -6219,7 +6221,7 @@ fn a_stored_dependent_a_read_left_out_before_the_masters_is_applied_after_them()
     store_manual_exposure_and_focus(&mut h);
     // The first read at the open cannot read the exposure time (under
     // automatic exposure); after the masters' writes it can. The read
-    // after them has one entry more, before the focus.
+    // after them has one entry more, after the focus.
     let queries = h.world().control_queries;
     h.world().next_read_failures =
         vec![vec!["exposure_time_absolute".to_string()], Vec::new()].into();
@@ -6227,10 +6229,10 @@ fn a_stored_dependent_a_read_left_out_before_the_masters_is_applied_after_them()
     assert_eq!(
         h.writes(),
         [
-            w("usb-a", "auto_exposure", 1),
             w("usb-a", "focus_automatic_continuous", 0),
-            w("usb-a", "exposure_time_absolute", 400),
+            w("usb-a", "auto_exposure", 1),
             w("usb-a", "focus_absolute", 90),
+            w("usb-a", "exposure_time_absolute", 400),
         ]
     );
     assert_eq!(h.brio().value(EXPOSURE), 400);
@@ -6245,7 +6247,7 @@ fn a_stored_dependent_unreadable_after_the_masters_is_kept_and_nothing_else_is_w
     let mut h = H::new("", with_focus_brio);
     store_manual_exposure_and_focus(&mut h);
     // Readable at the open; the read after the masters' writes cannot read
-    // the exposure time: one entry fewer, before the focus.
+    // the exposure time: one entry fewer, after the focus.
     h.world().next_read_failures = vec![
         Vec::new(),
         vec!["exposure_time_absolute".to_string()],
@@ -6256,8 +6258,8 @@ fn a_stored_dependent_unreadable_after_the_masters_is_kept_and_nothing_else_is_w
     assert_eq!(
         h.writes(),
         [
-            w("usb-a", "auto_exposure", 1),
             w("usb-a", "focus_automatic_continuous", 0),
+            w("usb-a", "auto_exposure", 1),
             w("usb-a", "focus_absolute", 90),
         ]
     );
@@ -14859,16 +14861,20 @@ fn the_default_microphone_is_made_remembered_and_restored() {
         panic!("RestoreDefault not sent")
     };
     assert_eq!(previous, "alsa_input.usb-a");
-    // Dropped unanswered: the record stays.
+    // Dropped unanswered: the record stays, the switch on and enabled
+    // (the user may have picked another microphone since).
     assert!(restore.try_recv().is_err());
-    assert!(h.setting(mic::RESTORE_DEFAULT).enabled);
-    // Still offered: the user may have picked another microphone since.
-    assert!(h.setting(mic::MAKE_DEFAULT).enabled);
+    let switch = h.setting(mic::USE_AS_DEFAULT);
+    assert!(switch.enabled);
+    assert_eq!(switch.kind.value(), Some(SettingValue::Bool(true)));
     // Across a restart.
     h.restart();
     let mut rx = h.mic_link();
     h.mic(MicEvent::Catalogue(mic_catalogue()));
-    assert!(h.setting(mic::RESTORE_DEFAULT).enabled);
+    assert_eq!(
+        h.setting(mic::USE_AS_DEFAULT).kind.value(),
+        Some(SettingValue::Bool(true))
+    );
     // mic off: the previous default goes with the request; restored, it
     // is forgotten.
     let (tx, mut reply) = tokio::sync::oneshot::channel();
@@ -14898,6 +14904,202 @@ fn the_default_microphone_is_made_remembered_and_restored() {
     assert!(
         sent.last().unwrap()["previous_in_force"].is_null(),
         "{sent:?}"
+    );
+}
+
+#[test]
+fn the_default_microphone_switch_makes_and_restores_the_default() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    let on = |h: &mut H| h.setting(mic::USE_AS_DEFAULT).kind.value();
+    // Greyed while the host is off, busy.
+    let s = h.setting(mic::USE_AS_DEFAULT);
+    assert_eq!(
+        (s.enabled, s.disabled_kind.as_str()),
+        (false, obc_ipc::settings::disabled::BUSY)
+    );
+    assert!(matches!(
+        h.set_setting(mic::USE_AS_DEFAULT, SettingValue::Bool(true), 0),
+        Err(IpcError::Disabled(m)) if m == mic::REASON_HOST_OFF
+    ));
+    h.host_on();
+    H::mic_snapshots(&mut rx);
+    assert_eq!(on(&mut h), Some(SettingValue::Bool(false)));
+    // Off while off: nothing asked, answered at once.
+    h.set_setting(mic::USE_AS_DEFAULT, SettingValue::Bool(false), 0)
+        .unwrap();
+    assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(
+        r,
+        MicRequest::MakeDefault { .. } | MicRequest::RestoreDefault { .. }
+    )));
+    // On: made the default, then on.
+    let mut reply = h.send_set("", mic::USE_AS_DEFAULT, Some(SettingValue::Bool(true)), 0);
+    let Some(MicRequest::MakeDefault { reply: r, .. }) = std::iter::from_fn(|| rx.try_recv().ok())
+        .find(|r| matches!(r, MicRequest::MakeDefault { .. }))
+    else {
+        panic!("MakeDefault not sent")
+    };
+    h.mic(MicEvent::DefaultMade {
+        previous: "alsa_input.usb-a".into(),
+        in_force: None,
+        already: false,
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    assert_eq!(on(&mut h), Some(SettingValue::Bool(true)));
+    // Off: the previous default asked for, then off.
+    let mut reply = h.send_set("", mic::USE_AS_DEFAULT, Some(SettingValue::Bool(false)), 0);
+    let Some(MicRequest::RestoreDefault { previous, reply: r }) =
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|r| matches!(r, MicRequest::RestoreDefault { .. }))
+    else {
+        panic!("RestoreDefault not sent")
+    };
+    assert_eq!(previous, "alsa_input.usb-a");
+    h.mic(MicEvent::DefaultRestored {
+        result: Ok(()),
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    assert_eq!(h.persisted().mic_previous_default, None);
+    assert_eq!(on(&mut h), Some(SettingValue::Bool(false)));
+}
+
+/// The agent's next request of the two default-microphone kinds.
+fn next_default_request(rx: &mut UnboundedReceiver<MicRequest>) -> Option<MicRequest> {
+    std::iter::from_fn(|| rx.try_recv().ok()).find(|r| {
+        matches!(
+            r,
+            MicRequest::MakeDefault { .. } | MicRequest::RestoreDefault { .. }
+        )
+    })
+}
+
+/// On then off before the on is answered: the off is held (no reply,
+/// nothing asked) until the make lands, then restores, so that the switch
+/// ends off; a later on drops a held off; a make that fails lets a held off
+/// go with nothing on record.
+#[test]
+fn a_quick_off_after_on_is_held_until_the_default_is_made() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    h.host_on();
+    H::mic_snapshots(&mut rx);
+    let on = |h: &mut H| h.setting(mic::USE_AS_DEFAULT).kind.value();
+    let set =
+        |h: &mut H, v: bool| h.send_set("", mic::USE_AS_DEFAULT, Some(SettingValue::Bool(v)), 0);
+    // On, then off at once: the off waits.
+    let mut made = set(&mut h, true);
+    let Some(MicRequest::MakeDefault { reply: r, .. }) = next_default_request(&mut rx) else {
+        panic!("MakeDefault not sent")
+    };
+    let mut off = set(&mut h, false);
+    assert!(
+        off.try_recv().is_err(),
+        "the off is answered before the make"
+    );
+    assert!(next_default_request(&mut rx).is_none());
+    // The make lands: answered, then the held off restores what it
+    // recorded.
+    h.mic(MicEvent::DefaultMade {
+        previous: "alsa_input.usb-a".into(),
+        in_force: None,
+        already: false,
+        reply: r,
+    });
+    made.try_recv().unwrap().unwrap();
+    assert!(off.try_recv().is_err(), "answered by the restore");
+    let Some(MicRequest::RestoreDefault { previous, reply: r }) = next_default_request(&mut rx)
+    else {
+        panic!("the held off did not restore")
+    };
+    assert_eq!(previous, "alsa_input.usb-a");
+    h.mic(MicEvent::DefaultRestored {
+        result: Ok(()),
+        reply: r,
+    });
+    off.try_recv().unwrap().unwrap();
+    assert_eq!(on(&mut h), Some(SettingValue::Bool(false)));
+    assert_eq!(h.persisted().mic_previous_default, None);
+
+    // On, off, on: the later on drops the held off (answered Ok), and the
+    // switch ends on with no restore.
+    let mut first = set(&mut h, true);
+    let Some(MicRequest::MakeDefault { reply: r1, .. }) = next_default_request(&mut rx) else {
+        panic!("MakeDefault not sent")
+    };
+    let mut off = set(&mut h, false);
+    let mut second = set(&mut h, true);
+    off.try_recv().unwrap().unwrap();
+    let Some(MicRequest::MakeDefault { reply: r2, .. }) = next_default_request(&mut rx) else {
+        panic!("the second MakeDefault not sent")
+    };
+    for r in [r1, r2] {
+        h.mic(MicEvent::DefaultMade {
+            previous: "alsa_input.usb-a".into(),
+            in_force: None,
+            already: false,
+            reply: r,
+        });
+    }
+    first.try_recv().unwrap().unwrap();
+    second.try_recv().unwrap().unwrap();
+    assert!(next_default_request(&mut rx).is_none());
+    assert_eq!(on(&mut h), Some(SettingValue::Bool(true)));
+
+    // Off now restores at once (nothing out).
+    let mut off = set(&mut h, false);
+    let Some(MicRequest::RestoreDefault { reply: r, .. }) = next_default_request(&mut rx) else {
+        panic!("RestoreDefault not sent")
+    };
+    h.mic(MicEvent::DefaultRestored {
+        result: Ok(()),
+        reply: r,
+    });
+    off.try_recv().unwrap().unwrap();
+
+    // On that fails, an off held behind it: the failure is answered, the
+    // off finds nothing on record and is answered Ok with nothing asked.
+    let mut made = set(&mut h, true);
+    let Some(MicRequest::MakeDefault { reply: r, .. }) = next_default_request(&mut rx) else {
+        panic!("MakeDefault not sent")
+    };
+    let mut off = set(&mut h, false);
+    assert!(off.try_recv().is_err());
+    h.mic(MicEvent::DefaultNotMade {
+        error: IpcError::Unavailable("no PipeWire".into()),
+        reply: r,
+    });
+    assert!(matches!(
+        made.try_recv().unwrap(),
+        Err(IpcError::Unavailable(_))
+    ));
+    off.try_recv().unwrap().unwrap();
+    assert!(next_default_request(&mut rx).is_none());
+    assert_eq!(on(&mut h), Some(SettingValue::Bool(false)));
+}
+
+/// The switch stores no value: a reset of it alone is refused as an
+/// action's is, and a reset of its group leaves it (and the default
+/// microphone) alone.
+#[test]
+fn the_default_microphone_switch_is_not_reset() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    h.host_on();
+    h.ctrl.runtime.mic_previous_default = Some("alsa_input.usb-a".into());
+    assert!(matches!(
+        h.reset_settings(&format!("setting:{}", mic::USE_AS_DEFAULT), 0),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    h.reset_settings("group:mic.input", 0).unwrap();
+    assert!(next_default_request(&mut rx).is_none());
+    assert_eq!(
+        h.setting(mic::USE_AS_DEFAULT).kind.value(),
+        Some(SettingValue::Bool(true))
     );
 }
 
@@ -16252,7 +16454,7 @@ impl H {
 #[test]
 fn auto_without_usable_cuda_runs_in_system_memory_with_no_cuda_call() {
     let mut h = H::new("", |w| {
-        w.cuda_unusable = Some(NO_DRIVER.into());
+        w.cuda_unusable = Some(obc_gpu::presence::Cause::NoDriver);
         w.modules = vec![host_cutout()];
     });
     // Said once, from the start (the modules are opened for it).
@@ -16295,7 +16497,7 @@ fn auto_without_usable_cuda_runs_in_system_memory_with_no_cuda_call() {
 #[test]
 fn a_session_in_system_memory_plans_nothing_that_takes_cuda_frames() {
     let mut h = H::new("", |w| {
-        w.cuda_unusable = Some(NO_DRIVER.into());
+        w.cuda_unusable = Some(obc_gpu::presence::Cause::NoDriver);
         w.modules = vec![host_cutout()];
     });
     h.activate(0);
@@ -16345,7 +16547,7 @@ fn system_memory_set_in_the_configuration_gives_the_cuda_off_reason() {
 fn cuda_set_in_the_configuration_never_falls_back() {
     let mut h = H::new("[video]\nmemory = \"cuda\"\n", |w| {
         // The probe is not even asked.
-        w.cuda_unusable = Some(NO_DRIVER.into());
+        w.cuda_unusable = Some(obc_gpu::presence::Cause::NoDriver);
         w.fail_start_no_cuda = Some(NO_CUDADOWNLOAD.into());
     });
     assert!(h.stage_listed(MAXINE_MODULE, "denoise").0);
@@ -16668,7 +16870,7 @@ fn in_system_memory_with_only_a_cuda_cut_out_the_effect_follows_on_failure() {
             let config = format!("{memory}{}", blur_with(on_failure));
             let mut h = H::new(&config, |w| {
                 if memory.is_empty() {
-                    w.cuda_unusable = Some(NO_DRIVER.into());
+                    w.cuda_unusable = Some(obc_gpu::presence::Cause::NoDriver);
                 }
             });
             assert_eq!(
@@ -17978,7 +18180,7 @@ fn the_power_profile_is_followed_and_its_absence_is_said() {
 #[test]
 fn without_usable_cuda_the_saver_changes_nothing() {
     let mut h = H::new("[video]\nbattery_saver = \"always\"\n", |w| {
-        w.cuda_unusable = Some(NO_DRIVER.into());
+        w.cuda_unusable = Some(obc_gpu::presence::Cause::NoDriver);
     });
     assert_eq!(
         h.stage_listed(MAXINE_MODULE, "denoise"),
@@ -18090,7 +18292,7 @@ fn the_notice_is_only_for_the_savers_own_changes() {
     // saver's either.
     let mut h = H::new("", |_| {});
     h.activate(0);
-    h.world().cuda_unusable = Some(NO_DRIVER.into());
+    h.world().cuda_unusable = Some(obc_gpu::presence::Cause::NoDriver);
     h.reload("", 1000).unwrap();
     assert!(
         h.row("video.memory")

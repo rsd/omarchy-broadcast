@@ -169,8 +169,9 @@ pub const REASON_VOICE_ON: &str = "Studio voice already removes noise and echo";
 /// Why noise removal's strength is greyed while it is off.
 pub const REASON_NOISE_OFF: &str = "Turn on noise removal to change this";
 /// Why room echo removal's strength is greyed (off, or combined with noise
-/// removal).
-pub const REASON_ECHO_STRENGTH: &str = "Set with noise removal's strength while both are on; turn on room echo removal alone to change this";
+/// removal). At most 96 bytes, so that a client never cuts it short.
+pub const REASON_ECHO_STRENGTH: &str =
+    "Follows noise removal's strength while both are on; turn on room echo removal alone";
 /// Why the mic profile is greyed while studio voice is off.
 pub const REASON_VOICE_OFF: &str = "Turn on studio voice to change this";
 /// Studio voice's label, which says what it costs.
@@ -790,6 +791,18 @@ mod tests {
         assert!(Config::parse(&json!({"sdk_root": 3})).is_err());
         assert!(Config::parse(&json!({"_host": {"compute_capability": [12]}})).is_err());
         assert!(Config::parse(&json!([])).is_err());
+    }
+
+    #[test]
+    fn the_reasons_fit_a_client_s_bound() {
+        for r in [
+            REASON_VOICE_ON,
+            REASON_NOISE_OFF,
+            REASON_ECHO_STRENGTH,
+            REASON_VOICE_OFF,
+        ] {
+            assert!(r.len() <= 96, "{} bytes: {r}", r.len());
+        }
     }
 
     #[test]

@@ -11,14 +11,16 @@
 //!   `surface` s (revision 13: `mic` for the microphone's groups; absent,
 //!   the group belongs where its scope puts it);
 //! - a setting: `id` s, `label` s, `type` s, `scope` s, `stored` b,
-//!   `enabled` b, `disabled_reason` s, `enabled_when` a(ssv), then by type
+//!   `enabled` b, `disabled_reason` s, `enabled_when` a(ssv), from
+//!   revision 28 `disabled_kind` s ([`disabled`]), then by type
 //!   (int: `min`, `max`, `step`, `default`, `value` x and an optional
 //!   `unit` s, and from revision 27 an optional `display_offset` x and
 //!   `display_scale` x ([`IntDisplay`]); bool: `default`, `value` b; enum: `options` a(ss),
 //!   `default`, `value` s; action: none), and an optional `hint` s;
 //! - `SettingsChanged(u revision, u serial, a(sa{sv}) changes)`, a change
-//!   being `(id, {value v, stored b, enabled b, disabled_reason s})`, with
-//!   no `value` for an action ([`SettingChange`]).
+//!   being `(id, {value v, stored b, enabled b, disabled_reason s,
+//!   disabled_kind s})`, with no `value` for an action ([`SettingChange`];
+//!   `disabled_kind` from revision 28).
 //!
 //! Encoding writes exactly these shapes. Decoding is tolerant, so that an
 //! older client keeps working against a newer daemon: a key it does not
@@ -98,6 +100,54 @@ pub fn valid_setting_id(id: &str) -> bool {
             && s.bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || (i > 0 && b == b'_'))
     })
+}
+
+/// The `disabled_kind` of a setting (revision 28): why it is not enabled,
+/// as a token a client lays the setting out by, beside the sentence of
+/// `disabled_reason`. `""` while the setting is enabled; exactly one of
+/// [`KINDS`] while it is not. A client that meets `""` with `enabled`
+/// false (an older daemon) or a value it does not know shows the setting
+/// greyed in place, as before the key existed.
+pub mod disabled {
+    /// An `enabled_when` rule does not hold (its master is off, or on
+    /// another choice).
+    pub const PARENT_OFF: &str = "parent_off";
+    /// It cannot apply in this context (the camera already captures at
+    /// full resolution, its format cannot be enhanced, the configuration
+    /// rules it out).
+    pub const NOT_APPLICABLE: &str = "not_applicable";
+    /// What it needs is not installed, as the daemon knows it.
+    pub const NOT_INSTALLED: &str = "not_installed";
+    /// It needs hardware this machine lacks (an NVIDIA GPU), as the daemon
+    /// knows it.
+    pub const NEEDS_HARDWARE: &str = "needs_hardware";
+    /// Another module provides its stage.
+    pub const OTHER_PROVIDER: &str = "other_provider";
+    /// Its module or stage is unavailable for a reason the daemon passes
+    /// on as it is (a module's own reason).
+    pub const UNAVAILABLE: &str = "unavailable";
+    /// For now: the device holds the control or marks it inactive, a
+    /// command runs, the microphone is off.
+    pub const BUSY: &str = "busy";
+    /// The device marks it disabled or read-only, or reports a value this
+    /// version does not know.
+    pub const DEVICE: &str = "device";
+    /// Every kind of revision 28.
+    pub const KINDS: [&str; 8] = [
+        PARENT_OFF,
+        NOT_APPLICABLE,
+        NOT_INSTALLED,
+        NEEDS_HARDWARE,
+        OTHER_PROVIDER,
+        UNAVAILABLE,
+        BUSY,
+        DEVICE,
+    ];
+
+    /// Whether `kind` is one of [`KINDS`].
+    pub fn is_known(kind: &str) -> bool {
+        KINDS.contains(&kind)
+    }
 }
 
 /// A value of the settings channel: a setting's value or default, a
@@ -335,6 +385,9 @@ pub struct Setting {
     pub enabled: bool,
     /// Why not, when not enabled; empty when enabled.
     pub disabled_reason: String,
+    /// What kind of reason that is (revision 28, [`disabled`]); empty when
+    /// enabled, and when an older daemon sent none.
+    pub disabled_kind: String,
     pub enabled_when: Vec<Condition>,
     /// A widget suggestion: `slider` (int), `switch` (bool), `segmented`
     /// (enum).
@@ -362,6 +415,11 @@ impl Setting {
             &mut d,
             "disabled_reason",
             Variant::from(self.disabled_reason.as_str()),
+        );
+        put(
+            &mut d,
+            "disabled_kind",
+            Variant::from(self.disabled_kind.as_str()),
         );
         let conditions: Vec<(&str, &str, OwnedVariant)> = self
             .enabled_when
@@ -423,7 +481,8 @@ impl Setting {
     /// The setting a dictionary describes, or `None` when it is malformed:
     /// a common key or a key of its (known) type missing or of the wrong
     /// type, or an id that is not a [`valid_setting_id`]. Unknown keys are
-    /// ignored; a `unit`, `hint` or `description` of the wrong type is read as absent, and so
+    /// ignored; a `unit`, `hint` or `description` of the wrong type is read as absent, a
+    /// `disabled_kind` absent or of the wrong type as `""`, and so
     /// is a display transform of the wrong type or with a scale not above 0; a
     /// condition or an option that does not decode is dropped alone.
     pub fn from_dict(dict: &VariantDict) -> Option<Setting> {
@@ -483,6 +542,7 @@ impl Setting {
             stored: get_bool(e, "stored")?,
             enabled: get_bool(e, "enabled")?,
             disabled_reason: get_str(e, "disabled_reason")?.to_string(),
+            disabled_kind: get_str(e, "disabled_kind").unwrap_or_default().to_string(),
             enabled_when,
             hint: get_str(e, "hint").map(str::to_string),
             description: get_str(e, "description").map(str::to_string),
@@ -600,11 +660,14 @@ pub struct SettingChange {
     pub stored: bool,
     pub enabled: bool,
     pub disabled_reason: String,
+    /// Revision 28 ([`disabled`]); `""` when enabled or not sent.
+    pub disabled_kind: String,
 }
 
 impl SettingChange {
     /// The change as `SettingsChanged` carries it: `(id, {value, stored,
-    /// enabled, disabled_reason})`, without `value` when it is `None`.
+    /// enabled, disabled_reason, disabled_kind})`, without `value` when it
+    /// is `None`.
     pub fn to_wire(&self) -> WireChange {
         let mut d = VariantDict::new();
         if let Some(value) = &self.value {
@@ -617,6 +680,11 @@ impl SettingChange {
             "disabled_reason",
             Variant::from(self.disabled_reason.as_str()),
         );
+        put(
+            &mut d,
+            "disabled_kind",
+            Variant::from(self.disabled_kind.as_str()),
+        );
         (self.id.clone(), d)
     }
 
@@ -624,7 +692,8 @@ impl SettingChange {
     /// malformed: an id that is not a [`valid_setting_id`], `stored`,
     /// `enabled` or `disabled_reason` missing or of the wrong type, or a
     /// `value` that does not decode ([`SettingValue::from_variant`]).
-    /// Unknown keys are ignored.
+    /// Unknown keys are ignored; a `disabled_kind` absent or of the wrong
+    /// type reads as `""`.
     pub fn from_wire(id: &str, dict: &VariantDict) -> Option<SettingChange> {
         if !valid_setting_id(id) {
             return None;
@@ -640,6 +709,7 @@ impl SettingChange {
             stored: get_bool(&e, "stored")?,
             enabled: get_bool(&e, "enabled")?,
             disabled_reason: get_str(&e, "disabled_reason")?.to_string(),
+            disabled_kind: get_str(&e, "disabled_kind").unwrap_or_default().to_string(),
         })
     }
 
@@ -833,6 +903,7 @@ mod tests {
             stored: false,
             enabled: true,
             disabled_reason: String::new(),
+            disabled_kind: String::new(),
             enabled_when: Vec::new(),
             hint: None,
             description: None,
@@ -854,6 +925,7 @@ mod tests {
         );
         temp.enabled = false;
         temp.disabled_reason = "Turn off automatic white balance to change this".into();
+        temp.disabled_kind = disabled::PARENT_OFF.into();
         temp.stored = true;
         temp.hint = Some("slider".into());
         temp.enabled_when = vec![Condition {
@@ -1119,6 +1191,7 @@ mod tests {
             ("stored", "b"),
             ("enabled", "b"),
             ("disabled_reason", "s"),
+            ("disabled_kind", "s"),
             ("enabled_when", "a(ssv)"),
             ("min", "x"),
             ("max", "x"),
@@ -1130,7 +1203,7 @@ mod tests {
         ] {
             assert_eq!(sig(&temp, k), want, "{k}");
         }
-        assert_eq!(temp.len(), 15);
+        assert_eq!(temp.len(), 16);
         assert_eq!(<&str>::try_from(&temp["type"]).unwrap(), "int");
         // No unit, no hint: the keys are left out.
         let exposure = s[1].to_dict();
@@ -1151,7 +1224,7 @@ mod tests {
         assert_eq!(sig(&s[4].to_dict(), "enabled_when"), "a(ssv)");
         let action = s[5].to_dict();
         assert!(!action.contains_key("value") && !action.contains_key("default"));
-        assert_eq!(action.len(), 8);
+        assert_eq!(action.len(), 9);
         let group = SettingsGroup {
             id: "g".into(),
             label: "G".into(),
@@ -1342,6 +1415,66 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_kind_round_trips_and_is_decoded_tolerantly() {
+        assert_eq!(disabled::KINDS.len(), 8);
+        assert!(disabled::KINDS.iter().all(|k| disabled::is_known(k)));
+        assert!(!disabled::is_known("") && !disabled::is_known("Busy"));
+        // Every kind over the wire, in a setting and in a change.
+        for kind in disabled::KINDS {
+            let mut s = base("camera.image.sharpness", SettingKind::Action);
+            s.enabled = false;
+            s.disabled_reason = "Why not".into();
+            s.disabled_kind = kind.into();
+            let d = s.to_dict();
+            assert_eq!(<&str>::try_from(&d["disabled_kind"]).unwrap(), kind);
+            let tree = SettingsTree {
+                revision: 28,
+                serial: 1,
+                camera: "c".into(),
+                groups: vec![SettingsGroup {
+                    id: "image".into(),
+                    label: "Image".into(),
+                    settings: vec![s.clone()],
+                    surface: None,
+                }],
+            };
+            let back = SettingsTree::from_wire(&over_the_wire(&tree.to_wire()));
+            assert_eq!(back.groups[0].settings[0].disabled_kind, kind);
+            let change = SettingChange {
+                id: s.id.clone(),
+                value: None,
+                stored: false,
+                enabled: false,
+                disabled_reason: "Why not".into(),
+                disabled_kind: kind.into(),
+            };
+            let (id, d) = over_the_wire(&change.to_wire());
+            assert_eq!(SettingChange::from_wire(&id, &d), Some(change));
+        }
+        // An enabled setting sends "".
+        let s = base("camera.image.sharpness", SettingKind::Action);
+        assert_eq!(<&str>::try_from(&s.to_dict()["disabled_kind"]).unwrap(), "");
+        // Absent (an older daemon) or of the wrong type: "", the rest kept.
+        let mut s = base("camera.image.sharpness", SettingKind::Action);
+        s.enabled = false;
+        s.disabled_reason = "Why not".into();
+        let mut d = s.to_dict();
+        d.remove("disabled_kind");
+        assert_eq!(Setting::from_dict(&d), Some(s.clone()));
+        d.insert("disabled_kind".into(), owned(Variant::from(3u32)));
+        assert_eq!(Setting::from_dict(&d), Some(s.clone()));
+        // An unknown kind is carried as received: a client decides.
+        d.insert("disabled_kind".into(), owned(Variant::from("later")));
+        assert_eq!(Setting::from_dict(&d).unwrap().disabled_kind, "later");
+        let mut c = VariantDict::new();
+        put(&mut c, "stored", Variant::from(false));
+        put(&mut c, "enabled", Variant::from(false));
+        put(&mut c, "disabled_reason", Variant::from("Why not"));
+        let got = SettingChange::from_wire("camera.image.sharpness", &c).unwrap();
+        assert_eq!(got.disabled_kind, "");
+    }
+
+    #[test]
     fn a_malformed_setting_is_dropped_alone() {
         let s = every_type();
         let good = s[0].to_dict();
@@ -1462,6 +1595,7 @@ mod tests {
                 stored: true,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
             SettingChange {
                 id: "camera.exposure.auto_exposure".into(),
@@ -1469,6 +1603,7 @@ mod tests {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
             SettingChange {
                 id: "camera.white_balance.red_balance".into(),
@@ -1476,6 +1611,7 @@ mod tests {
                 stored: false,
                 enabled: false,
                 disabled_reason: "Turn off automatic white balance to change this".into(),
+                disabled_kind: "parent_off".into(),
             },
             SettingChange {
                 id: "camera.focus.pan_reset".into(),
@@ -1483,11 +1619,12 @@ mod tests {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
         ];
         let wire: Vec<WireChange> = changes.iter().map(SettingChange::to_wire).collect();
-        assert_eq!(wire[3].1.len(), 3, "no value for an action");
-        assert_eq!(wire[0].1.len(), 4);
+        assert_eq!(wire[3].1.len(), 4, "no value for an action");
+        assert_eq!(wire[0].1.len(), 5);
         assert_eq!(SettingChange::list_from_wire(&wire), changes);
         assert_eq!(
             SettingChange::list_from_wire(&over_the_wire(&wire)),

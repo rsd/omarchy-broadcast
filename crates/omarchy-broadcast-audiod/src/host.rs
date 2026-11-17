@@ -49,6 +49,23 @@ pub const REASON_CRASHED_WORKER: &str = "Disabled after crashing the audio worke
 /// The reason of a module the user disabled.
 pub const REASON_DISABLED: &str = "Disabled";
 
+/// The `disabled_kind` tokens of the settings document (the settings
+/// channel's, revision 28: `obc_ipc::settings::disabled`, which the daemon
+/// checks them against).
+pub mod disabled_kind {
+    /// An `enabled_when` condition does not hold.
+    pub const PARENT_OFF: &str = "parent_off";
+    /// It cannot apply in this session (the GPU policy rules the stage out).
+    pub const NOT_APPLICABLE: &str = "not_applicable";
+    /// Another module provides the stage.
+    pub const OTHER_PROVIDER: &str = "other_provider";
+    /// No module can run the stage, for the reason passed on as it is.
+    pub const UNAVAILABLE: &str = "unavailable";
+    /// For now: processing is off, or a stage that is on turns this one
+    /// off.
+    pub const BUSY: &str = "busy";
+}
+
 /// The reason of a stage whose switch is off.
 pub const REASON_OFF: &str = "Turned off";
 
@@ -160,6 +177,11 @@ pub struct StagePlan {
     pub on: bool,
     /// Why not, when it is not.
     pub reason: String,
+    /// The `disabled_kind` of the reason of a stage no module runs
+    /// ([`disabled_kind`]), empty while one does.
+    pub kind: &'static str,
+    /// A stage that is on turns it off (a declared conflict).
+    pub excluded: bool,
 }
 
 /// The chain the snapshot asks for.
@@ -576,6 +598,17 @@ impl Host {
         for s in &order {
             let res = self.resolve(s, gate);
             let provider = res.provider.clone();
+            // No provider under the gate, one without it: the GPU policy
+            // rules the stage out of this session.
+            let gated = provider.is_none()
+                && !gate.allows()
+                && self.registry.resolve(s.as_str()).provider.is_some();
+            let kind = match &provider {
+                Some(_) => "",
+                None if !snapshot.enabled => disabled_kind::BUSY,
+                None if gated => disabled_kind::NOT_APPLICABLE,
+                None => disabled_kind::UNAVAILABLE,
+            };
             let (is_on, reason) = match &provider {
                 _ if !snapshot.enabled => (false, REASON_PROCESSING_OFF.to_string()),
                 None => (
@@ -606,6 +639,8 @@ impl Host {
                 provider,
                 on: is_on,
                 reason,
+                kind,
+                excluded: false,
             });
         }
         if !snapshot.forced_conflicts {
@@ -613,6 +648,7 @@ impl Host {
             for (s, by) in &excluded {
                 if let Some(sp) = stages.iter_mut().find(|x| x.id == s.as_str()) {
                     sp.on = false;
+                    sp.excluded = true;
                     let provider = on.iter().find(|(x, _)| x == by).map(|(_, p)| p.as_str());
                     sp.reason = format!(
                         "Cannot run together with {}",
@@ -735,7 +771,11 @@ impl Host {
     /// audio modules, in module id order, in the keys of the obc-ipc
     /// setting dictionaries (with `stage`, `key`, `apply` and `role` too);
     /// `enabled` computed from the conditions, the stage's provider and the
-    /// conflicts in force.
+    /// conflicts in force, with its `disabled_kind` ([`disabled_kind`]):
+    /// `other_provider` (`Handled by <name> instead`), `not_applicable`
+    /// (the GPU policy), `busy` (processing off, or a stage that is on
+    /// turns this one off), `unavailable` (no module can run the stage),
+    /// `parent_off` (a condition that does not hold); `""` while enabled.
     ///
     /// It describes what the user may configure, so only the policy gates
     /// ([`GpuGate::Never`], [`GpuGate::CameraOff`]: the stage cannot run in
@@ -789,12 +829,14 @@ impl Host {
         let value = value_of(snapshot, s);
         let mut enabled = true;
         let mut reason = String::new();
+        let mut kind = "";
         if let Some(stage) = &s.stage {
             let sp = plan.stages.iter().find(|p| p.id == stage.as_str());
             match sp.map(|p| p.provider.as_deref()) {
                 Some(Some(p)) if p != module => {
                     enabled = false;
-                    reason = format!("Provided by {}", self.name_of(p));
+                    reason = format!("Handled by {} instead", self.name_of(p));
+                    kind = disabled_kind::OTHER_PROVIDER;
                 }
                 Some(Some(_)) => {}
                 _ => {
@@ -802,21 +844,24 @@ impl Host {
                     reason = sp
                         .map(|p| p.reason.clone())
                         .unwrap_or_else(|| obc_module_host::registry::REASON_NO_PROVIDER.into());
+                    kind = sp.map_or(disabled_kind::UNAVAILABLE, |p| p.kind);
                 }
             }
             // The switch of a stage another one turns off.
             if enabled
                 && s.role == Some(Role::Enable)
                 && let Some(p) = sp
-                && p.reason.starts_with("Cannot run together")
+                && p.excluded
             {
                 enabled = false;
                 reason = p.reason.clone();
+                kind = disabled_kind::BUSY;
             }
         }
         if enabled && !s.enabled_when.iter().all(|c| holds(snapshot, desc, c)) {
             enabled = false;
             reason = s.disabled_reason.clone().unwrap_or_default();
+            kind = disabled_kind::PARENT_OFF;
         }
         let conditions: Vec<Json> = s
             .enabled_when
@@ -838,6 +883,7 @@ impl Host {
             "stored": snapshot.values.contains_key(&s.id),
             "enabled": enabled,
             "disabled_reason": reason,
+            "disabled_kind": kind,
             "enabled_when": conditions,
         });
         match &s.kind {

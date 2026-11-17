@@ -288,11 +288,18 @@ fn greyed(s: &CameraSettings, id: &str) -> Option<String> {
     let st = setting(s, id);
     if st.enabled {
         assert_eq!(st.disabled_reason, "", "{id}");
+        assert_eq!(st.disabled_kind, "", "{id}");
         None
     } else {
         assert!(!st.disabled_reason.is_empty(), "{id}");
+        assert!(disabled::is_known(&st.disabled_kind), "{id}: {st:?}");
         Some(st.disabled_reason.clone())
     }
+}
+
+/// The `disabled_kind` of setting `id`.
+fn kind_of(s: &CameraSettings, id: &str) -> String {
+    setting(s, id).disabled_kind.clone()
 }
 
 fn str_value(v: &str) -> Option<SettingValue> {
@@ -306,15 +313,22 @@ fn the_brio_tree_has_its_groups_in_order_and_leaves_out_what_is_never_exposed() 
     assert_eq!(
         groups,
         [
+            ("focus".into(), "Framing & focus".into()),
             ("image".into(), "Image".into()),
             ("white_balance".into(), "White balance".into()),
             ("exposure".into(), "Exposure".into()),
-            ("focus".into(), "Focus & zoom".into()),
         ]
     );
+    // Framing first: the field of view, then zoom.
     assert_eq!(
         ids(&s),
         [
+            "camera.focus.field_of_view",
+            "camera.focus.zoom_absolute",
+            "camera.focus.focus_automatic_continuous",
+            "camera.focus.focus_absolute",
+            "camera.focus.pan_absolute",
+            "camera.focus.tilt_absolute",
             "camera.image.brightness",
             "camera.image.contrast",
             "camera.image.saturation",
@@ -327,12 +341,6 @@ fn the_brio_tree_has_its_groups_in_order_and_leaves_out_what_is_never_exposed() 
             "camera.exposure.gain",
             "camera.exposure.keep_framerate",
             "camera.exposure.power_line_frequency",
-            "camera.focus.focus_automatic_continuous",
-            "camera.focus.focus_absolute",
-            "camera.focus.zoom_absolute",
-            "camera.focus.pan_absolute",
-            "camera.focus.tilt_absolute",
-            "camera.focus.field_of_view",
         ]
     );
     assert!(s.notes.is_empty(), "{:?}", s.notes);
@@ -498,12 +506,16 @@ fn exposure_time_follows_the_exposure_mode_with_its_reason() {
         str_value("manual")
     );
     assert_eq!(greyed(&s, id).as_deref(), Some(REASON));
+    // The rule holds, the device says not now.
+    assert_eq!(kind_of(&s, id), disabled::BUSY);
     c.controls[10].info.flags = 0;
     let s = c.build();
     assert_eq!(greyed(&s, id), None);
-    // Back to the automatic mode on the device: greyed again.
+    // Back to the automatic mode on the device: greyed again, by the rule.
     c.controls[9].value = CtrlValue::Value(3);
-    assert_eq!(greyed(&c.build(), id).as_deref(), Some(REASON));
+    let s = c.build();
+    assert_eq!(greyed(&s, id).as_deref(), Some(REASON));
+    assert_eq!(kind_of(&s, id), disabled::PARENT_OFF);
 }
 
 #[test]
@@ -522,6 +534,7 @@ fn white_balance_and_focus_follow_their_automatic_switches() {
         "camera.white_balance.blue_balance",
     ] {
         assert_eq!(greyed(&s, id).as_deref(), Some(WB), "{id}");
+        assert_eq!(kind_of(&s, id), disabled::PARENT_OFF, "{id}");
         assert_eq!(
             setting(&s, id).enabled_when,
             [Condition {
@@ -559,6 +572,7 @@ fn white_balance_and_focus_follow_their_automatic_switches() {
         greyed(&s, "camera.focus.focus_absolute").as_deref(),
         Some(REASON_INACTIVE)
     );
+    assert_eq!(kind_of(&s, "camera.focus.focus_absolute"), disabled::BUSY);
     // A master of another type than the rule's drops the rule too.
     let s = Case::of(vec![
         int(0x009a_0901, "Auto Exposure", 3, 3, 3),
@@ -614,6 +628,16 @@ fn flags_grey_a_setting_with_their_reason() {
             Some(REASON_INACTIVE)
         );
         assert_eq!(greyed(&s, "camera.image.gamma"), None);
+        // Fixed by the device: `device`; for now: `busy`.
+        for (id, kind) in [
+            ("camera.image.brightness", disabled::DEVICE),
+            ("camera.image.contrast", disabled::DEVICE),
+            ("camera.image.saturation", disabled::BUSY),
+            ("camera.image.sharpness", disabled::BUSY),
+            ("camera.image.gamma", ""),
+        ] {
+            assert_eq!(kind_of(&s, id), kind, "{id} open {open}");
+        }
     }
     // An unknown field of view byte.
     let mut c = Case::brio();
@@ -623,6 +647,7 @@ fn flags_grey_a_setting_with_their_reason() {
         greyed(&s, "camera.focus.field_of_view").as_deref(),
         Some(REASON_XU_UNKNOWN)
     );
+    assert_eq!(kind_of(&s, "camera.focus.field_of_view"), disabled::DEVICE);
     assert_eq!(value(&s, "camera.focus.field_of_view"), str_value("m7"));
 }
 
@@ -706,6 +731,7 @@ fn a_quirk_row_hides_its_controls_and_an_empty_menu_is_absent() {
         // The exposure time has no master to wait for: greyed for good,
         // with a reason that says so, and no condition.
         assert_eq!(greyed(&s, exposure).as_deref(), Some(NO_EXPOSURE));
+        assert_eq!(kind_of(&s, exposure), disabled::DEVICE);
         assert!(setting(&s, exposure).enabled_when.is_empty());
         assert!(matches!(
             s.check(exposure, Some(&SettingValue::Int(10))),
@@ -1020,8 +1046,8 @@ fn unknown_controls_fall_back_to_other_and_bad_names_are_left_out() {
     assert_eq!(
         ids(&s),
         [
-            "camera.image.sharpness",
             "camera.focus.focus_automatic_continuous",
+            "camera.image.sharpness",
             "camera.other.led_brightness",
             "camera.other.colour_effect",
             "camera.other.sensor_mode",
@@ -1243,15 +1269,15 @@ fn masters_are_written_first_and_reset_last() {
         [
             "sharpness",
             "auto_exposure",
-            "exposure_time_absolute",
-            "focus_absolute"
+            "focus_absolute",
+            "exposure_time_absolute"
         ]
     );
     assert_eq!(
         names(s.reset_order(&all)),
         [
-            "exposure_time_absolute",
             "focus_absolute",
+            "exposure_time_absolute",
             "sharpness",
             "auto_exposure"
         ]
@@ -1279,6 +1305,7 @@ fn a_value_change_is_a_delta_and_a_new_shape_is_structural() {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
             SettingChange {
                 id: "camera.exposure.exposure_time_absolute".into(),
@@ -1286,6 +1313,7 @@ fn a_value_change_is_a_delta_and_a_new_shape_is_structural() {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
         ]
     );
@@ -1568,8 +1596,8 @@ fn the_mx_brio_extension_unit_rows_are_typed_settings() {
         assert!(st.enabled_when.is_empty(), "{id}");
         assert!(matches!(s.get(id).unwrap().target, Target::Xu(_)), "{id}");
     }
-    // Their place: after their group's standard controls, Show Mode after
-    // the field of view.
+    // Their place: after their group's standard controls; the field of
+    // view first of its group, Show Mode last.
     let ids = ids(&s);
     let at = |id: &str| ids.iter().position(|i| *i == id).unwrap();
     assert_eq!(
@@ -1581,11 +1609,14 @@ fn the_mx_brio_extension_unit_rows_are_typed_settings() {
             > at("camera.white_balance.white_balance_temperature")
     );
     assert!(at("camera.exposure.exposure_compensation") > at("camera.exposure.gain"));
-    let focus = &ids[at("camera.focus.field_of_view")..];
-    assert_eq!(
-        focus,
-        ["camera.focus.field_of_view", "camera.focus.show_mode",]
-    );
+    assert_eq!(at("camera.focus.field_of_view"), 0);
+    let focus: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|i| i.starts_with("camera.focus."))
+        .collect();
+    assert_eq!(focus.first(), Some(&"camera.focus.field_of_view"));
+    assert_eq!(focus.last(), Some(&"camera.focus.show_mode"));
     // Only the two compensations carry a display transform.
     let shown_ids: Vec<&str> = s
         .entries
