@@ -835,7 +835,8 @@ pub trait MediaBackend: Send + 'static {
     /// environment, the driver's procfs listing, the driver library opened
     /// without `cuInit`, and GStreamer's registry. It makes no CUDA call and
     /// loads no plugin, so it may run at idle and while the GPU is parked.
-    fn cuda_unusable(&mut self) -> Option<String>;
+    /// The check that failed says why ([`obc_gpu::presence::Cause::reason`]).
+    fn cuda_unusable(&mut self) -> Option<obc_gpu::presence::Cause>;
 
     /// What the machine's power supplies show, for the battery saver
     /// ([`crate::power::power_source`]): a sysfs read, cheap and at any

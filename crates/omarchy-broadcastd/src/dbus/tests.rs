@@ -464,8 +464,8 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 27);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::DISPLAY_OFFSET_REVISION);
+    assert_eq!(INTERFACE_REVISION, 28);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::DISABLED_KIND_REVISION);
     assert_eq!(obc_ipc::CAMERA_STATUS_REVISION, 26);
     assert_eq!(obc_ipc::CAMERA_XU_SETTINGS_REVISION, 24);
     assert_eq!(obc_ipc::BATTERY_SAVER_AUTO_REVISION, 23);
@@ -981,7 +981,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 27);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 28);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1170,7 +1170,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 27);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 28);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1286,7 +1286,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 27);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 28);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -1807,16 +1807,17 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
     let exp = tree.find(EXPOSURE).unwrap();
     assert!(!exp.enabled);
     assert_eq!(exp.disabled_reason, "Set exposure to manual to change this");
+    assert_eq!(exp.disabled_kind, obc_ipc::settings::disabled::PARENT_OFF);
     assert_eq!(
         tree.groups
             .iter()
             .map(|g| g.id.as_str())
             .collect::<Vec<_>>(),
         [
+            "focus",
             "image",
             "white_balance",
             "exposure",
-            "focus",
             "background",
             "video",
             "lighting"
@@ -1969,6 +1970,7 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
                 stored: true,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
             SettingChange {
                 id: EXPOSURE.into(),
@@ -1976,6 +1978,7 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
         ]
     );
@@ -2034,6 +2037,7 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
         stored: on,
         enabled: true,
         disabled_reason: String::new(),
+        disabled_kind: String::new(),
     };
     let sig = settings_changed_after(&mut signals, before).await;
     let args = sig.args().unwrap();

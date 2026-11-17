@@ -318,8 +318,8 @@ pub struct World {
     /// included), in order.
     pub start_memories: Vec<VideoMemory>,
     /// What the CUDA presence probe finds (`cuda_unusable`): `None`, CUDA
-    /// is usable (the default), else why not.
-    pub cuda_unusable: Option<String>,
+    /// is usable (the default), else the check that failed.
+    pub cuda_unusable: Option<obc_gpu::presence::Cause>,
     /// The CUDA presence probes made.
     pub cuda_probes: u32,
     /// What the power supplies show (`power_source`): AC power by default.
@@ -1666,10 +1666,10 @@ impl MediaBackend for FakeBackend {
         }
     }
 
-    fn cuda_unusable(&mut self) -> Option<String> {
+    fn cuda_unusable(&mut self) -> Option<obc_gpu::presence::Cause> {
         let mut w = self.world();
         w.cuda_probes += 1;
-        w.cuda_unusable.clone()
+        w.cuda_unusable
     }
 
     fn power_source(&mut self) -> PowerSource {

@@ -1658,16 +1658,14 @@ impl MediaBackend for GstBackend {
             .compute_capability
     }
 
-    fn cuda_unusable(&mut self) -> Option<String> {
+    fn cuda_unusable(&mut self) -> Option<obc_gpu::presence::Cause> {
         // `find` reads GStreamer's registry (its cache) and loads no
         // plugin: making a CUDA element would load `nvcodec`, whose
         // initialisation calls `cuInit`.
         let registered = obc_gpu::presence::CUDA_ELEMENTS
             .iter()
             .all(|name| gst::ElementFactory::find(name).is_some());
-        obc_gpu::presence::probe_process(registered)
-            .unusable_reason()
-            .map(str::to_string)
+        obc_gpu::presence::probe_process(registered).cause()
     }
 
     fn power_source(&mut self) -> PowerSource {

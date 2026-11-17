@@ -2339,7 +2339,7 @@ fn settings_follow_the_camera_over_dbus() {
             );
         }
     }
-    for want in ["Image", "White balance", "Exposure", "Focus & zoom"] {
+    for want in ["Image", "White balance", "Exposure", "Framing & focus"] {
         assert!(groups.contains(&want), "{want} missing: {groups:?}");
     }
     assert_eq!(tree.camera, client.active());

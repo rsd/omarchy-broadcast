@@ -446,6 +446,7 @@ fn switch(id: &str, on: bool, enabled: bool) -> GlobalEntry {
             } else {
                 "Not installed".into()
             },
+            disabled_kind: String::new(),
             enabled_when: Vec::new(),
             hint: None,
             description: None,

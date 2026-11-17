@@ -55,6 +55,8 @@ use std::path::{Path, PathBuf};
 
 use obc_core::config::{Config, EffectiveMemory, MemoryChoice, RuntimeState, VideoMemory};
 use obc_core::modules::{BackendProfile, StoredValue};
+use obc_gpu::presence::Cause;
+use obc_ipc::settings::disabled;
 use obc_module_host::registry::{
     FRAME_GENERATION, Profile, REASON_BATTERY_SAVER, REASON_CUDA_OFF, REASON_NEEDS_CUDA,
 };
@@ -178,35 +180,99 @@ impl std::fmt::Debug for Modules {
 /// Where the next session's video frames are, as the modules are told: the
 /// registry's stage availability and the `_host.cuda` key of their
 /// configuration.
+///
+/// Every variant but [`HostMemory::Cuda`] is system memory, where a stage
+/// that takes CUDA frames only is unavailable with [`HostMemory::reason`]
+/// and CUDA is off for the modules; they differ in why, which the
+/// `disabled_kind` of such a stage's settings follows
+/// ([`HostMemory::disabled_kind`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HostMemory {
     /// CUDA memory (the default): nothing is filtered.
     #[default]
     Cuda,
-    /// System memory: a stage that takes CUDA frames only is unavailable
-    /// with this reason, and CUDA is off for the modules.
-    System(&'static str),
+    /// The configuration chose system memory (`video.memory = "system"`).
+    Configured,
+    /// `auto` chose it for the battery saver, CUDA being usable.
+    BatterySaver,
+    /// `auto` chose it because the machine has no NVIDIA GPU, as a fact:
+    /// the CUDA presence probe found the NVIDIA driver loaded with no GPU
+    /// ([`Cause::no_gpu`]).
+    NoGpu,
+    /// `auto` chose it because the CUDA presence probe found CUDA
+    /// unusable for another reason (no driver loaded, which a broken
+    /// driver also shows, GPUs hidden, the library or GStreamer's elements
+    /// missing): whether the hardware is there is not known.
+    CudaUnusable,
+    /// `auto` fell back to it after a CUDA start failed (until the next
+    /// reload).
+    StartFailed,
 }
 
 impl HostMemory {
-    /// The modules' view of the effective memory `m`: in system memory,
-    /// the reason is [`REASON_CUDA_OFF`] when the configuration chose it,
-    /// [`REASON_BATTERY_SAVER`] when the battery saver did (`auto`, CUDA
-    /// usable), else [`REASON_NEEDS_CUDA`] (`auto` found no usable CUDA,
-    /// or a CUDA start failed).
-    pub fn of(m: &EffectiveMemory) -> HostMemory {
+    /// The modules' view of the effective memory `m`, `probe` being what
+    /// the CUDA presence probe found when `m` was resolved (`None`: CUDA
+    /// usable, or not probed, as while a fallback stands).
+    pub fn of(m: &EffectiveMemory, probe: Option<Cause>) -> HostMemory {
         match (m.memory, m.choice) {
             (VideoMemory::Cuda, _) => HostMemory::Cuda,
-            (VideoMemory::System, MemoryChoice::System) => HostMemory::System(REASON_CUDA_OFF),
-            (VideoMemory::System, _) if m.battery_saver => HostMemory::System(REASON_BATTERY_SAVER),
-            (VideoMemory::System, _) => HostMemory::System(REASON_NEEDS_CUDA),
+            (VideoMemory::System, MemoryChoice::System) => HostMemory::Configured,
+            (VideoMemory::System, _) if m.battery_saver => HostMemory::BatterySaver,
+            // Under `auto`, a probe that found CUDA unusable decides; with
+            // none, a start fell back.
+            (VideoMemory::System, _) => match probe {
+                Some(c) if c.no_gpu() => HostMemory::NoGpu,
+                Some(_) => HostMemory::CudaUnusable,
+                None => HostMemory::StartFailed,
+            },
+        }
+    }
+
+    /// Why a stage that takes CUDA frames only is unavailable in this
+    /// memory: [`REASON_CUDA_OFF`] when the configuration chose it,
+    /// [`REASON_BATTERY_SAVER`] when the battery saver did, else
+    /// [`REASON_NEEDS_CUDA`]; `""` in CUDA memory.
+    pub fn reason(self) -> &'static str {
+        match self {
+            HostMemory::Cuda => "",
+            HostMemory::Configured => REASON_CUDA_OFF,
+            HostMemory::BatterySaver => REASON_BATTERY_SAVER,
+            HostMemory::NoGpu | HostMemory::CudaUnusable | HostMemory::StartFailed => {
+                REASON_NEEDS_CUDA
+            }
         }
     }
 
     /// Whether the modules are told CUDA is off.
     pub fn cuda_off(self) -> bool {
-        matches!(self, HostMemory::System(_))
+        self != HostMemory::Cuda
     }
+
+    /// The `disabled_kind` of a setting whose stage cannot take the frames
+    /// of this memory: `needs_hardware` only when the machine is known to
+    /// have no NVIDIA GPU, `not_applicable` when the configuration or the
+    /// battery saver chose system memory, `unavailable` when CUDA was found
+    /// unusable or failed to start (the hardware may be there) and in CUDA
+    /// memory, where every declaration takes the frames.
+    pub fn disabled_kind(self) -> &'static str {
+        match self {
+            HostMemory::NoGpu => disabled::NEEDS_HARDWARE,
+            HostMemory::Configured | HostMemory::BatterySaver => disabled::NOT_APPLICABLE,
+            HostMemory::Cuda | HostMemory::CudaUnusable | HostMemory::StartFailed => {
+                disabled::UNAVAILABLE
+            }
+        }
+    }
+}
+
+/// Why a module cannot run a stage at the next session
+/// ([`Modules::stage_reason`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageUnavailable {
+    /// The sentence a setting shows (`disabled_reason`).
+    pub reason: String,
+    /// Its kind (`disabled_kind`, [`obc_ipc::settings::disabled`]).
+    pub kind: &'static str,
 }
 
 /// The configuration a module is opened with: its `[module."<id>"]` table
@@ -714,7 +780,7 @@ impl Modules {
     fn apply_memory(&mut self) {
         match self.memory {
             HostMemory::Cuda => self.registry.set_memory(FrameKind::Cuda, ""),
-            HostMemory::System(reason) => self.registry.set_memory(FrameKind::Host, reason),
+            m => self.registry.set_memory(FrameKind::Host, m.reason()),
         }
     }
 
@@ -1222,17 +1288,43 @@ impl Modules {
     }
 
     /// Why `module` cannot run `stage` at the next session, `None` when it
-    /// can: the stage's reason, or that another module provides it.
-    pub fn stage_reason(&self, module: &str, stage: &str) -> Option<String> {
+    /// can: that another module provides it (`Handled by <name> instead`,
+    /// kind `other_provider`), else the stage's reason, of the kind
+    /// [`HostMemory::disabled_kind`] gives while no module that declares
+    /// it can take the session's frames, else `unavailable` (the reason is
+    /// a module's, or the registry's, passed on as it is).
+    pub fn stage_reason(&self, module: &str, stage: &str) -> Option<StageUnavailable> {
         let res = self.registry.resolve(stage);
         match &res.provider {
             Some(p) if p == module => None,
-            Some(p) => Some(format!("Provided by {}", self.name_of(p))),
-            None => Some(
-                res.reason
+            Some(p) => Some(StageUnavailable {
+                reason: format!("Handled by {} instead", self.name_of(p)),
+                kind: disabled::OTHER_PROVIDER,
+            }),
+            None => Some(StageUnavailable {
+                reason: res
+                    .reason
                     .unwrap_or_else(|| obc_module_host::registry::REASON_NO_PROVIDER.into()),
-            ),
+                kind: self.memory_kind_of(stage),
+            }),
         }
+    }
+
+    /// The kind of a stage no module provides: [`HostMemory::disabled_kind`]
+    /// while one declares it and none of those takes the session's frames,
+    /// else `unavailable`.
+    fn memory_kind_of(&self, stage: &str) -> &'static str {
+        if self.declares(stage).is_some() && self.declares_in_memory(stage).is_none() {
+            self.memory_kind()
+        } else {
+            disabled::UNAVAILABLE
+        }
+    }
+
+    /// [`HostMemory::disabled_kind`] of the memory the modules were opened
+    /// for.
+    pub fn memory_kind(&self) -> &'static str {
+        self.memory.disabled_kind()
     }
 
     /// Whether `module` can run `stage` now, whoever the pins and the
@@ -1919,6 +2011,99 @@ mod tests {
         (Some(NAME.into()), reason.into())
     }
 
+    /// The kind of why a module cannot run a stage: another provider, the
+    /// session's memory (by why it is system memory), or the module's own
+    /// reason passed on.
+    #[test]
+    fn a_stage_reason_has_a_kind_the_host_knows() {
+        use super::testing::{in_memory, onnx_entry, onnx_opened};
+        use super::{HostMemory, StageUnavailable};
+        use obc_ipc::settings::disabled;
+        use obc_module_host::registry::{REASON_BATTERY_SAVER, REASON_CUDA_OFF, REASON_NEEDS_CUDA};
+        const ONNX: &str = "br.com.dias.onnx-cutout";
+        let bg = StageId::BACKGROUND.as_str();
+        // Both offer the background effect, in CUDA memory: one runs it,
+        // the other is told who does.
+        let both = || {
+            modules(vec![
+                (maxine_entry(), Ok(maxine_opened(&[]))),
+                (onnx_entry(), Ok(onnx_opened())),
+            ])
+        };
+        let m = both();
+        let runs = m.resolve(bg).provider.unwrap();
+        let (other, runs_name) = if runs == MAXINE_MODULE {
+            (ONNX, NAME)
+        } else {
+            (MAXINE_MODULE, "Open-model cut-out")
+        };
+        assert_eq!(m.stage_reason(&runs, bg), None);
+        assert_eq!(
+            m.stage_reason(other, bg),
+            Some(StageUnavailable {
+                reason: format!("Handled by {runs_name} instead"),
+                kind: disabled::OTHER_PROVIDER,
+            })
+        );
+        // In system memory the open-model cut-out (host frames) runs it.
+        let mut m = both();
+        in_memory(&mut m, HostMemory::Configured);
+        assert_eq!(
+            m.stage_reason(MAXINE_MODULE, bg).map(|u| u.kind),
+            Some(disabled::OTHER_PROVIDER)
+        );
+        // Only Maxine (CUDA frames only) in system memory: needs hardware
+        // only where the machine is known to have no NVIDIA GPU; not
+        // applicable to the memory the configuration or the saver chose;
+        // unavailable where CUDA was found unusable or failed to start (an
+        // NVIDIA GPU may be there, its driver broken).
+        for (memory, reason, kind) in [
+            (
+                HostMemory::NoGpu,
+                REASON_NEEDS_CUDA,
+                disabled::NEEDS_HARDWARE,
+            ),
+            (
+                HostMemory::CudaUnusable,
+                REASON_NEEDS_CUDA,
+                disabled::UNAVAILABLE,
+            ),
+            (
+                HostMemory::StartFailed,
+                REASON_NEEDS_CUDA,
+                disabled::UNAVAILABLE,
+            ),
+            (
+                HostMemory::Configured,
+                REASON_CUDA_OFF,
+                disabled::NOT_APPLICABLE,
+            ),
+            (
+                HostMemory::BatterySaver,
+                REASON_BATTERY_SAVER,
+                disabled::NOT_APPLICABLE,
+            ),
+        ] {
+            let mut m = maxine(&[]);
+            in_memory(&mut m, memory);
+            let got = m.stage_reason(MAXINE_MODULE, "denoise").unwrap();
+            assert_eq!(got.kind, kind, "{memory:?}");
+            assert_eq!(got.reason, reason, "{memory:?}");
+            assert_eq!(memory.disabled_kind(), kind);
+        }
+        assert_eq!(HostMemory::Cuda.disabled_kind(), disabled::UNAVAILABLE);
+        // The module's own reason (its probe's): passed on, unavailable.
+        let m = maxine(&[("denoise", "Not installed")]);
+        assert_eq!(
+            m.stage_reason(MAXINE_MODULE, "denoise"),
+            Some(StageUnavailable {
+                reason: "Not installed".into(),
+                kind: disabled::UNAVAILABLE,
+            })
+        );
+        assert_eq!(m.stage_reason(MAXINE_MODULE, "enhance"), None);
+    }
+
     #[test]
     fn absent_reason_names_the_module_and_its_reason() {
         let bg = StageId::BACKGROUND.as_str();
@@ -2042,18 +2227,43 @@ mod tests {
             host["_host"],
             serde_json::json!({ "compute_capability": null, "cuda": false })
         );
-        // The reasons: auto found no CUDA, or the configuration chose
-        // system memory.
-        let of = |choice, probe| HostMemory::of(&resolve_memory(choice, probe));
+        // Why system memory: the configuration, the battery saver, the
+        // probe (no GPU as a fact, or CUDA unusable otherwise), or a CUDA
+        // start that fell back (no probe then).
+        use obc_core::config::EffectiveMemory;
+        use obc_gpu::presence::Cause;
+        let of = |choice, probe: Option<Cause>| {
+            HostMemory::of(&resolve_memory(choice, probe.map(Cause::reason)), probe)
+        };
         assert_eq!(of(MemoryChoice::Auto, None), HostMemory::Cuda);
-        assert_eq!(of(MemoryChoice::Cuda, Some("x")), HostMemory::Cuda);
+        assert_eq!(of(MemoryChoice::Cuda, Some(Cause::NoGpu)), HostMemory::Cuda);
         assert_eq!(
-            of(MemoryChoice::Auto, Some("no NVIDIA driver is loaded")),
-            HostMemory::System(REASON_NEEDS_CUDA)
+            of(MemoryChoice::Auto, Some(Cause::NoGpu)),
+            HostMemory::NoGpu
+        );
+        for c in [
+            Cause::Hidden,
+            Cause::NoDriver,
+            Cause::NoLibrary,
+            Cause::NoElements,
+        ] {
+            assert_eq!(
+                of(MemoryChoice::Auto, Some(c)),
+                HostMemory::CudaUnusable,
+                "{c:?}"
+            );
+        }
+        assert_eq!(of(MemoryChoice::System, None), HostMemory::Configured);
+        assert_eq!(
+            of(MemoryChoice::System, Some(Cause::NoGpu)),
+            HostMemory::Configured
         );
         assert_eq!(
-            of(MemoryChoice::System, None),
-            HostMemory::System(REASON_CUDA_OFF)
+            HostMemory::of(
+                &EffectiveMemory::auto_system("CUDA could not start: x"),
+                None
+            ),
+            HostMemory::StartFailed
         );
         // The battery saver: its own reason, CUDA off for the modules.
         let saver = saver_state(
@@ -2061,27 +2271,39 @@ mod tests {
             &PowerSource::External,
             &PowerProfile::Unavailable,
         );
-        let saving = HostMemory::of(&resolve_memory_saving(
-            MemoryChoice::Auto,
+        let saving = HostMemory::of(
+            &resolve_memory_saving(MemoryChoice::Auto, None, Some(&saver)),
             None,
-            Some(&saver),
-        ));
-        assert_eq!(saving, HostMemory::System(REASON_BATTERY_SAVER));
+        );
+        assert_eq!(saving, HostMemory::BatterySaver);
         assert!(saving.cuda_off());
         assert_eq!(
             REASON_BATTERY_SAVER,
             "Needs CUDA; battery saver runs the video pipeline in system memory"
         );
-        // Without usable CUDA the probe's reason stands.
+        // Without usable CUDA the probe's finding stands.
         assert_eq!(
-            HostMemory::of(&resolve_memory_saving(
-                MemoryChoice::Auto,
-                Some("no NVIDIA driver is loaded"),
-                Some(&saver),
-            )),
-            HostMemory::System(REASON_NEEDS_CUDA)
+            HostMemory::of(
+                &resolve_memory_saving(
+                    MemoryChoice::Auto,
+                    Some(Cause::NoDriver.reason()),
+                    Some(&saver),
+                ),
+                Some(Cause::NoDriver)
+            ),
+            HostMemory::CudaUnusable
         );
-        assert!(!HostMemory::Cuda.cuda_off());
-        assert!(HostMemory::System(REASON_CUDA_OFF).cuda_off());
+        // The registry's reason of each.
+        for (m, reason) in [
+            (HostMemory::Cuda, ""),
+            (HostMemory::Configured, REASON_CUDA_OFF),
+            (HostMemory::BatterySaver, REASON_BATTERY_SAVER),
+            (HostMemory::NoGpu, REASON_NEEDS_CUDA),
+            (HostMemory::CudaUnusable, REASON_NEEDS_CUDA),
+            (HostMemory::StartFailed, REASON_NEEDS_CUDA),
+        ] {
+            assert_eq!(m.reason(), reason, "{m:?}");
+            assert_eq!(m.cuda_off(), m != HostMemory::Cuda, "{m:?}");
+        }
     }
 }

@@ -248,6 +248,7 @@ fn the_blur_strength_is_enabled_only_with_blur() {
     let blur = get(&e, BLUR_STRENGTH);
     assert!(!blur.enabled);
     assert_eq!(blur.disabled_reason, REASON_CHOOSE_BLUR);
+    assert_eq!(blur.disabled_kind, disabled::PARENT_OFF);
     assert_eq!(
         blur.enabled_when,
         [Condition {
@@ -266,6 +267,7 @@ fn the_blur_strength_is_enabled_only_with_blur() {
     };
     let e = entries(&Config::default(), &runtime, None);
     assert!(get(&e, BLUR_STRENGTH).enabled);
+    assert_eq!(get(&e, BLUR_STRENGTH).disabled_kind, "");
     assert_eq!(
         check(&e, BLUR_STRENGTH, Some(&SettingValue::Int(40))),
         Ok(Write::BlurStrength(0.4))
@@ -283,6 +285,8 @@ fn noise_removal_not_installed_is_greyed_and_off_with_the_choice_kept() {
     let d = get(&e, DENOISE);
     assert!(!d.enabled);
     assert_eq!(d.disabled_reason, REASON_NOT_INSTALLED);
+    // The module's own reason: the daemon passes it on, untyped.
+    assert_eq!(d.disabled_kind, disabled::UNAVAILABLE);
     assert_eq!(d.kind.value(), Some(SettingValue::Bool(false)));
     assert!(d.stored, "the choice is kept");
     assert_eq!(
@@ -294,6 +298,7 @@ fn noise_removal_not_installed_is_greyed_and_off_with_the_choice_kept() {
         let e = entries(&config, &runtime, installed);
         let d = get(&e, DENOISE);
         assert!(d.enabled && d.disabled_reason.is_empty(), "{installed:?}");
+        assert!(d.disabled_kind.is_empty());
         assert_eq!(d.kind.value(), Some(SettingValue::Bool(true)));
     }
     // Becoming installed is a delta, not a structural change.
@@ -388,6 +393,12 @@ fn enhance_is_greyed_and_off_when_not_installed_or_not_needed() {
         let en = get(&e, ENHANCE);
         assert!(!en.enabled, "{installed:?} {applies:?}");
         assert_eq!(en.disabled_reason, reason);
+        let kind = if reason == REASON_NOT_INSTALLED {
+            disabled::UNAVAILABLE
+        } else {
+            disabled::NOT_APPLICABLE
+        };
+        assert_eq!(en.disabled_kind, kind, "{installed:?} {applies:?}");
         assert_eq!(en.kind.value(), Some(SettingValue::Bool(false)));
         assert!(en.stored, "the choice is kept");
         assert_eq!(
@@ -511,6 +522,8 @@ fn relighting_is_a_switch_with_three_settings_of_its_light() {
         assert_eq!(s.scope, SCOPE_GLOBAL);
         assert!(!s.enabled, "{id}");
         assert_eq!(s.disabled_reason, REASON_TURN_ON_RELIGHT);
+        // A module's condition that does not hold.
+        assert_eq!(s.disabled_kind, disabled::PARENT_OFF, "{id}");
         assert_eq!(
             s.enabled_when,
             [Condition {
@@ -536,7 +549,7 @@ fn relighting_is_a_switch_with_three_settings_of_its_light() {
     for id in [RELIGHT, LIGHT, DIRECTION, BRIGHTNESS] {
         let s = get(&e, id);
         assert!(
-            s.enabled && s.disabled_reason.is_empty() && s.stored,
+            s.enabled && s.disabled_reason.is_empty() && s.disabled_kind.is_empty() && s.stored,
             "{id}"
         );
     }
@@ -890,12 +903,7 @@ fn in_cuda_memory_the_background_group_is_offered() {
 #[test]
 fn in_system_memory_the_open_model_cut_out_offers_the_background_group() {
     use crate::modules::HostMemory;
-    use obc_module_host::registry::REASON_CUDA_OFF;
-    let e = in_memory(
-        &RuntimeState::default(),
-        true,
-        HostMemory::System(REASON_CUDA_OFF),
-    );
+    let e = in_memory(&RuntimeState::default(), true, HostMemory::Configured);
     let mode = e.iter().find(|g| g.setting.id == MODE).unwrap();
     assert_eq!(mode.binding, Binding::Mode);
     assert!(mode.setting.enabled);
@@ -912,10 +920,18 @@ fn in_system_memory_the_open_model_cut_out_offers_the_background_group() {
 #[test]
 fn in_system_memory_with_only_maxine_the_background_group_is_greyed_with_its_reason() {
     use crate::modules::HostMemory;
-    use obc_module_host::registry::{REASON_CUDA_OFF, REASON_NEEDS_CUDA};
     let str_value = |s: &str| SettingValue::Str(s.into());
-    for reason in [REASON_CUDA_OFF, REASON_NEEDS_CUDA] {
-        let memory = HostMemory::System(reason);
+    // Needs hardware only where the machine is known to have no NVIDIA
+    // GPU; unavailable where CUDA was found unusable or failed to start;
+    // else the memory was chosen.
+    for (memory, kind) in [
+        (HostMemory::Configured, disabled::NOT_APPLICABLE),
+        (HostMemory::BatterySaver, disabled::NOT_APPLICABLE),
+        (HostMemory::NoGpu, disabled::NEEDS_HARDWARE),
+        (HostMemory::CudaUnusable, disabled::UNAVAILABLE),
+        (HostMemory::StartFailed, disabled::UNAVAILABLE),
+    ] {
+        let reason = memory.reason();
         let e = in_memory(&RuntimeState::default(), false, memory);
         let in_group: Vec<&str> = e
             .iter()
@@ -923,10 +939,11 @@ fn in_system_memory_with_only_maxine_the_background_group_is_greyed_with_its_rea
             .map(|g| g.setting.id.as_str())
             .collect();
         assert_eq!(in_group, [MODE, BLUR_STRENGTH], "{reason}");
-        for id in [MODE, BLUR_STRENGTH] {
+        for id in [MODE, BLUR_STRENGTH, DENOISE, ENHANCE, RELIGHT] {
             let s = get(&e, id);
             assert!(!s.enabled, "{id} {reason}");
             assert_eq!(s.disabled_reason, reason, "{id}");
+            assert_eq!(s.disabled_kind, kind, "{id} {reason}");
         }
         assert_eq!(
             check(&e, MODE, Some(&str_value("blur"))),
@@ -981,7 +998,7 @@ fn a_reset_cannot_bring_back_a_background_effect_nothing_runs() {
     };
     // System memory, Maxine only: `[effect] mode = blur`, `none` stored.
     let off = stored(Some(EffectMode::None));
-    let e = in_memory(&off, false, HostMemory::System(REASON_CUDA_OFF));
+    let e = in_memory(&off, false, HostMemory::Configured);
     let refused = Err(Refusal::Disabled(REASON_CUDA_OFF.into()));
     assert_eq!(check_reset(&e, &group, &off, &blur), refused);
     assert_eq!(check_reset(&e, &ids(&[MODE]), &off, &blur), refused);
@@ -990,7 +1007,7 @@ fn a_reset_cannot_bring_back_a_background_effect_nothing_runs() {
     assert_eq!(check_reset(&e, &group, &off, &none), Ok(()), "none back");
     // The configured blur in force already: the mode stays as it is.
     let kept = stored(Some(EffectMode::Blur));
-    let e = in_memory(&kept, false, HostMemory::System(REASON_CUDA_OFF));
+    let e = in_memory(&kept, false, HostMemory::Configured);
     assert_eq!(check_reset(&e, &group, &kept, &blur), Ok(()));
     assert_eq!(
         check_reset(&e, &group, &RuntimeState::default(), &blur),

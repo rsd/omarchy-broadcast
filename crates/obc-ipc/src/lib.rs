@@ -161,8 +161,21 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// with no new member ([`CAMERA_STATUS_REVISION`]). Revision 27 added the
 /// optional `display_offset` and `display_scale` of an int setting and
 /// removed the MX Brio's RightSight settings (`camera.focus.rightsight*`),
-/// with no new member ([`DISPLAY_OFFSET_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 27;
+/// with no new member ([`DISPLAY_OFFSET_REVISION`]). Revision 28 added the
+/// `disabled_kind` of a setting and published the default microphone as
+/// the switch `mic.input.use_as_default`, with no new member
+/// ([`DISABLED_KIND_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 28;
+/// The first [`INTERFACE_REVISION`] with the `disabled_kind` (`s`) of a
+/// setting dictionary and of a `SettingsChanged` entry
+/// ([`settings::disabled`]: why a setting is not enabled, as a token a
+/// client lays it out by; `""` while it is enabled), and with the default
+/// microphone published as the `bool` switch `mic.input.use_as_default` in
+/// place of the actions `mic.input.make_default` and
+/// `mic.input.restore_default`, which `SetSetting` still takes. No new
+/// member: a client that does not know the key ignores it, and shows a
+/// setting that is not enabled greyed in place.
+pub const DISABLED_KIND_REVISION: u32 = 28;
 /// The first [`INTERFACE_REVISION`] with the optional `display_offset` and
 /// `display_scale` (both `x`) of an `int` setting
 /// ([`settings::IntDisplay`]), and no new member: a client shows the value
@@ -1442,7 +1455,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, DISPLAY_OFFSET_REVISION);
+        assert_eq!(INTERFACE_REVISION, DISABLED_KIND_REVISION);
+        const { assert!(DISPLAY_OFFSET_REVISION < DISABLED_KIND_REVISION) };
         const { assert!(CAMERA_STATUS_REVISION < DISPLAY_OFFSET_REVISION) };
         const { assert!(MIC_HARDWARE_GAIN_REVISION < CAMERA_STATUS_REVISION) };
         const { assert!(CAMERA_XU_SETTINGS_REVISION < MIC_HARDWARE_GAIN_REVISION) };

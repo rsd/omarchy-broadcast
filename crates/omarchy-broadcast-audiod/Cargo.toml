@@ -29,6 +29,9 @@ pipewire = { workspace = true }
 alsa = { workspace = true }
 
 [dev-dependencies]
+# The settings channel's `disabled_kind` tokens, which the worker's copy
+# is checked against.
+obc-ipc = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

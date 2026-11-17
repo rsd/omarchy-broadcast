@@ -28,11 +28,13 @@ fn worker_settings() -> Json {
          "surface": "mic", "settings": [
             {"id": "mic.noise.enabled", "label": "Noise removal", "type": "bool",
              "scope": "global", "stored": false, "enabled": false,
-             "disabled_reason": "Provided by Voice (CPU)", "enabled_when": [],
+             "disabled_reason": "Handled by Voice (CPU) instead",
+             "disabled_kind": "other_provider", "enabled_when": [],
              "default": true, "value": true, "stage": "mic-denoise", "role": "enable"},
             {"id": "mic.noise.strength", "label": "Strength", "type": "int",
              "scope": "global", "stored": false, "enabled": false,
-             "disabled_reason": "Provided by Voice (CPU)", "enabled_when": [],
+             "disabled_reason": "Handled by Voice (CPU) instead",
+             "disabled_kind": "other_provider", "enabled_when": [],
              "min": 0, "max": 100, "step": 5, "unit": "%", "default": 100, "value": 100}]},
         {"id": "noise", "label": "Noise removal", "module": "br.com.dias.voice-cpu",
          "surface": "mic", "settings": [
@@ -135,16 +137,7 @@ fn the_hardware_gain_is_an_input_setting_bound_to_its_config_key() {
     cat.hardware_gain = parse_hardware_gain(&status_with_gain(40.4));
     let g = groups_of(&config, &runtime, &cat, true);
     let ids: Vec<&str> = g[0].settings.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(
-        ids,
-        [
-            ENABLED,
-            DEVICE,
-            HARDWARE_GAIN,
-            MAKE_DEFAULT,
-            RESTORE_DEFAULT
-        ]
-    );
+    assert_eq!(ids, [ENABLED, DEVICE, HARDWARE_GAIN, USE_AS_DEFAULT]);
     let s = find(&g, HARDWARE_GAIN).unwrap();
     assert_eq!(s.label, "Hardware gain");
     assert!(!s.stored);
@@ -201,6 +194,34 @@ fn the_hardware_gain_is_an_input_setting_bound_to_its_config_key() {
     cat.hardware_gain = None;
     let g = groups_of(&config, &runtime, &cat, true);
     assert!(find(&g, HARDWARE_GAIN).is_none());
+}
+
+#[test]
+fn a_key_a_later_file_sets_greys_its_setting_as_not_applicable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::create_dir_all(dir.path().join("config.d")).unwrap();
+    std::fs::write(
+        dir.path().join("config.d/90-local.toml"),
+        "[mic]\nenabled = false\n",
+    )
+    .unwrap();
+    let set = ConfigSet::load(&path).unwrap();
+    let runtime = RuntimeState::default();
+    let cat = catalogue();
+    let g = groups(&Inputs {
+        config: &set.config,
+        config_set: &set,
+        runtime: &runtime,
+        catalogue: &cat,
+        host_on: true,
+    });
+    let s = find(&g, ENABLED).unwrap();
+    assert!(!s.enabled);
+    assert_eq!(s.disabled_reason, "Overridden by config.d/90-local.toml");
+    assert_eq!(s.disabled_kind, obc_ipc::settings::disabled::NOT_APPLICABLE);
+    let d = find(&g, DEVICE).unwrap();
+    assert!(d.enabled && d.disabled_kind.is_empty());
 }
 
 #[test]
@@ -309,7 +330,7 @@ fn the_input_group_comes_first_once_the_worker_is_known() {
     assert_eq!(ids, ["input", "noise", "voice"]);
     assert!(g.iter().all(|g| g.surface.as_deref() == Some("mic")));
     let input: Vec<&str> = g[0].settings.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(input, [ENABLED, DEVICE, MAKE_DEFAULT, RESTORE_DEFAULT]);
+    assert_eq!(input, [ENABLED, DEVICE, USE_AS_DEFAULT]);
     for s in g.iter().flat_map(|g| &g.settings) {
         assert!(obc_ipc::valid_setting_id(&s.id), "{}", s.id);
         assert_eq!(s.scope, "global");
@@ -371,25 +392,168 @@ fn the_input_group_comes_first_once_the_worker_is_known() {
 }
 
 #[test]
-fn the_default_microphone_actions_follow_the_host_and_the_record() {
+fn the_default_microphone_switch_follows_the_host_and_the_record() {
     let config = Config::default();
     let mut runtime = RuntimeState::default();
-    let action = |g: &[SettingsGroup], id: &str| find(g, id).cloned().unwrap();
+    let switch = |g: &[SettingsGroup]| find(g, USE_AS_DEFAULT).cloned().unwrap();
+    let value = |s: &Setting| s.kind.value();
+    // The actions it replaced are no longer published.
     let off = groups_of(&config, &runtime, &catalogue(), false);
-    assert_eq!(action(&off, MAKE_DEFAULT).disabled_reason, REASON_HOST_OFF);
+    assert!(find(&off, MAKE_DEFAULT).is_none() && find(&off, RESTORE_DEFAULT).is_none());
+    let s = switch(&off);
+    assert_eq!(s.label, "Use as default microphone");
+    assert_eq!(s.kind.type_name(), "bool");
+    assert_eq!(s.hint.as_deref(), Some("switch"));
+    assert_eq!(s.scope, "global");
+    assert_eq!(s.kind.default_value(), Some(SettingValue::Bool(false)));
+    // Host off: greyed, busy, off with nothing on record.
+    assert!(!s.enabled);
+    assert_eq!(s.disabled_reason, REASON_HOST_OFF);
+    assert_eq!(s.disabled_kind, obc_ipc::settings::disabled::BUSY);
+    assert_eq!(value(&s), Some(SettingValue::Bool(false)));
+    // Host on: enabled, still off.
+    let on = switch(&groups_of(&config, &runtime, &catalogue(), true));
+    assert!(on.enabled);
     assert_eq!(
-        action(&off, RESTORE_DEFAULT).disabled_reason,
-        REASON_NOT_DEFAULT
+        (on.disabled_reason.as_str(), on.disabled_kind.as_str()),
+        ("", "")
     );
-    let on = groups_of(&config, &runtime, &catalogue(), true);
-    assert!(action(&on, MAKE_DEFAULT).enabled);
-    assert!(!action(&on, RESTORE_DEFAULT).enabled);
+    assert_eq!(value(&on), Some(SettingValue::Bool(false)));
+    // Made the default here (a previous default on record): on, with the
+    // host on or off.
     runtime.mic_previous_default = Some("alsa_input.usb-a".into());
-    let made = groups_of(&config, &runtime, &catalogue(), true);
-    // A previous default on record may be stale (another microphone picked
-    // since in the system's settings): making it the default stays offered.
-    assert!(action(&made, MAKE_DEFAULT).enabled);
-    assert!(action(&made, RESTORE_DEFAULT).enabled);
+    let made = switch(&groups_of(&config, &runtime, &catalogue(), true));
+    assert!(made.enabled);
+    assert_eq!(value(&made), Some(SettingValue::Bool(true)));
+    let made_off = switch(&groups_of(&config, &runtime, &catalogue(), false));
+    assert!(!made_off.enabled);
+    assert_eq!(value(&made_off), Some(SettingValue::Bool(true)));
+    // On record with no name (the previous default was not known): on.
+    runtime.mic_previous_default = Some(String::new());
+    let unnamed = switch(&groups_of(&config, &runtime, &catalogue(), true));
+    assert_eq!(value(&unnamed), Some(SettingValue::Bool(true)));
+}
+
+#[test]
+fn the_default_microphone_switch_writes_both_ways_and_the_old_actions_still_work() {
+    let config = Config::default();
+    let mut runtime = RuntimeState::default();
+    let b = |v: bool| SettingValue::Bool(v);
+    // Nothing on record, host on.
+    let g = groups_of(&config, &runtime, &catalogue(), true);
+    assert_eq!(
+        check(&g, USE_AS_DEFAULT, Some(&b(true))),
+        Ok(Write::MakeDefault)
+    );
+    assert_eq!(
+        check(&g, USE_AS_DEFAULT, Some(&b(false))),
+        Ok(Write::Unchanged)
+    );
+    assert!(matches!(
+        check(&g, USE_AS_DEFAULT, Some(&SettingValue::Int(1))),
+        Err(Refusal::Invalid(_))
+    ));
+    assert_eq!(
+        check(&g, MAKE_DEFAULT, Some(&b(true))),
+        Ok(Write::MakeDefault)
+    );
+    assert_eq!(
+        check(&g, RESTORE_DEFAULT, Some(&b(true))),
+        Err(Refusal::Disabled(REASON_NOT_DEFAULT.into()))
+    );
+    // Greyed before the value is looked at, as the published action was.
+    assert_eq!(
+        check(&g, RESTORE_DEFAULT, Some(&b(false))),
+        Err(Refusal::Disabled(REASON_NOT_DEFAULT.into()))
+    );
+    // Made the default here: off restores, on makes it again (harmless).
+    runtime.mic_previous_default = Some("alsa_input.usb-a".into());
+    let g = groups_of(&config, &runtime, &catalogue(), true);
+    assert_eq!(
+        check(&g, USE_AS_DEFAULT, Some(&b(false))),
+        Ok(Write::RestoreDefault)
+    );
+    assert_eq!(
+        check(&g, USE_AS_DEFAULT, Some(&b(true))),
+        Ok(Write::MakeDefault)
+    );
+    assert_eq!(
+        check(&g, RESTORE_DEFAULT, Some(&b(true))),
+        Ok(Write::RestoreDefault)
+    );
+    assert_eq!(
+        check(&g, MAKE_DEFAULT, Some(&b(true))),
+        Ok(Write::MakeDefault)
+    );
+    // Host off: the switch refuses both ways with its reason; the old
+    // restore action still restores, as it did; the old make action is
+    // refused as it was.
+    let g = groups_of(&config, &runtime, &catalogue(), false);
+    for v in [true, false] {
+        assert_eq!(
+            check(&g, USE_AS_DEFAULT, Some(&b(v))),
+            Err(Refusal::Disabled(REASON_HOST_OFF.into()))
+        );
+    }
+    assert_eq!(
+        check(&g, RESTORE_DEFAULT, Some(&b(true))),
+        Ok(Write::RestoreDefault)
+    );
+    // Greyed first, whatever the value, as the published action was.
+    for v in [Some(b(true)), Some(b(false)), None] {
+        assert_eq!(
+            check(&g, MAKE_DEFAULT, v.as_ref()),
+            Err(Refusal::Disabled(REASON_HOST_OFF.into())),
+            "{v:?}"
+        );
+    }
+    // Without the input group (the worker not known, the host off): the
+    // old ids are unknown, as every mic.input id.
+    let none = groups_of(&config, &runtime, &Catalogue::default(), false);
+    assert!(matches!(
+        check(&none, MAKE_DEFAULT, Some(&b(true))),
+        Err(Refusal::Unknown(_))
+    ));
+}
+
+#[test]
+fn a_worker_setting_keeps_a_known_kind_only_while_greyed() {
+    let doc = |enabled: bool, kind: &str| {
+        json!({"groups": [{"id": "noise", "label": "Noise", "settings": [
+            {"id": "mic.noise.strength", "label": "Strength", "type": "int",
+             "min": 0, "max": 100, "enabled": enabled, "disabled_reason": "Why",
+             "disabled_kind": kind}]}]})
+    };
+    let kind = |enabled: bool, k: &str| {
+        parse_groups(&doc(enabled, k))[0].settings[0]
+            .disabled_kind
+            .clone()
+    };
+    for k in obc_ipc::settings::disabled::KINDS {
+        assert_eq!(kind(false, k), k);
+        // Enabled: no kind, whatever the worker says.
+        assert_eq!(kind(true, k), "");
+    }
+    // Greyed with a kind this version does not know, or none (an older
+    // worker): `unavailable`, never "" (every greyed setting has a kind);
+    // enabled, still none.
+    assert_eq!(
+        kind(false, "later"),
+        obc_ipc::settings::disabled::UNAVAILABLE
+    );
+    assert_eq!(kind(false, ""), obc_ipc::settings::disabled::UNAVAILABLE);
+    assert_eq!(kind(true, "later"), "");
+    let mut old = doc(false, "x");
+    old["groups"][0]["settings"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("disabled_kind");
+    assert_eq!(
+        parse_groups(&old)[0].settings[0].disabled_kind,
+        obc_ipc::settings::disabled::UNAVAILABLE
+    );
+    old["groups"][0]["settings"][0]["enabled"] = json!(true);
+    assert_eq!(parse_groups(&old)[0].settings[0].disabled_kind, "");
 }
 
 #[test]
@@ -1200,7 +1364,8 @@ async fn make_default_hands_back_the_previous_default() {
         };
         assert_eq!(in_force.as_deref(), want, "{reply_doc}");
     }
-    // A worker that cannot: the reply says why, nothing is recorded.
+    // A worker that cannot: the controller is told why, with the reply
+    // (so that it knows the request is answered), nothing is recorded.
     rig.worker.0.lock().unwrap().replies.insert(
         "MakeDefault",
         Err(WorkerError {
@@ -1209,15 +1374,21 @@ async fn make_default_hands_back_the_previous_default() {
             message: "no PipeWire".into(),
         }),
     );
-    let (tx, rx) = reply();
+    let (tx, _rx) = reply();
     rig.requests
         .send(MicRequest::MakeDefault {
             target: "x".into(),
             reply: tx,
         })
         .unwrap();
-    match rx.await.unwrap() {
-        Err(IpcError::Unavailable(m)) => assert!(m.contains("no PipeWire"), "{m}"),
+    let e = rig
+        .until(|e| matches!(e, MicEvent::DefaultNotMade { .. }))
+        .await;
+    match e {
+        MicEvent::DefaultNotMade {
+            error: IpcError::Unavailable(m),
+            ..
+        } => assert!(m.contains("no PipeWire"), "{m}"),
         other => panic!("expected Unavailable, got {other:?}"),
     }
 }

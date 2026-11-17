@@ -54,14 +54,53 @@ pub const REASON_NO_LIBRARY: &str = "the CUDA driver library is not installed";
 pub const REASON_NO_ELEMENTS: &str =
     "GStreamer's CUDA elements (gst-plugins-bad, nvcodec) are not installed";
 
+/// Which check of [`probe`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// `CUDA_VISIBLE_DEVICES` hides every GPU ([`REASON_HIDDEN`]).
+    Hidden,
+    /// The NVIDIA kernel driver is not loaded ([`REASON_NO_DRIVER`]): no
+    /// NVIDIA GPU, or one whose driver did not load; the probe cannot tell
+    /// which.
+    NoDriver,
+    /// The NVIDIA kernel driver is loaded and lists no GPU
+    /// ([`REASON_NO_GPU`]).
+    NoGpu,
+    /// The CUDA driver library cannot be opened ([`REASON_NO_LIBRARY`]).
+    NoLibrary,
+    /// GStreamer's CUDA elements are not registered
+    /// ([`REASON_NO_ELEMENTS`]).
+    NoElements,
+}
+
+impl Cause {
+    /// Why, in words a user reads (one of the `REASON_*` constants).
+    pub fn reason(self) -> &'static str {
+        match self {
+            Cause::Hidden => REASON_HIDDEN,
+            Cause::NoDriver => REASON_NO_DRIVER,
+            Cause::NoGpu => REASON_NO_GPU,
+            Cause::NoLibrary => REASON_NO_LIBRARY,
+            Cause::NoElements => REASON_NO_ELEMENTS,
+        }
+    }
+
+    /// Whether the machine is known to have no NVIDIA GPU: the driver is
+    /// loaded and lists none. A driver that is not loaded says nothing of
+    /// the hardware (it may be broken), nor do the later checks.
+    pub fn no_gpu(self) -> bool {
+        matches!(self, Cause::NoGpu)
+    }
+}
+
 /// Whether CUDA is usable, as [`probe`] found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Presence {
     /// Every check passed.
     Usable,
-    /// A check failed: why, in words a user reads (one of the `REASON_*`
-    /// constants).
-    Unusable(String),
+    /// A check failed: which ([`Cause::reason`] says why in words a user
+    /// reads).
+    Unusable(Cause),
 }
 
 impl Presence {
@@ -72,10 +111,15 @@ impl Presence {
 
     /// Why CUDA is not usable; `None` when it is. The argument
     /// `obc_core::config::resolve_memory` takes.
-    pub fn unusable_reason(&self) -> Option<&str> {
+    pub fn unusable_reason(&self) -> Option<&'static str> {
+        self.cause().map(Cause::reason)
+    }
+
+    /// The check that failed; `None` when CUDA is usable.
+    pub fn cause(&self) -> Option<Cause> {
         match self {
             Presence::Usable => None,
-            Presence::Unusable(r) => Some(r),
+            Presence::Unusable(c) => Some(*c),
         }
     }
 }
@@ -121,23 +165,23 @@ pub fn cuda_hidden(value: Option<&OsStr>) -> bool {
 /// Whether CUDA is usable according to `env`; see the module
 /// documentation for the checks. Creates no CUDA context.
 pub fn probe(env: &ProbeEnv) -> Presence {
-    let unusable = |r: &str| Presence::Unusable(r.to_string());
+    use Presence::Unusable;
     if cuda_hidden(env.cuda_visible_devices.as_deref()) {
-        return unusable(REASON_HIDDEN);
+        return Unusable(Cause::Hidden);
     }
     match std::fs::read_dir(env.nvidia_proc_dir.join("gpus")) {
-        Err(_) => return unusable(REASON_NO_DRIVER),
+        Err(_) => return Unusable(Cause::NoDriver),
         Ok(mut entries) => {
             if !entries.any(|e| e.is_ok()) {
-                return unusable(REASON_NO_GPU);
+                return Unusable(Cause::NoGpu);
             }
         }
     }
     if !driver_library_opens(&env.driver_library) {
-        return unusable(REASON_NO_LIBRARY);
+        return Unusable(Cause::NoLibrary);
     }
     if !env.cuda_elements_registered {
-        return unusable(REASON_NO_ELEMENTS);
+        return Unusable(Cause::NoElements);
     }
     Presence::Usable
 }
@@ -257,10 +301,16 @@ mod tests {
         let none = Scratch::new();
         let r = probe(&usable(&none.0));
         assert_eq!(r.unusable_reason(), Some(REASON_NO_DRIVER));
+        // No driver says nothing of the hardware.
+        assert_eq!(r.cause(), Some(Cause::NoDriver));
+        assert!(!Cause::NoDriver.no_gpu());
 
         let empty = proc_with_gpus(0);
         let r = probe(&usable(&empty.0));
         assert_eq!(r.unusable_reason(), Some(REASON_NO_GPU));
+        // A loaded driver that lists none: no NVIDIA GPU, as a fact.
+        assert_eq!(r.cause(), Some(Cause::NoGpu));
+        assert!(Cause::NoGpu.no_gpu());
 
         // `gpus` a file, not a directory: no listing, no driver.
         let odd = Scratch::new();
@@ -289,6 +339,22 @@ mod tests {
             ..usable(&p.0)
         };
         assert_eq!(probe(&env).unusable_reason(), Some(REASON_NO_ELEMENTS));
+    }
+
+    #[test]
+    fn only_a_driver_that_lists_no_gpu_is_known_to_mean_no_gpu() {
+        for (c, reason, no_gpu) in [
+            (Cause::Hidden, REASON_HIDDEN, false),
+            (Cause::NoDriver, REASON_NO_DRIVER, false),
+            (Cause::NoGpu, REASON_NO_GPU, true),
+            (Cause::NoLibrary, REASON_NO_LIBRARY, false),
+            (Cause::NoElements, REASON_NO_ELEMENTS, false),
+        ] {
+            assert_eq!(c.reason(), reason);
+            assert_eq!(c.no_gpu(), no_gpu, "{c:?}");
+            assert_eq!(Presence::Unusable(c).cause(), Some(c));
+        }
+        assert_eq!(Presence::Usable.cause(), None);
     }
 
     /// The `/dev/nvidia*` nodes this process holds open, and the lines of

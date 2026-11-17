@@ -217,6 +217,7 @@ fn setting(id: &str, label: &str, kind: SettingKind) -> Setting {
         stored: false,
         enabled: true,
         disabled_reason: String::new(),
+        disabled_kind: String::new(),
         enabled_when: Vec::new(),
         hint: None,
         description: None,
@@ -239,6 +240,7 @@ fn mock_settings() -> Vec<SettingsGroup> {
     );
     temperature.enabled = false;
     temperature.disabled_reason = WB_REASON.into();
+    temperature.disabled_kind = "parent_off".into();
     temperature.enabled_when = vec![Condition {
         id: AUTO_WB.into(),
         op: ConditionOp::Eq,
@@ -327,6 +329,7 @@ fn change_of(s: &Setting) -> SettingChange {
         stored: s.stored,
         enabled: s.enabled,
         disabled_reason: s.disabled_reason.clone(),
+        disabled_kind: s.disabled_kind.clone(),
     }
 }
 
@@ -457,6 +460,11 @@ impl Mock {
             t.enabled = !auto;
             t.disabled_reason = if auto {
                 WB_REASON.into()
+            } else {
+                String::new()
+            };
+            t.disabled_kind = if auto {
+                "parent_off".into()
             } else {
                 String::new()
             };
@@ -1362,8 +1370,8 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 27);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::DISPLAY_OFFSET_REVISION);
+    assert_eq!(INTERFACE_REVISION, 28);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::DISABLED_KIND_REVISION);
     assert_eq!(obc_ipc::CAMERA_STATUS_REVISION, 26);
     assert_eq!(obc_ipc::CAMERA_XU_SETTINGS_REVISION, 24);
     assert_eq!(obc_ipc::BATTERY_SAVER_AUTO_REVISION, 23);
@@ -2329,6 +2337,7 @@ async fn settings_changed_reaches_the_client_in_one_signal_per_operation() {
                 stored: true,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
             SettingChange {
                 id: TEMPERATURE.into(),
@@ -2336,6 +2345,7 @@ async fn settings_changed_reaches_the_client_in_one_signal_per_operation() {
                 stored: false,
                 enabled: true,
                 disabled_reason: String::new(),
+                disabled_kind: String::new(),
             },
         ]
     );
@@ -2351,7 +2361,7 @@ async fn settings_changed_reaches_the_client_in_one_signal_per_operation() {
         .expect("SettingsChanged stream ended");
     let args = signal.args().unwrap();
     assert_eq!(args.revision, 3);
-    assert_eq!(args.changes[0].1.len(), 3);
+    assert_eq!(args.changes[0].1.len(), 4);
     assert_eq!(args.to_changes()[0].value, None);
     // SettingsRevision follows by PropertiesChanged.
     loop {
