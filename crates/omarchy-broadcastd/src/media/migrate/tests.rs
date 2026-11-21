@@ -462,8 +462,25 @@ fn a_gallery_another_process_is_moving_is_left_to_it() {
     );
     assert_eq!(f.run(), Outcome::default());
     assert!(f.old_dir(MediaKind::Away).join("me.png").exists());
+    // Unlocked, not only closed: a child another test forks meanwhile
+    // shares the description until it execs.
+    // SAFETY: flock on a descriptor the test owns.
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
     drop(held);
     assert_eq!(f.run(), outcome(1, 0, 0));
+}
+
+#[test]
+fn the_lock_is_released_while_a_forked_child_still_shares_it() {
+    let f = fixture();
+    fs::create_dir_all(&f.old).unwrap();
+    let held = lock(&f.old).unwrap();
+    // A duplicate shares the open file description, as a child forked by
+    // another thread (an ffmpeg spawn) does until it execs.
+    let child = held.0.try_clone().unwrap();
+    drop(held);
+    assert!(lock(&f.old).is_some(), "the next start moves the gallery");
+    drop(child);
 }
 
 #[test]

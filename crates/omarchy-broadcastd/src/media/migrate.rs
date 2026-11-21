@@ -477,11 +477,25 @@ fn log_if_link(path: &Path) {
     }
 }
 
-/// An exclusive lock of the directory `dir` (released when the file
-/// closes): `None` when another process holds it (logged) or it cannot be
+/// The exclusive `flock` of the old root, released on drop by an explicit
+/// unlock: a child forked meanwhile (an ffmpeg spawn) shares the open
+/// file description until it execs, so closing this descriptor alone
+/// would leave the lock held and the next start would skip the gallery.
+struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this guard owns.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// An exclusive lock of the directory `dir` (released when the guard
+/// drops): `None` when another process holds it (logged) or it cannot be
 /// taken (logged; nothing is moved then). Two daemons started at once
 /// both pass the bus name check; only one moves the gallery.
-fn lock(dir: &Path) -> Option<File> {
+fn lock(dir: &Path) -> Option<Lock> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let f = fs::OpenOptions::new()
@@ -497,7 +511,7 @@ fn lock(dir: &Path) -> Option<File> {
     };
     // SAFETY: flock on a descriptor this function owns.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Some(f);
+        return Some(Lock(f));
     }
     let e = std::io::Error::last_os_error();
     if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
