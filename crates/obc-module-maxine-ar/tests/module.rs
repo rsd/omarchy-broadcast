@@ -200,7 +200,7 @@ fn the_configuration_refuses_unknown_keys_and_accepts_the_host_keys() {
 fn the_registry_offers_the_stage_with_the_probes_reason() {
     let dir = tempfile::tempdir().unwrap();
     support::installed_manifest(dir.path());
-    let dirs = discovery::dirs_from(None, None, &[dir.path().to_path_buf()], None);
+    let dirs = vec![dir.path().to_path_buf()];
     let mut registry = Registry::new(discovery::scan(&dirs));
     let (sink, _) = support::capture();
     let empty_root = tempfile::tempdir().unwrap();

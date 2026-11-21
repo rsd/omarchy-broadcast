@@ -188,7 +188,7 @@ fn the_registry_offers_the_stages_in_the_rev8_order() {
     let dir = tempfile::tempdir().unwrap();
     let lib = support::module_library();
     support::installed_manifest(dir.path(), &lib);
-    let dirs = discovery::dirs_from(None, None, &[dir.path().to_path_buf()], None);
+    let dirs = vec![dir.path().to_path_buf()];
     let mut registry = Registry::new(discovery::scan(&dirs));
     let (sink, _) = support::capture();
     let empty_root = tempfile::tempdir().unwrap();
