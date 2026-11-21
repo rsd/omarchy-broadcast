@@ -100,7 +100,7 @@ git commit -m '0.55.0-1'
 git push
 ```
 
-The committed `pkgver=` is the release version; makepkg replaces it with the output of `pkgver()` (`<version>.r<commits>.g<hash>`), which sorts after it. A new AUR commit is needed only when the PKGBUILD changes (a dependency, a file installed, a new version in `pkgver=`), not for every commit of the repository.
+The committed `pkgver=` is the release version; makepkg replaces it with the output of `pkgver()` (`<version>.r<commits>.g<hash>`), which sorts after it. A new AUR commit is needed only when the PKGBUILD changes (a dependency, a file installed, a new version in `pkgver=`), not for every commit of the repository. After a push, the AUR's web interface shows the new version at once, but its RPC index, which AUR helpers such as `yay` query, can take a few minutes to follow, so `yay` may still offer the previous version for a while; this needs no action.
 
 #### The prebuilt packages (`omarchy-broadcast-bin`)
 
@@ -272,7 +272,7 @@ WirePlumber probes video devices when it starts. A loopback device that has no w
 
 Applications that open `/dev/video*` directly are not affected. Meanwhile, `gst-device-monitor-1.0 -i Video/Source` lists the camera through the v4l2 provider. Details are in [testing.md](../testing.md#discovery-by-pipewire). The daemon can also register its own PipeWire source, which needs none of this: see the next section.
 
-A v4l2loopback device serves one capture stream at a time: a second application that opens the same device gets `EBUSY` at `VIDIOC_S_FMT` or `VIDIOC_REQBUFS`. Applications that need the camera at the same moment should use the PipeWire node, which serves several consumers, or the loopback should have more devices ([loopback.md](loopback.md)).
+A v4l2loopback device serves one capture stream at a time: a second application that opens the same device gets `EBUSY` at `VIDIOC_S_FMT` or `VIDIOC_REQBUFS`. Applications that need the camera at the same moment should use the PipeWire node, which serves several consumers (with the limitation described under "The PipeWire output" below), or the loopback should have more devices. Why the limit exists, and which applications share the camera by themselves, is in [loopback.md](loopback.md#one-application-at-a-time).
 
 ## The PipeWire output
 
@@ -327,6 +327,8 @@ offer_nv12 = false
 ```
 
 A reload that changes it rebuilds the node, like enabling or disabling it: at once if no application is linked to the node, otherwise when the last one leaves. The loopback is not touched.
+
+**Known limitation: consumers that ask for different formats.** The node has one port and one negotiated format. While one consumer streams a format (YUY2, say), a second one that accepts only another (NV12, say) fails to link, and the first one can stop receiving frames from the moment the second connects. The stream recovers once every consumer has disconnected. Consumers that ask for the same format run together. This is one reason the PipeWire output is optional and off by default; where applications that ask for different formats must run at the same time, let one of them use the loopback device instead.
 
 ### Known issue: OBS Studio and NV12
 

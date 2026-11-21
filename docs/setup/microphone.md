@@ -365,7 +365,7 @@ omarchy-broadcast mic off        # restores the previous default microphone, sto
 
 Without the daemon: change the default microphone back (`wpctl set-default ID` or the desktop's audio settings), then `systemctl --user disable --now omarchy-broadcast-mic.service`. Then remove the files according to the route:
 
-- Arch package: `sudo pacman -R omarchy-broadcast-git` removes the daemon too; the microphone files alone are not removable separately. Leaving the unit disabled is enough.
+- Arch package: `sudo pacman -R omarchy-broadcast-git` (`omarchy-broadcast-bin` for the prebuilt package) removes the daemon too; the microphone files alone are not removable separately. Leaving the unit disabled is enough.
 - `install-user.sh --audio`: `scripts/install-user.sh --uninstall`.
 
 The Maxine module package and then the SDK package are removed with `sudo pacman -R omarchy-broadcast-maxine-afx-git maxine-afx-sdk-local`, only if nothing else uses the SDK; the worker then starts without it. A drop-in copied for an earlier version, `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf`, is not needed any more: `rm` it and run `systemctl --user daemon-reload`.
