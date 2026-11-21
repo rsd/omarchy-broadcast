@@ -1851,6 +1851,74 @@ fn clearing_the_image_brings_back_the_configs_image() {
     assert_eq!(h.snap().background_image, cfg_image);
 }
 
+// ---- replace without a background chosen ----
+
+/// A video service whose gallery has the bundled background `0`.
+struct DefaultBackground(Option<PathBuf>);
+
+impl VideoService for DefaultBackground {
+    fn request_poster(&mut self, _: &Path) {}
+    fn prune(&mut self, _: Option<&Path>) {}
+    fn default_background(&self) -> Option<PathBuf> {
+        self.0.clone()
+    }
+}
+
+#[test]
+fn replace_with_no_background_chooses_the_default_and_keeps_it() {
+    let mut h = H::new("", |_| {});
+    let bundled = h._dir.path().join("bundled.png");
+    fs::write(&bundled, b"an image").unwrap();
+    h.ctrl
+        .set_videos(Box::new(DefaultBackground(Some(bundled.clone()))));
+    h.set_effect("replace", 0).unwrap();
+    let shown = bundled.display().to_string();
+    assert_eq!(h.snap().effect, "replace");
+    assert_eq!(h.snap().background_image, shown, "the panel shows it");
+    assert_eq!(h.persisted().background_image, Some(bundled));
+    // A choice of the user is kept, not replaced by the default.
+    let own = h.image();
+    h.set_image(&own, 10).unwrap();
+    h.set_effect("none", 20).unwrap();
+    h.set_effect("replace", 30).unwrap();
+    assert_eq!(h.snap().background_image, own);
+}
+
+#[test]
+fn replace_with_a_missing_background_chooses_the_default() {
+    let mut h = H::new("", |_| {});
+    let bundled = h._dir.path().join("bundled.png");
+    fs::write(&bundled, b"an image").unwrap();
+    h.ctrl
+        .set_videos(Box::new(DefaultBackground(Some(bundled.clone()))));
+    let own = h.image();
+    h.set_image(&own, 0).unwrap();
+    h.set_effect("replace", 10).unwrap();
+    fs::remove_file(&own).unwrap();
+    // Already replace, its image gone: the default is chosen again.
+    h.set_effect("replace", 20).unwrap();
+    assert_eq!(h.snap().background_image, bundled.display().to_string());
+    assert_eq!(h.persisted().background_image, Some(bundled));
+}
+
+#[test]
+fn replace_with_no_background_at_all_is_refused_in_user_terms() {
+    let mut h = H::new("", |_| {});
+    h.ctrl.set_videos(Box::new(DefaultBackground(None)));
+    let msg = match h.set_effect("replace", 0) {
+        Err(IpcError::InvalidArgument(m)) => m,
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    };
+    assert!(msg.contains("needs a background image"), "{msg}");
+    assert!(
+        msg.contains("omarchy-broadcast effect replace --image"),
+        "{msg}"
+    );
+    assert!(!msg.contains("SetBackgroundImage"), "{msg}");
+    assert_eq!(h.snap().effect, "none");
+    assert_eq!(h.snap().background_image, "");
+}
+
 // ---- the media gallery's removals (RemoveMedia, revision 15) ----
 
 /// A gallery under `root` with the user background `name` in it.

@@ -53,6 +53,13 @@ pub trait VideoService: Send {
     /// video needs), keeping what `outside` (a video outside the gallery
     /// the settings name) needs; for the daemon's start.
     fn prune(&mut self, outside: Option<&Path>);
+
+    /// The background the `replace` effect starts with when none is set:
+    /// the first bundled background, a still before a video
+    /// ([`MediaStore::default_background`]); `None` when there is none.
+    fn default_background(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// No video service (until the daemon gives the controller its own): no
@@ -96,6 +103,10 @@ impl Drop for GalleryVideos {
 }
 
 impl VideoService for GalleryVideos {
+    fn default_background(&self) -> Option<PathBuf> {
+        self.store.as_ref().and_then(MediaStore::default_background)
+    }
+
     fn request_poster(&mut self, path: &Path) {
         let store = self.store.clone();
         let tx = self.commands.clone();

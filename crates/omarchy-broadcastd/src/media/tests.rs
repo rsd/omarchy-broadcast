@@ -560,6 +560,32 @@ fn stale_temporary_files_go_from_both_folders() {
 }
 
 #[test]
+fn the_default_background_is_the_first_bundled_still() {
+    let f = fixture();
+    assert_eq!(f.store.default_background(), None, "no bundled directory");
+    // The user's own background is never the default.
+    write(
+        &f.store.user_dir(MediaKind::Background).join("mine.png"),
+        &png(10, 10, 9),
+    );
+    assert_eq!(f.store.default_background(), None);
+    let bundled = f.store.bundled_dir(MediaKind::Background);
+    write(&bundled.join("b.png"), &png(10, 10, 2));
+    write(&bundled.join("A.png"), &png(10, 10, 3));
+    write(&bundled.join("c.png"), &png(10, 10, 4));
+    write(
+        &bundled.join(SOURCES_FILE),
+        b"[[item]]\nfile = \"c.png\"\ntitle = \"C\"\n",
+    );
+    // SOURCES.toml order first, then by name: the same order as the listing.
+    assert_eq!(f.store.default_background(), Some(bundled.join("c.png")));
+    assert_eq!(
+        f.store.list(MediaKind::Background)[0].path,
+        bundled.join("c.png")
+    );
+}
+
+#[test]
 fn bundled_items_come_first_in_sources_order_then_user_items_by_name() {
     let f = fixture();
     let bundled = f.store.bundled_dir(MediaKind::Background);

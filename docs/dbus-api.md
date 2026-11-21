@@ -147,11 +147,11 @@ Errors: `InvalidConfig`, `Failed`.
 
 ### `SetEffect(s effect)`
 
-Selects the video effect: `none` (the camera image as it is), `blur` (blur the background behind the person) or `replace` (replace the background with the background image). It takes effect on a running stream at once, with no restart of the session and no change to what the virtual camera negotiates; see [Video effects](#video-effects) for what the application sees while an effect starts. Selecting the effect already in force does nothing. The choice persists across restarts and takes precedence over the configuration.
+Selects the video effect: `none` (the camera image as it is), `blur` (blur the background behind the person) or `replace` (replace the background with the background image). It takes effect on a running stream at once, with no restart of the session and no change to what the virtual camera negotiates; see [Video effects](#video-effects) for what the application sees while an effect starts. `replace` with no background image set, or one whose file is gone, chooses the first bundled background (the first of the gallery's bundled items, a still image before a video) as `SetBackgroundImage` would, so `BackgroundImage` shows it; the daemon logs it. This is no change of the interface, so `InterfaceRevision` does not move; an earlier daemon refuses it instead. Selecting the effect already in force does nothing. The choice persists across restarts and takes precedence over the configuration.
 
 Any effect method also retries an effect that failed (see below), and leaves the `error` state when settings the stream refused put the daemon there.
 
-Errors: `InvalidArgument` (an effect other than `none`, `blur`, `replace`; or `replace` while no background image is set), `Failed`.
+Errors: `InvalidArgument` (an effect other than `none`, `blur`, `replace`; or `replace` while no background image is set and the gallery has no bundled one to choose), `Failed`.
 
 ### `SetBlurStrength(d strength)`
 
@@ -715,7 +715,7 @@ Revision 8 puts the video effects in the same tree, as settings of `scope` `glob
 
 | Group | Setting id | `type`, range, hint | Meaning |
 |---|---|---|---|
-| `background` ("Background effect") | `effect.background.mode` | `enum`: `none` "Off", `blur` "Blur", `replace` "Replace"; `segmented` | The effect (`Effect`, `SetEffect`). `replace` without a background image is refused as `SetEffect` refuses it |
+| `background` ("Background effect") | `effect.background.mode` | `enum`: `none` "Off", `blur` "Blur", `replace` "Replace"; `segmented` | The effect (`Effect`, `SetEffect`). `replace` without a background image takes the first bundled one, and is refused only when there is none, as `SetEffect` refuses it |
 | | `effect.background.blur_strength` | `int` 0 to 100, step 1, unit `%`; `slider` | The blur strength (`BlurStrength`, `SetBlurStrength`); enabled only while the mode is `blur` |
 | `video` ("Video") | `effect.video.denoise` | `bool`; `switch` | Noise removal (`Denoise`, `SetDenoise`) |
 | | `effect.video.enhance` | `bool`; `switch` | Enhancement of a low-resolution camera (see below) |

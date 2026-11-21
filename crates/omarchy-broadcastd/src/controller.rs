@@ -6848,16 +6848,42 @@ impl<B: MediaBackend> Controller<B> {
         let mode: EffectMode = name
             .parse()
             .map_err(|e: obc_core::CoreError| IpcError::InvalidArgument(e.to_string()))?;
-        if mode == EffectMode::Replace && self.effect().background_image.is_none() {
+        let background = mode == EffectMode::Replace && self.ensure_replace_background()?;
+        info!("effect selected: {mode}");
+        let changed = self.runtime.effect.replace(mode) != Some(mode) || background;
+        self.effect_changed(changed, now)
+    }
+
+    /// `replace` needs a background: when none is set, or the one set is
+    /// gone, the first bundled background ([`VideoService::default_background`])
+    /// is chosen as an explicit choice would be (the run-time background,
+    /// which `Background` shows); refused, in terms a user can act on,
+    /// only when there is none. Whether the background changed.
+    fn ensure_replace_background(&mut self) -> Result<bool, IpcError> {
+        let set = self.effect().background_image;
+        if set.as_deref().is_some_and(Path::is_file) {
+            return Ok(false);
+        }
+        let Some(default) = self.videos.default_background() else {
             return Err(IpcError::InvalidArgument(
-                "the replace effect needs a background image: set one with SetBackgroundImage \
-                 first"
+                "Replace needs a background image: choose one in the panel (Background) or \
+                 with `omarchy-broadcast effect replace --image <file>`"
                     .into(),
             ));
+        };
+        match set {
+            Some(gone) => info!(
+                "the background {} is gone: using the bundled {} for the replace effect",
+                gone.display(),
+                default.display()
+            ),
+            None => info!(
+                "no background chosen: using the bundled {} for the replace effect",
+                default.display()
+            ),
         }
-        info!("effect selected: {mode}");
-        let changed = self.runtime.effect.replace(mode) != Some(mode);
-        self.effect_changed(changed, now)
+        self.runtime.background_image = Some(default);
+        Ok(true)
     }
 
     fn set_blur_strength(&mut self, strength: f64, now: Instant) -> Result<(), IpcError> {
