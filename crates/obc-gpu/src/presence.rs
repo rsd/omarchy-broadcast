@@ -9,7 +9,13 @@
 //!    `/proc/driver/nvidia/gpus` has an entry (the listing only, no file in
 //!    it is read);
 //! 3. the CUDA driver library (`libcuda.so.1`) can be opened;
-//! 4. GStreamer's CUDA elements (`cudaupload`, `cudadownload`,
+//! 4. the CUDA toolkit's runtime compiler, NVRTC, can be opened: GStreamer's
+//!    CUDA library opens it by the name [`NVRTC_LIBRARY`] (or the one in
+//!    [`NVRTC_LIBRARY_ENV`]) to compile the kernels of its CUDA elements, so
+//!    without it (the `cuda` package not installed, only the driver's
+//!    `nvidia-utils`) the CUDA pipeline cannot run. The library is closed
+//!    again at once: it is large, and the elements open it themselves;
+//! 5. GStreamer's CUDA elements (`cudaupload`, `cudadownload`,
 //!    `cudaconvertscale`) are registered. This crate does not link
 //!    GStreamer: the caller looks them up in the registry
 //!    (`gst::ElementFactory::find`, which reads the registry cache and
@@ -17,12 +23,13 @@
 //!
 //! None of it creates a CUDA context, calls `cuInit` or any other driver
 //! entry point, or opens a `/dev/nvidia*` device: listing procfs touches no
-//! device, and opening the driver library runs its initialisers only (as
+//! device, and opening the driver library (or NVRTC, a compiler that knows
+//! no device) runs its initialisers only (as
 //! [`crate::park`] does to find its entry points). It is therefore safe while
 //! the process is parked and while a runtime-suspended GPU sleeps
 //! (`docs/adr/0006-on-demand-gpu-lifecycle.md`,
 //! `docs/adr/0017-cuda-checkpoint-parking.md`). The caller must not
-//! make a CUDA element (`gst::ElementFactory::make`) to answer step 4:
+//! make a CUDA element (`gst::ElementFactory::make`) to answer step 5:
 //! loading the `nvcodec` plugin calls `cuInit`.
 //!
 //! What it cannot see is a driver that is present but whose `cuInit` fails
@@ -34,6 +41,15 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 use crate::DRIVER_LIBRARY;
+
+/// The name GStreamer's CUDA library (`libgstcuda`, gst-plugins-bad) opens
+/// NVRTC by on Linux, unless [`NVRTC_LIBRARY_ENV`] names another. The
+/// unversioned name: the `cuda` package's `/opt/cuda/lib64` is on the
+/// loader's path.
+pub const NVRTC_LIBRARY: &str = "libnvrtc.so";
+/// The environment variable that makes GStreamer's CUDA library open
+/// another NVRTC library than [`NVRTC_LIBRARY`]; the probe opens the same.
+pub const NVRTC_LIBRARY_ENV: &str = "GST_CUDA_NVRTC_LIBNAME";
 
 /// The NVIDIA kernel driver's procfs directory.
 pub const NVIDIA_PROC_DIR: &str = "/proc/driver/nvidia";
@@ -50,6 +66,11 @@ pub const REASON_NO_DRIVER: &str = "no NVIDIA driver is loaded";
 pub const REASON_NO_GPU: &str = "the NVIDIA driver reports no GPU";
 /// The reason when the CUDA driver library cannot be opened.
 pub const REASON_NO_LIBRARY: &str = "the CUDA driver library is not installed";
+/// The reason when NVRTC cannot be opened.
+/// Shown after "system memory" in the log and the `video.memory` row
+/// ("Now: system memory, …"), so it does not say that again.
+pub const REASON_NO_NVRTC: &str =
+    "the CUDA toolkit (NVRTC) is not installed; install `cuda` for the GPU path";
 /// The reason when GStreamer's CUDA elements are not registered.
 pub const REASON_NO_ELEMENTS: &str =
     "GStreamer's CUDA elements (gst-plugins-bad, nvcodec) are not installed";
@@ -68,6 +89,9 @@ pub enum Cause {
     NoGpu,
     /// The CUDA driver library cannot be opened ([`REASON_NO_LIBRARY`]).
     NoLibrary,
+    /// The CUDA toolkit's runtime compiler, NVRTC, cannot be opened
+    /// ([`REASON_NO_NVRTC`]).
+    NoNvrtc,
     /// GStreamer's CUDA elements are not registered
     /// ([`REASON_NO_ELEMENTS`]).
     NoElements,
@@ -81,6 +105,7 @@ impl Cause {
             Cause::NoDriver => REASON_NO_DRIVER,
             Cause::NoGpu => REASON_NO_GPU,
             Cause::NoLibrary => REASON_NO_LIBRARY,
+            Cause::NoNvrtc => REASON_NO_NVRTC,
             Cause::NoElements => REASON_NO_ELEMENTS,
         }
     }
@@ -135,6 +160,9 @@ pub struct ProbeEnv {
     pub nvidia_proc_dir: PathBuf,
     /// The CUDA driver library's name or path ([`DRIVER_LIBRARY`]).
     pub driver_library: OsString,
+    /// NVRTC's name or path ([`NVRTC_LIBRARY`], or [`NVRTC_LIBRARY_ENV`]'s
+    /// value when set and not empty).
+    pub nvrtc_library: OsString,
     /// Whether every one of [`CUDA_ELEMENTS`] is in GStreamer's registry.
     pub cuda_elements_registered: bool,
 }
@@ -147,9 +175,19 @@ impl ProbeEnv {
             cuda_visible_devices: std::env::var_os("CUDA_VISIBLE_DEVICES"),
             nvidia_proc_dir: PathBuf::from(NVIDIA_PROC_DIR),
             driver_library: OsString::from(DRIVER_LIBRARY),
+            nvrtc_library: nvrtc_library(std::env::var_os(NVRTC_LIBRARY_ENV)),
             cuda_elements_registered,
         }
     }
+}
+
+/// The NVRTC library GStreamer opens, given the value of
+/// [`NVRTC_LIBRARY_ENV`]: that value when set and not empty, else
+/// [`NVRTC_LIBRARY`].
+pub fn nvrtc_library(env_value: Option<OsString>) -> OsString {
+    env_value
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| OsString::from(NVRTC_LIBRARY))
 }
 
 /// Whether a `CUDA_VISIBLE_DEVICES` value hides every GPU: set and empty
@@ -180,6 +218,9 @@ pub fn probe(env: &ProbeEnv) -> Presence {
     if !driver_library_opens(&env.driver_library) {
         return Unusable(Cause::NoLibrary);
     }
+    if !nvrtc_opens(&env.nvrtc_library) {
+        return Unusable(Cause::NoNvrtc);
+    }
     if !env.cuda_elements_registered {
         return Unusable(Cause::NoElements);
     }
@@ -206,6 +247,19 @@ fn driver_library_opens(name: &OsStr) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Whether the library `name` opens (lazy binding, local symbols). It is
+/// closed again: NVRTC maps some 30 MB, which a daemon that runs in system
+/// memory should not keep, and GStreamer opens it itself when its CUDA
+/// elements need it.
+fn nvrtc_opens(name: &OsStr) -> bool {
+    use libloading::os::unix::{Library, RTLD_LAZY, RTLD_LOCAL};
+    // SAFETY: NVRTC is a compiler library; its initialisers have no
+    // preconditions and open no device. Any other library named here is
+    // the caller's choice (tests, `GST_CUDA_NVRTC_LIBNAME`). Nothing is
+    // resolved or called, so nothing of it is used once it is closed.
+    unsafe { Library::open(Some(name), RTLD_LAZY | RTLD_LOCAL) }.is_ok()
 }
 
 #[cfg(test)]
@@ -257,6 +311,7 @@ mod tests {
             cuda_visible_devices: None,
             nvidia_proc_dir: proc_dir.to_path_buf(),
             driver_library: "libc.so.6".into(),
+            nvrtc_library: "libm.so.6".into(),
             cuda_elements_registered: true,
         }
     }
@@ -286,6 +341,7 @@ mod tests {
                 cuda_visible_devices: Some(v.into()),
                 nvidia_proc_dir: "/nonexistent/obc-gpu".into(),
                 driver_library: "libobc-no-such-library.so.0".into(),
+                nvrtc_library: "libobc-no-such-library.so.0".into(),
                 cuda_elements_registered: false,
             };
             let r = probe(&env);
@@ -332,6 +388,40 @@ mod tests {
     }
 
     #[test]
+    fn a_driver_without_nvrtc_is_unusable_and_says_to_install_cuda() {
+        // `nvidia-utils` without `cuda`: the driver library opens, NVRTC
+        // does not. The CUDA elements' registration is not looked at.
+        let p = proc_with_gpus(1);
+        let env = ProbeEnv {
+            nvrtc_library: "libobc-no-such-nvrtc.so".into(),
+            cuda_elements_registered: false,
+            ..usable(&p.0)
+        };
+        let r = probe(&env);
+        assert_eq!(r.cause(), Some(Cause::NoNvrtc));
+        assert_eq!(r.unusable_reason(), Some(REASON_NO_NVRTC));
+        assert!(REASON_NO_NVRTC.contains("install `cuda`"));
+        // Says nothing of the hardware: a GPU is there.
+        assert!(!Cause::NoNvrtc.no_gpu());
+        // The driver library is checked first.
+        let env = ProbeEnv {
+            driver_library: "libobc-no-such-library.so.0".into(),
+            ..env
+        };
+        assert_eq!(probe(&env).cause(), Some(Cause::NoLibrary));
+    }
+
+    #[test]
+    fn the_nvrtc_library_is_gstreamers_name_unless_the_environment_names_another() {
+        assert_eq!(nvrtc_library(None), OsStr::new(NVRTC_LIBRARY));
+        assert_eq!(nvrtc_library(Some("".into())), OsStr::new(NVRTC_LIBRARY));
+        assert_eq!(
+            nvrtc_library(Some("/opt/cuda/lib64/libnvrtc.so.13".into())),
+            OsStr::new("/opt/cuda/lib64/libnvrtc.so.13")
+        );
+    }
+
+    #[test]
     fn missing_gstreamer_elements_are_unusable() {
         let p = proc_with_gpus(1);
         let env = ProbeEnv {
@@ -348,6 +438,7 @@ mod tests {
             (Cause::NoDriver, REASON_NO_DRIVER, false),
             (Cause::NoGpu, REASON_NO_GPU, true),
             (Cause::NoLibrary, REASON_NO_LIBRARY, false),
+            (Cause::NoNvrtc, REASON_NO_NVRTC, false),
             (Cause::NoElements, REASON_NO_ELEMENTS, false),
         ] {
             assert_eq!(c.reason(), reason);
@@ -396,6 +487,10 @@ mod tests {
         let env = ProbeEnv::from_process(true);
         assert_eq!(env.nvidia_proc_dir, Path::new(NVIDIA_PROC_DIR));
         assert_eq!(env.driver_library, OsStr::new(DRIVER_LIBRARY));
+        assert_eq!(
+            env.nvrtc_library,
+            nvrtc_library(std::env::var_os(NVRTC_LIBRARY_ENV))
+        );
         assert!(env.cuda_elements_registered);
         assert_eq!(
             env.cuda_visible_devices,

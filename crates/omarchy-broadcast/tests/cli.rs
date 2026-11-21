@@ -3518,7 +3518,7 @@ fn daemon_not_running_has_its_own_exit_code_and_reads_never_activate() {
     assert_eq!(
         out.stderr,
         "omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast \
-         on the session bus); start it with: systemctl --user start omarchy-broadcastd\n"
+         on the session bus); start it with: systemctl --user enable --now omarchy-broadcastd\n"
     );
 
     for args in [&["status", "--json"][..], &["cameras", "--json"][..]] {
@@ -3553,7 +3553,7 @@ fn daemon_not_running_has_its_own_exit_code_and_reads_never_activate() {
     );
     assert!(
         out.stderr
-            .contains("systemctl --user start omarchy-broadcastd")
+            .contains("systemctl --user enable --now omarchy-broadcastd")
     );
     assert!(bus.activation_attempted(), "`on` should allow activation");
 }

@@ -571,7 +571,7 @@ omarchy-broadcast preview [--json] [--fps 15|30]
 When the daemon is not running, the human-readable commands print one line to stderr, for example:
 
 ```text
-omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast on the session bus); start it with: systemctl --user start omarchy-broadcastd
+omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast on the session bus); start it with: systemctl --user enable --now omarchy-broadcastd
 ```
 
 ## Exit status
@@ -1012,7 +1012,7 @@ omarchy-broadcast watch --json
 {"v":1,"type":"state","changed":["state"],"state":"active","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4}
 {"v":1,"type":"stats","fps":30.0,"latency_p50_ms":41.2,"cpu_percent":6.5,"gpu_percent":18.0}
 {"v":1,"type":"stats","fps":30.0,"latency_p50_ms":40.8,"cpu_percent":6.4,"gpu_percent":-1.0}
-{"v":1,"type":"error","code":"daemon-not-running","error":"omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast on the session bus); start it with: systemctl --user start omarchy-broadcastd"}
+{"v":1,"type":"error","code":"daemon-not-running","error":"omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast on the session bus); start it with: systemctl --user enable --now omarchy-broadcastd"}
 {"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
 ```
 
@@ -1094,7 +1094,7 @@ omarchy-broadcast preview --json
 {"v":1,"type":"frame","seq":2,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
 {"v":1,"type":"frame","seq":3,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
 {"v":1,"type":"preview","active":false}
-{"v":1,"type":"error","code":"daemon-not-running","error":"omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast on the session bus); start it with: systemctl --user start omarchy-broadcastd"}
+{"v":1,"type":"error","code":"daemon-not-running","error":"omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast on the session bus); start it with: systemctl --user enable --now omarchy-broadcastd"}
 {"v":1,"type":"preview","active":true,"fps":15,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
 {"v":1,"type":"frame","seq":1,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
 ```
