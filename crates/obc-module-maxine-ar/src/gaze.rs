@@ -5,7 +5,8 @@
 //! the gaze and writes the frame with the eyes redirected towards the
 //! camera into its output image, full frame; with no face, the output is
 //! the input. Fixed here: temporal tracking on, redirection on, 126
-//! landmarks, and the SDK's defaults for everything else (the gaze and
+//! landmarks, CUDA graphs off (see `configure`), and the SDK's defaults for
+//! everything else (the gaze and
 //! head-pose thresholds, the eye-size sensitivity, the closure detection
 //! and the look-away timing). The one choice is the randomised look-away
 //! (`GazeConfig::look_away`), applied by a new load.
@@ -139,6 +140,17 @@ impl EyeContact {
         set_u32(ffi::P_GAZE_REDIRECT, 1)?;
         set_u32(ffi::P_TEMPORAL, 1)?;
         set_u32(ffi::P_ENABLE_LOOK_AWAY, u32::from(self.config.look_away))?;
+        // No CUDA graphs (the SDK's default is on). The feature captures
+        // them on its first frames with a face, in the global capture mode:
+        // while a capture runs, an unsafe call from any other thread of the
+        // process (a `cuMemAlloc`, as a Video Effects load or a buffer pool
+        // makes) fails with "operation not permitted when stream is
+        // capturing", the capture is invalidated, `NvAR_Run` fails and leaves
+        // the stream capturing, and every unsafe call after it fails too; a
+        // TensorRT engine load meeting it throws through `NvVFX_Load` and
+        // aborts the daemon. The other stages run on other threads, so the
+        // capture cannot be kept to itself.
+        set_u32(ffi::P_USE_CUDA_GRAPH, 0)?;
         check("NvAR_Load", ffi::FEATURE_GAZE_REDIRECTION, unsafe {
             (sdk.NvAR_Load)(h)
         })?;
