@@ -367,7 +367,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::backend::{
     ControlEvent, ControlNode, ControlScan, EffectReport, EffectRun, EffectStatus, Failure,
     MediaBackend, OrientationEvent, PipeWireEvent, PipeWireGeneration, PipeWireState,
-    PreviewRequest, SessionParams, StageRun, WatchGeneration,
+    PreviewRequest, SessionError, SessionParams, StageRun, WatchGeneration,
 };
 use crate::camera::{self, Camera};
 use crate::gpu_cache;
@@ -5769,7 +5769,7 @@ impl<B: MediaBackend> Controller<B> {
             if e.contract {
                 self.session_contract_failed(&params.contract, &e.message);
             }
-            let e = e.message;
+            let e = self.cuda_failure_text(&params, &e);
             // The effect's check refused it before: that is the cause the
             // user can act on, the build's text a consequence.
             let msg = match refused {
@@ -6075,6 +6075,26 @@ impl<B: MediaBackend> Controller<B> {
             );
             self.failed_contract = Some((*contract, e.to_string(), good));
         }
+    }
+
+    /// The text of a session start with `params` that failed with `e`.
+    /// Under an explicit `video.memory = "cuda"` a start that failed for
+    /// want of CUDA ([`crate::backend::SessionError::no_cuda`]) gets the
+    /// CUDA presence probe's reason when it finds one, so that the user is
+    /// told what is missing (`… (the CUDA toolkit (NVRTC) is not
+    /// installed; install `cuda` for the GPU path)`) rather than an
+    /// element's error alone. The probe is asked only then: the choice of
+    /// memory never needs it, and `auto` has already tried system memory.
+    /// It makes no CUDA call ([`obc_gpu::presence`]).
+    fn cuda_failure_text(&mut self, params: &SessionParams, e: &SessionError) -> String {
+        if e.no_cuda
+            && params.memory == VideoMemory::Cuda
+            && self.memory.choice == MemoryChoice::Cuda
+            && let Some(cause) = self.backend.cuda_unusable()
+        {
+            return format!("{} ({})", e.message, cause.reason());
+        }
+        e.message.clone()
     }
 
     /// A session output that could not start with `params` (`why`) is

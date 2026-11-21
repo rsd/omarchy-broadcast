@@ -64,7 +64,7 @@ pub use obc_ipc::CONTROLS_REVISION;
 pub use obc_ipc::SETTINGS_REVISION;
 
 /// How to start the daemon, quoted in the not-running message.
-pub const START_HINT: &str = "systemctl --user start omarchy-broadcastd";
+pub const START_HINT: &str = "systemctl --user enable --now omarchy-broadcastd";
 
 /// Why a request did not succeed.
 #[derive(Debug)]

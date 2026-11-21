@@ -2245,6 +2245,7 @@ mod tests {
             Cause::Hidden,
             Cause::NoDriver,
             Cause::NoLibrary,
+            Cause::NoNvrtc,
             Cause::NoElements,
         ] {
             assert_eq!(

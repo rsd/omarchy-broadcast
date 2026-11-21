@@ -16546,13 +16546,16 @@ fn system_memory_set_in_the_configuration_gives_the_cuda_off_reason() {
 #[test]
 fn cuda_set_in_the_configuration_never_falls_back() {
     let mut h = H::new("[video]\nmemory = \"cuda\"\n", |w| {
-        // The probe is not even asked.
+        // The probe is not asked for the memory: only to explain a
+        // failed start.
         w.cuda_unusable = Some(obc_gpu::presence::Cause::NoDriver);
         w.fail_start_no_cuda = Some(NO_CUDADOWNLOAD.into());
     });
     assert!(h.stage_listed(MAXINE_MODULE, "denoise").0);
+    assert_eq!(h.world().cuda_probes, 0);
     h.activate_expecting_error();
-    assert_eq!(h.snap().error, NO_CUDADOWNLOAD);
+    // The error says what the probe finds missing.
+    assert_eq!(h.snap().error, format!("{NO_CUDADOWNLOAD} ({NO_DRIVER})"));
     let w = h.world();
     assert!(!w.start_memories.is_empty());
     assert!(
@@ -16560,9 +16563,68 @@ fn cuda_set_in_the_configuration_never_falls_back() {
         "{:?}",
         w.start_memories
     );
-    assert_eq!(w.cuda_probes, 0);
+    // Asked once, after the failed start (whose passthrough retry failed
+    // too), never for a start: 0 before, 1 after.
+    assert_eq!(w.cuda_probes, 1, "{:?}", w.start_memories);
     // Not parked after a start that failed for want of CUDA.
     assert_eq!(w.park_calls, 0);
+}
+
+#[test]
+fn auto_without_nvrtc_runs_in_system_memory_and_says_to_install_cuda() {
+    // `nvidia-utils` without `cuda`: a GPU and its driver library, no NVRTC.
+    use obc_gpu::presence::{Cause, REASON_NO_NVRTC};
+    let mut h = H::new("", |w| {
+        w.cuda_unusable = Some(Cause::NoNvrtc);
+        w.modules = vec![host_cutout()];
+    });
+    let lines = crate::log::take_lines();
+    assert!(
+        lines.contains(&format!("video memory: system (auto: {REASON_NO_NVRTC})")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        h.row("video.memory").description,
+        format!("Now: system memory, {REASON_NO_NVRTC}. Applies at the next camera start.")
+    );
+    // A GPU is there: CUDA unusable, not "no GPU".
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_NEEDS_CUDA.to_string())
+    );
+    h.activate_then_idle(0);
+    let w = h.world();
+    assert_eq!(w.start_memories, [VideoMemory::System]);
+    assert!(!w.cuda_initialised);
+}
+
+#[test]
+fn cuda_set_in_the_configuration_without_nvrtc_fails_saying_to_install_cuda() {
+    use obc_gpu::presence::{Cause, REASON_NO_NVRTC};
+    let mut h = H::new("[video]\nmemory = \"cuda\"\n", |w| {
+        w.cuda_unusable = Some(Cause::NoNvrtc);
+        w.fail_start_no_cuda = Some(NO_CUDADOWNLOAD.into());
+    });
+    h.activate_expecting_error();
+    assert_eq!(
+        h.snap().error,
+        format!("{NO_CUDADOWNLOAD} ({REASON_NO_NVRTC})")
+    );
+    assert!(
+        h.world()
+            .start_memories
+            .iter()
+            .all(|m| *m == VideoMemory::Cuda)
+    );
+}
+
+#[test]
+fn cuda_set_in_the_configuration_keeps_the_error_alone_when_the_probe_finds_nothing() {
+    let mut h = H::new("[video]\nmemory = \"cuda\"\n", |w| {
+        w.fail_start_no_cuda = Some(NO_CUDADOWNLOAD.into());
+    });
+    h.activate_expecting_error();
+    assert_eq!(h.snap().error, NO_CUDADOWNLOAD);
 }
 
 #[test]
