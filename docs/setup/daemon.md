@@ -1,8 +1,8 @@
 # Running omarchy-broadcastd as a user service
 
-This guide installs the daemon, `omarchy-broadcastd`, and runs it as a systemd user service. You need it on every machine: the daemon is the program that makes the virtual camera work.
+This guide covers running and configuring the daemon, `omarchy-broadcastd`, as a systemd user service. You need the daemon on every machine: it is the program that makes the virtual camera work. To install it, follow [INSTALL.md](../../INSTALL.md) first.
 
-The daemon owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus. It starts the camera and the GPU pipeline only while an application uses the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)). The build installs nothing; you pick one of four routes below.
+The daemon owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus. It starts the camera and the GPU pipeline only while an application uses the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)).
 
 ## Before you start
 
@@ -22,204 +22,11 @@ On a machine with an NVIDIA GPU, install `cuda` as well as `nvidia-utils` for th
 
 ## Install
 
-Choose one route.
-
-| Route | Root needed | Use it when |
-|---|---|---|
-| [From the AUR](#from-the-aur) | yes (pacman) | You want a package, prebuilt or built from the latest source |
-| [Arch package from a checkout](#arch-package-from-a-checkout) | yes (pacman) | You build the package from a local checkout |
-| [Per-user install from a checkout](#per-user-install-from-a-checkout) | no | You want an install in your home directory |
-| [Manual install](#manual-install) | no | You want only the two binaries and the unit file |
-
-### From the AUR
-
-The AUR has the split package of `packaging/arch/PKGBUILD` in two forms. Install one of them. They conflict with each other, and the modules of one form work with the core of the other.
-
-- `omarchy-broadcast-bin` (pkgbase) is prebuilt and quick to install. Its files come from the GitHub release of the same version, are checked against a sha256 in the recipe, and need no build tools. Its packages are `omarchy-broadcast-bin`, `omarchy-broadcast-onnx-bin`, `omarchy-broadcast-maxine-vfx-bin`, `omarchy-broadcast-maxine-ar-bin` and `omarchy-broadcast-maxine-afx-bin`.
-- `omarchy-broadcast-git` (pkgbase) builds from the latest source of this repository on GitHub and needs the build tools of `packaging/arch/PKGBUILD`. Its packages have the same names with `-git` in place of `-bin`.
-
-Each `-bin` package installs exactly the files of its `-git` twin. It provides the plain name (`omarchy-broadcast`, `omarchy-broadcast-onnx`, and so on) and conflicts with the plain name and with the twin.
-
-1. Install the core and the open-model cut-out module with an AUR helper such as `yay`:
-
-   ```sh
-   yay -S omarchy-broadcast-bin omarchy-broadcast-onnx-bin   # prebuilt
-   yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git   # built from source
-   ```
-
-2. Add what your GPU needs.
-
-   On a machine with an NVIDIA GPU, add `cuda` (NVRTC, needed by the CUDA video path). `nvidia-utils` comes with the NVIDIA driver.
-
-   ```sh
-   yay -S cuda omarchy-broadcast-bin omarchy-broadcast-onnx-bin
-   ```
-
-   On a machine without an NVIDIA GPU, install the CPU build of ONNX Runtime with the module. Or pick `onnxruntime-cpu` when yay asks which provider of `onnxruntime` to install.
-
-   ```sh
-   yay -S onnxruntime-cpu omarchy-broadcast-onnx-bin
-   ```
-
-   The other providers build a much larger runtime: the AUR's `onnxruntime-core` builds with CUDA, cuDNN, OpenVINO and TensorRT. [onnx.md](onnx.md#2-install-onnx-runtime) lists them.
-
-3. Optional, on an NVIDIA RTX GPU: install the Maxine modules `omarchy-broadcast-maxine-vfx-bin`, `omarchy-broadcast-maxine-ar-bin` and `omarchy-broadcast-maxine-afx-bin` (`-git` in place of `-bin` for the source build). Each depends on an SDK package that you build yourself from your own download of the NVIDIA SDK, as in [maxine.md](maxine.md). Install that SDK package first.
-
-4. Configure the v4l2loopback device as in [loopback.md](loopback.md). This needs root, once. The package ships the `modprobe.d` line as `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`.
-
-5. Start the daemon, now and at every login:
-
-   ```sh
-   systemctl --user enable --now omarchy-broadcastd
-   ```
-
-The package prints these steps after it is installed.
-
-The prebuilt packages do not contain the NVIDIA SDKs or ONNX Runtime, which are licensed separately. The Maxine and ONNX modules hold no code of either: they load the SDK or the runtime when the daemon runs. So the `-bin` modules need the SDK packages and an `onnxruntime` package exactly as the `-git` ones do.
-
-### Arch package from a checkout
-
-`packaging/arch/PKGBUILD` builds one split package of five from the committed HEAD of your local checkout. Uncommitted changes are not included. The five are the core `omarchy-broadcast-git` and a package per loadable module. The [README table](../../README.md#choose-your-modules) lists them by their base names (`omarchy-broadcast`, `omarchy-broadcast-onnx`, and so on); add `-git` to each name.
-
-1. Build from `packaging/arch`, then install the core and the module packages you want from the same build:
-
-   ```sh
-   cd packaging/arch
-   makepkg -s
-   sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
-   ```
-
-2. Configure the v4l2loopback device as in [loopback.md](loopback.md). The package does not do this for you.
-
-3. Start the daemon as each user. Nothing is enabled by the install. Pacman prints the next steps from the install scriptlet `packaging/arch/omarchy-broadcast.install`, which changes nothing.
-
-   ```sh
-   systemctl --user enable --now omarchy-broadcastd
-   ```
-
-The core package, `omarchy-broadcast-git`, installs:
-
-- `/usr/bin/omarchy-broadcastd` and `/usr/bin/omarchy-broadcast`;
-- the unit `/usr/lib/systemd/user/omarchy-broadcastd.service`;
-- the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service`;
-- the directories modules are found in, `/usr/lib/omarchy-broadcast/modules` (libraries) and `/usr/lib/omarchy-broadcast/modules.d` (manifests), with the CPU voice module in them;
-- the C header of the module interface, `/usr/include/omarchy-broadcast/omarchy_broadcast_module.h`;
-- the udev rule for the MX Brio, `/usr/lib/udev/rules.d/70-omarchy-broadcast-mx-brio.rules`, which lets the daemon read the camera's Show Mode ([The udev rule for the MX Brio](#the-udev-rule-for-the-mx-brio));
-- the licences and this documentation, in `/usr/share/doc/omarchy-broadcast/`;
-- the optional WirePlumber drop-in, as an inactive example in `/usr/share/doc/omarchy-broadcast/examples/systemd/wireplumber.service.d/omarchy-broadcast.conf` ([Discovery by PipeWire](#discovery-by-pipewire));
-- the loopback's `modprobe.d` line of [loopback.md](loopback.md), as an inactive example, `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`, to copy into `/etc/modprobe.d`. It is not installed in `/usr/lib/modprobe.d`: only one `options v4l2loopback` line takes effect, and it would collide with one of your own.
-
-The other modules are packages of their own, built from the same `PKGBUILD`: `omarchy-broadcast-maxine-vfx-git`, `-maxine-ar-git`, `-maxine-afx-git` and `-onnx-git` ([maxine.md](maxine.md#the-maxine-module), [onnx.md](onnx.md), [../modules.md](../modules.md)). Each depends on the module ABI that the core provides (`omarchy-broadcast-module-abi`, a range: [../modules.md](../modules.md#packaging-a-module)). The Maxine SDKs need no drop-in: the daemon applies the SDK package's environment to itself at start ([maxine.md](maxine.md#3-the-sdk-environment)).
-
-**Dependencies.**
-
-- Required: `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`).
-- Optional, for the GPU path and the Maxine modules: `nvidia-utils` and `cuda` (NVRTC, used by GStreamer's CUDA converters). The daemon opens them at run time. See [Without CUDA or without an NVIDIA GPU](#without-cuda-or-without-an-nvidia-gpu). The Maxine video and AR module packages depend on `cuda`, and the Maxine SDK packages on `nvidia-utils`.
-- Optional: `ffmpeg`. The daemon runs it, at low priority, to convert an animated GIF, WebP or APNG at import and to make the poster of an imported video. On a machine without an NVIDIA GPU it is also the program of the command that converts a video the CPU cannot play ([Playing a video without an NVIDIA GPU](#playing-a-video-without-an-nvidia-gpu)); the daemon never runs that command. The bundled video loops need none of it, and with an NVIDIA GPU a video plays as it is ([../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md)).
-- The NVIDIA Maxine SDKs are never part of the packages. Each Maxine module package depends on the SDK package of its own (`maxine-vfx-sdk-local`, `maxine-ar-sdk-local` or `maxine-afx-sdk-local`). You build it yourself from the omarchy-nvidia-sdks repository and install it as in [maxine.md](maxine.md).
-
-### Per-user install from a checkout
-
-1. From the repository root, run the script. It needs no root and refuses to run as root.
-
-   ```sh
-   scripts/install-user.sh
-   ```
-
-2. Load the unit and start the service:
-
-   ```sh
-   systemctl --user daemon-reload
-   systemctl --user enable --now omarchy-broadcastd
-   ```
-
-The script builds the release binaries and installs:
-
-- `omarchy-broadcastd` and `omarchy-broadcast` in `${XDG_BIN_HOME:-~/.local/bin}`;
-- the unit in `${XDG_DATA_HOME:-~/.local/share}/systemd/user/`, with `ExecStart=` pointing at the installed daemon;
-- the D-Bus activation file in `${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/`;
-- the modules, each as a library in `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/` and a manifest in `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/`, whose `library` line names the installed library:
-  - the NVIDIA Maxine video module (`libobc_module_maxine.so`, `maxine-vfx.toml`);
-  - the NVIDIA Maxine AR module (`libobc_module_maxine_ar.so`, `maxine-ar.toml`);
-  - the open-model cut-out module (`libobc_module_onnx.so`, `onnx.toml`);
-- a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/`. It lists every path written (the modules' libraries and manifests included) and the sha256 of each binary and of each module library.
-
-The Maxine modules are built and installed whether or not the Maxine SDK is present. Without the SDK the daemon lists the module greyed out, with the reason. The open-model cut-out module is installed without ONNX Runtime and without models: the daemon lists it as "model not installed" until the four model files are in `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/models/onnx`. Set `OBC_ONNX_MODELS_DIR` to a directory that holds them, and the script installs them once their sha256 match the module's catalogue ([../../crates/obc-module-onnx/README.md](../../crates/obc-module-onnx/README.md)).
-
-The script does not install the SDKs, the os-release shim or any drop-in; [maxine.md](maxine.md) describes them. An older version of the script installed a shim in `~/.local/lib/omarchy-broadcast/`. A reinstall or `--uninstall` removes it.
-
-**Behaviour.**
-
-- It marks every text file it writes. It overwrites or removes a file only if it carries that mark. For a binary, a module library included, it does so only if the manifest lists it with the checksum on disk. It stops before changing anything if a target path holds another file. Running it again updates its own install.
-- A Maxine manifest at `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-vfx.toml` that it did not write has no mark, so the script refuses it. An example is the hand-made copy of the manual recipe in [maxine.md](maxine.md). Remove that file and the library its `library` line names, then run the script again. This applies to `--uninstall` as well.
-- For an install, the data directory must be an absolute path made only of letters, digits and `._/@+-`. Its path is written into the Maxine manifest and, with `--mic`, into the microphone's unit. Otherwise the script exits with status 2.
-- It runs no `systemctl` command and enables nothing. It prints the next steps.
-- A running daemon never reloads a module library. After a run that rebuilt a module, restart the daemon:
-
-  ```sh
-  systemctl --user restart omarchy-broadcastd
-  ```
-
-- It does not install the udev rule for the MX Brio, which needs root ([The udev rule for the MX Brio](#the-udev-rule-for-the-mx-brio)), nor the WirePlumber drop-in. The Omarchy bar plugin is a separate project (the omarchy-broadcast-plugin repository).
-- It warns when a unit in `~/.config/systemd/user` exists, because that location takes precedence ([Which unit is used](#which-unit-is-used)).
-
-**Options.**
-
-| Option | Effect |
-|---|---|
-| `--mic` | Also installs the optional noise-removed microphone ([microphone.md](microphone.md)) |
-| `--audio` | Also installs the microphone with audio modules, the alternative to `--mic`; the script refuses both in one run ([microphone.md](microphone.md)) |
-| `--dry-run` | Prints every action and changes nothing |
-| `--no-build` | Installs the binaries and the module libraries already in `${CARGO_TARGET_DIR:-target}/release` |
-| `--uninstall` | Removes what the script installed, the modules' libraries and manifests included |
-| `--help` | Shows the usage |
-
-**Exit status.** 0 done. 1 refused (a target path holds a file the script did not install, or the unit is still enabled on `--uninstall`) or the build failed. 2 usage error or unusable environment.
-
-### Manual install
-
-1. Install the daemon and the CLI into `~/.cargo/bin`, from the repository root:
-
-   ```sh
-   cargo install --path crates/omarchy-broadcastd
-   cargo install --path crates/omarchy-broadcast
-   ```
-
-2. Install the unit file with `ExecStart=` rewritten. The file in `dist/` names `/usr/bin/omarchy-broadcastd`, the path of the package. Copied unchanged after `cargo install`, the service fails to start (status 203/EXEC).
-
-   ```sh
-   mkdir -p ~/.config/systemd/user
-   sed 's|^ExecStart=/usr/bin/|ExecStart=%h/.cargo/bin/|' \
-       dist/systemd/omarchy-broadcastd.service \
-       > ~/.config/systemd/user/omarchy-broadcastd.service
-   ```
-
-3. Optional, D-Bus activation: install the activation file. A command such as `omarchy-broadcast on` then starts the service if it is not running ([Start the daemon](#start-the-daemon)).
-
-   ```sh
-   install -Dm644 dist/dbus-1/services/br.com.dias.OmarchyBroadcast.service \
-       ~/.local/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service
-   ```
-
-4. Optional, discovery through PipeWire: install a drop-in that orders WirePlumber after the daemon ([Discovery by PipeWire](#discovery-by-pipewire)). In a checkout it is `dist/systemd/wireplumber.service.d/omarchy-broadcast.conf`. The package ships the same file as an example at `/usr/share/doc/omarchy-broadcast/examples/systemd/wireplumber.service.d/omarchy-broadcast.conf`. The same drop-in applies to the other routes; the package does not install it.
-
-   ```sh
-   install -Dm644 dist/systemd/wireplumber.service.d/omarchy-broadcast.conf \
-       ~/.config/systemd/user/wireplumber.service.d/omarchy-broadcast.conf
-   ```
-
-5. Load the units and start the service now and at every login:
-
-   ```sh
-   systemctl --user daemon-reload
-   systemctl --user enable --now omarchy-broadcastd
-   ```
-
-   If you enabled the service earlier from an older copy of the unit, run `systemctl --user reenable omarchy-broadcastd` so that `default.target` wants it.
+The install steps, the package choices and the install routes are in [INSTALL.md](../../INSTALL.md). Do them first, then return here to run and configure the daemon. The manual route ([Manual install](../../INSTALL.md#manual-install)) needs a rewritten `ExecStart=` in the unit file.
 
 ## Start the daemon
 
-`systemctl --user enable --now omarchy-broadcastd` starts the daemon now and at every login. Each install route above ends with it.
+`systemctl --user enable --now omarchy-broadcastd` starts the daemon now and at every login. Each install route in [INSTALL.md](../../INSTALL.md) ends with it.
 
 To start the daemon now without enabling it, use D-Bus activation:
 
@@ -227,7 +34,7 @@ To start the daemon now without enabling it, use D-Bus activation:
 omarchy-broadcast start
 ```
 
-This starts the service through its D-Bus activation file, if it is not running, and prints the status. It changes no state: the daemon restores what it saved and never turns the camera on by itself. The camera opens when an application uses it. The Arch package and the per-user install ship the activation file; the manual install has it as the optional step 3 ([dbus-api.md](../dbus-api.md#service-presence-and-activation)).
+This starts the service through its D-Bus activation file, if it is not running, and prints the status. It changes no state: the daemon restores what it saved and never turns the camera on by itself. The camera opens when an application uses it. The Arch package and the per-user install ship the activation file; the manual install has it as the optional step 3 ([INSTALL.md](../../INSTALL.md#manual-install)) ([dbus-api.md](../dbus-api.md#service-presence-and-activation)).
 
 Which commands start the daemon:
 
@@ -250,7 +57,7 @@ If `status` shows an `Error:` line, see Troubleshooting.
 | Symptom | Cause | Fix |
 |---|---|---|
 | The daemon is in the state `error` and retries every 2 s | The v4l2loopback device with the label "Omarchy Broadcast" is missing | Set it up as in [loopback.md](loopback.md) |
-| The service fails with status 203/EXEC | The unit names `/usr/bin/omarchy-broadcastd`, but the daemon is in `~/.cargo/bin` | Rewrite `ExecStart=` ([Manual install](#manual-install), step 2) |
+| The service fails with status 203/EXEC | The unit names `/usr/bin/omarchy-broadcastd`, but the daemon is in `~/.cargo/bin` | Rewrite `ExecStart=` ([Manual install](../../INSTALL.md#manual-install), step 2) |
 | An old daemon keeps starting after you installed the package | A copy of the unit in `~/.config/systemd/user` shadows the packaged one | See [Which unit is used](#which-unit-is-used) |
 | The unit is `failed` after repeated crashes | systemd's start limit: 5 starts within 60 s | Run `systemctl --user reset-failed omarchy-broadcastd`, then start it ([Restarts and crashes](#restarts-and-crashes)) |
 | The daemon exits with status 3 and is not restarted | Another instance already owns the bus name | Stop the other instance, then start the service |
@@ -280,37 +87,13 @@ systemctl --user cat omarchy-broadcastd
 
 ## Stop, disable, uninstall
 
-1. Stop and disable the service, on every route:
+Stop and disable the service, on every install route:
 
-   ```sh
-   systemctl --user disable --now omarchy-broadcastd
-   ```
+```sh
+systemctl --user disable --now omarchy-broadcastd
+```
 
-2. Remove the files, depending on how you installed:
-
-   - **Arch package:** `sudo pacman -R omarchy-broadcast-git`, or `sudo pacman -R omarchy-broadcast-bin` for the prebuilt package. Remove any module package first, because it depends on the core. This removes the udev rule too. Remove any drop-in you copied from the examples (the WirePlumber one). A Maxine drop-in copied for an earlier version is not needed any more ([maxine.md](maxine.md#3-the-sdk-environment)). The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
-   - **Per-user install:** run `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed, the modules' libraries and manifests among them. It refuses while the unit is still enabled, so run the command above first. A hand-made Maxine manifest stops it too; remove the files named in [maxine.md](maxine.md#8-uninstall) first.
-   - **Manual install:**
-
-     ```sh
-     rm ~/.config/systemd/user/omarchy-broadcastd.service
-     rm -f ~/.local/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service
-     rm -f ~/.config/systemd/user/wireplumber.service.d/omarchy-broadcast.conf
-     cargo uninstall omarchy-broadcastd omarchy-broadcast
-     ```
-
-3. Reload the units:
-
-   ```sh
-   systemctl --user daemon-reload
-   ```
-
-4. On the per-user and manual routes, also remove the udev rule if you copied it:
-
-   ```sh
-   sudo rm /etc/udev/rules.d/70-omarchy-broadcast-mx-brio.rules
-   sudo udevadm control --reload
-   ```
+Removing the files depends on how you installed: see [Uninstall](../../INSTALL.md#uninstall).
 
 ## Optional setup
 
@@ -338,7 +121,7 @@ Keep the `70-` prefix: the file name must sort before `73-seat-late.rules`, wher
 
 WirePlumber probes video devices when it starts. A loopback device that has no writer at that moment is recorded as output-only and not probed again. Applications that list cameras through PipeWire (the camera portal, OBS's PipeWire source, browsers using PipeWire) then do not show it. Two remedies:
 
-- Install the drop-in ([Manual install](#manual-install), step 4). It starts WirePlumber after the daemon is ready. Run `systemctl --user daemon-reload` after installing it, and restart WirePlumber once for the current session.
+- Install the drop-in ([Manual install](../../INSTALL.md#manual-install), step 4). It starts WirePlumber after the daemon is ready. Run `systemctl --user daemon-reload` after installing it, and restart WirePlumber once for the current session.
 - Without the drop-in, or after you restarted the daemon by hand, restart WirePlumber while the daemon runs:
 
   ```sh
@@ -593,7 +376,7 @@ Add `-v` to `ExecStart` for debug output (consumer counts, teardown times). Exit
 
 ## Publishing to the AUR
 
-This part is for maintainers. The AUR holds two recipes of the split package ([From the AUR](#from-the-aur)): the source one, pkgbase `omarchy-broadcast-git`, and the prebuilt one, pkgbase `omarchy-broadcast-bin` ([The prebuilt packages](#the-prebuilt-packages-omarchy-broadcast-bin)). This section covers the source one first.
+This part is for maintainers. The AUR holds two recipes of the split package ([Prebuilt or built from source](../../INSTALL.md#prebuilt-or-built-from-source)): the source one, pkgbase `omarchy-broadcast-git`, and the prebuilt one, pkgbase `omarchy-broadcast-bin` ([The prebuilt packages](#the-prebuilt-packages-omarchy-broadcast-bin)). This section covers the source one first.
 
 The AUR copy of `packaging/arch/PKGBUILD` differs from it only in where it builds from. It clones `https://github.com/rsd/omarchy-broadcast.git` instead of the local checkout, and its header comment says so. `scripts/aur.sh` makes that copy:
 

@@ -16,7 +16,7 @@ systemctl --user restart omarchy-broadcastd
 omarchy-broadcast modules
 ```
 
-`omarchy-broadcast-onnx-bin` is the prebuilt twin of `omarchy-broadcast-onnx-git` and works with either kind of core ([daemon.md](daemon.md#from-the-aur)). The module package pulls in the default model. The `modules` output lists the module with its stage `background`, or with the reason it cannot run.
+`omarchy-broadcast-onnx-bin` is the prebuilt twin of `omarchy-broadcast-onnx-git` and works with either kind of core ([INSTALL.md](../../INSTALL.md#prebuilt-or-built-from-source)). The module package pulls in the default model. The `modules` output lists the module with its stage `background`, or with the reason it cannot run.
 
 On an NVIDIA GPU, or for an Intel NPU or GPU, install the runtime and provider packages of sections 1 and 2 instead of `onnxruntime-cpu`.
 
@@ -245,7 +245,7 @@ To get TensorRT back after a switch from Maxine, restart the daemon (`systemctl 
 
 ### From the AUR or the Arch package
 
-With an AUR helper, install `omarchy-broadcast-onnx-git`, or `omarchy-broadcast-onnx-bin`, the prebuilt package with the same files. Either works with the core of either kind ([daemon.md](daemon.md#from-the-aur)). With no NVIDIA GPU, use `yay -S onnxruntime-cpu omarchy-broadcast-onnx-git` ([above](#using-it-on-a-machine-without-an-nvidia-gpu)).
+With an AUR helper, install `omarchy-broadcast-onnx-git`, or `omarchy-broadcast-onnx-bin`, the prebuilt package with the same files. Either works with the core of either kind ([INSTALL.md](../../INSTALL.md#prebuilt-or-built-from-source)). With no NVIDIA GPU, use `yay -S onnxruntime-cpu omarchy-broadcast-onnx-git` ([above](#using-it-on-a-machine-without-an-nvidia-gpu)).
 
 The module is one package of the split build of `packaging/arch/PKGBUILD`, built with the core `omarchy-broadcast-git` and the other module packages. It depends on:
 

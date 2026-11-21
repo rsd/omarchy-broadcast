@@ -43,7 +43,7 @@ Building the package fetches the DeepFilterNet source from its upstream reposito
 
 ### With `scripts/install-user.sh --audio`
 
-From the repository root, `scripts/install-user.sh --audio` ([daemon.md](daemon.md#per-user-install-from-a-checkout)) builds and installs the same parts without root, under `~/.local`:
+From the repository root, `scripts/install-user.sh --audio` ([INSTALL.md](../../INSTALL.md#per-user-install-from-a-checkout)) builds and installs the same parts without root, under `~/.local`:
 
 - the worker in `${XDG_BIN_HOME:-~/.local/bin}`;
 - the plugin, the mic host's configuration (with the plugin's absolute path), and the library and manifest of the CPU module and of the Maxine audio effects module (which loads without the SDK), under `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/`;
@@ -536,7 +536,7 @@ The package enables nothing. Install the plugin package (above), then follow [En
 
 ### With `scripts/install-user.sh --mic`
 
-From the repository root, `scripts/install-user.sh --mic` (see [daemon.md](daemon.md#per-user-install-from-a-checkout)) also installs, without root:
+From the repository root, `scripts/install-user.sh --mic` (see [INSTALL.md](../../INSTALL.md#per-user-install-from-a-checkout)) also installs, without root:
 
 - the configurations in `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/pipewire/`;
 - the unit as `${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-mic@.service`, with `ExecStart=` pointing at that absolute configuration path.

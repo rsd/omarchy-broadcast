@@ -34,7 +34,7 @@ Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, 
 Before you start, you need:
 
 - an NVIDIA GPU of compute capability 7.5 or newer, and driver 570.26 or newer (section 1);
-- the core package `omarchy-broadcast-git` (or `omarchy-broadcast-bin`) installed and working ([daemon.md](daemon.md));
+- the core package `omarchy-broadcast-git` (or `omarchy-broadcast-bin`) installed and working ([INSTALL.md](../../INSTALL.md));
 - the SDK downloaded from NVIDIA with your own account (section 2).
 
 Then:
@@ -86,7 +86,7 @@ The module's settings are the `effect.*` settings of `omarchy-broadcast settings
 
 A manifest in `~/.local/share/omarchy-broadcast/modules.d` replaces the packaged one of the same id. A module library that is rebuilt later takes a daemon restart to load (libraries are never unloaded). A changed manifest only needs a reload.
 
-A checkout that was not installed with the script (the cargo route of [daemon.md](daemon.md#manual-install)) can take the module by hand, with the recipe below. The script refuses to replace a manifest written this way, so remove it first when you use the script later (section 8):
+A checkout that was not installed with the script (the cargo route of [INSTALL.md](../../INSTALL.md#manual-install)) can take the module by hand, with the recipe below. The script refuses to replace a manifest written this way, so remove it first when you use the script later (section 8):
 
 ```bash
 cargo build --release -p obc-module-maxine
