@@ -65,6 +65,7 @@ pub(crate) const P_TEMPORAL: &CStr = c"NvAR_Parameter_Config_Temporal";
 pub(crate) const P_GAZE_REDIRECT: &CStr = c"NvAR_Parameter_Config_GazeRedirect";
 pub(crate) const P_ENABLE_LOOK_AWAY: &CStr = c"NvAR_Parameter_Config_EnableLookAway";
 pub(crate) const P_LANDMARKS_SIZE: &CStr = c"NvAR_Parameter_Config_Landmarks_Size";
+pub(crate) const P_USE_CUDA_GRAPH: &CStr = c"NvAR_Parameter_Config_UseCudaGraph";
 pub(crate) const P_IN_IMAGE: &CStr = c"NvAR_Parameter_Input_Image";
 pub(crate) const P_IN_WIDTH: &CStr = c"NvAR_Parameter_Input_Width";
 pub(crate) const P_IN_HEIGHT: &CStr = c"NvAR_Parameter_Input_Height";
