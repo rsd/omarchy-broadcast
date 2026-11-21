@@ -36,6 +36,10 @@ use crate::bus::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Failure, READ_TIMEOUT};
 /// which may wait for D-Bus activation of the daemon.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Time allowed for `start` to activate the daemon and see it answer: the
+/// `TimeoutStartSec` of the packaged unit, which D-Bus activation runs.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Time allowed for `media import`, which waits for the daemon to check, hash
 /// and copy a video of up to 512 MiB and, for an animated GIF, WebP or APNG,
 /// to convert it with ffmpeg (the daemon bounds that at 120 s). It is the
@@ -53,6 +57,12 @@ Exit status:
   2  invalid command line
   3  omarchy-broadcastd is not running, or there is no D-Bus session bus
   4  any other D-Bus failure, a timeout, or a failed write to stdout
+
+`start` starts it through D-Bus activation, if it is not running, and prints what `status`
+prints. It changes no state: the daemon only restores what it saved (the enabled or privacy
+state, the camera, the effect) and never turns the camera on by itself; the camera opens
+when an application uses it. To start it at every login, use
+`systemctl --user enable --now omarchy-broadcastd`.
 
 `status`, `cameras`, `watch`, `preview`, `effect` without an effect, `controls` and
 `settings` without a subcommand, `modules list`, `modules info`, `modules profile` without
@@ -79,6 +89,17 @@ enum Command {
     /// Show the state, the active camera, consumers, output mode and error.
     Status {
         /// Print one JSON object (`"type":"snapshot"`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start the daemon through D-Bus activation, then show the status.
+    ///
+    /// Does nothing when it is already running. Starting changes no state:
+    /// the daemon restores what it saved and never turns the camera on by
+    /// itself. To start it at every login, run
+    /// `systemctl --user enable --now omarchy-broadcastd`.
+    Start {
+        /// Print one JSON object (`"type":"snapshot"`), as `status --json`.
         #[arg(long)]
         json: bool,
     },
@@ -546,6 +567,39 @@ async fn show(json: bool, view: View) -> u8 {
             }
             EXIT_OK
         }
+        Err(f) => report(&f, json),
+    }
+}
+
+/// `start`: when the daemon does not answer, asks the bus to start it
+/// (`StartServiceByName`), waits for it to answer (within
+/// [`START_TIMEOUT`]), then prints as `status` does.
+async fn start(json: bool) -> u8 {
+    let started = within(START_TIMEOUT, async {
+        let conn = bus::connect().await?;
+        match bus::fetch(&conn).await {
+            Err(f) if f.is_not_running() && !matches!(f, Failure::NoBus(_)) => {}
+            other => return other.map(|_| ()),
+        }
+        zbus::fdo::DBusProxy::new(&conn)
+            .await
+            .map_err(|e| bus::classify(&e, true))?
+            .start_service_by_name(obc_ipc::BUS_NAME.try_into().expect("valid bus name"), 0)
+            .await
+            .map_err(|e| bus::classify(&zbus::Error::from(e), true))?;
+        // The name is claimed by now; wait until the object answers.
+        loop {
+            match bus::fetch(&conn).await {
+                Err(f) if f.is_not_running() => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => return other.map(|_| ()),
+            }
+        }
+    })
+    .await;
+    match started {
+        Ok(()) => show(json, View::Status).await,
         Err(f) => report(&f, json),
     }
 }
@@ -1108,6 +1162,7 @@ async fn run(job: Job) -> u8 {
             None => media::run_list(kind.as_deref(), *json).await,
         },
         Job::Command(Command::Status { json }) => show(*json, View::Status).await,
+        Job::Command(Command::Start { json }) => start(*json).await,
         Job::Command(Command::Cameras { json }) => show(*json, View::Cameras).await,
         Job::Command(Command::Effect { json, .. }) => show(*json, View::Effect).await,
         Job::Command(Command::Watch { json }) => watch::run(*json).await,
