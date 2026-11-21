@@ -356,6 +356,122 @@ struct DlInfo {
 
 unsafe extern "C" {
     fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> c_int;
+    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const c_char) -> *mut std::ffi::c_void;
+}
+
+/// glibc's `RTLD_DEFAULT`: `dlsym` searches the global scope (the
+/// program and every library opened with `RTLD_GLOBAL`), then the
+/// caller's own dependencies.
+const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut();
+
+/// The address of `symbol` as a library loaded without `RTLD_GLOBAL`
+/// sees it first, and the absolute path of the file that defines it:
+/// `dlsym(RTLD_DEFAULT)` from the module, which is opened `RTLD_LOCAL`
+/// and has no dependency defining such a symbol. A library the module
+/// loads later, ONNX Runtime's TensorRT provider among them, binds an
+/// unversioned symbol to this definition before its own dependencies'.
+/// `None` when the global scope does not define it.
+fn global_symbol(symbol: &CStr) -> Option<(*mut std::ffi::c_void, PathBuf)> {
+    // SAFETY: `symbol` is NUL-terminated; the address found is only
+    // passed to `dladdr`, never called here.
+    unsafe {
+        let addr = dlsym(RTLD_DEFAULT, symbol.as_ptr());
+        if addr.is_null() {
+            return None;
+        }
+        let mut info = DlInfo {
+            fname: std::ptr::null(),
+            fbase: std::ptr::null_mut(),
+            sname: std::ptr::null(),
+            saddr: std::ptr::null_mut(),
+        };
+        if dladdr(addr, &mut info) == 0 || info.fname.is_null() {
+            return None;
+        }
+        let path = PathBuf::from(
+            std::ffi::OsStr::from_encoded_bytes_unchecked(CStr::from_ptr(info.fname).to_bytes())
+                .to_os_string(),
+        );
+        Some((addr, path))
+    }
+}
+
+/// The TensorRT the process's global scope holds, if any: the version
+/// its `getInferLibVersion` gives (`10.9.0`) and its file. The Maxine
+/// modules load their SDK's own TensorRT there (`RTLD_GLOBAL`, so that
+/// the SDK finds its libraries by name).
+///
+/// TensorRT's entry points (`createInferBuilder_INTERNAL`,
+/// `getInferLibVersion`, the parser's) are unversioned, and every major
+/// release has the same names. ONNX Runtime's TensorRT provider, loaded
+/// after such a TensorRT, binds them to it rather than to the
+/// `libnvinfer` it links: a builder of TensorRT 10 refuses the provider's
+/// TensorRT 11 version and gives none, and the provider dereferences it
+/// (`SIGSEGV` in `libonnxruntime_providers_tensorrt.so`). Read fresh on
+/// every call: another module may load its TensorRT at any time.
+pub fn global_tensorrt() -> Option<(String, PathBuf)> {
+    let (addr, path) = global_symbol(c"getInferLibVersion")?;
+    // SAFETY: `getInferLibVersion` takes nothing and returns an int; the
+    // library defining it is loaded (the global scope holds it).
+    let get: unsafe extern "C" fn() -> c_int = unsafe { std::mem::transmute(addr) };
+    Some((tensorrt_version_string(unsafe { get() }), path))
+}
+
+/// Whether ONNX Runtime's TensorRT provider (beside `library`) is loaded
+/// in the process with its symbols bound already: its file asks for
+/// immediate binding ([`binds_now`]), so its TensorRT entry points were
+/// bound when it was loaded, to the TensorRT it was loaded with, and a
+/// TensorRT that enters the global scope after it no longer changes what
+/// it calls. A provider bound lazily could still bind them to the later
+/// one, and counts as not bound.
+pub fn tensorrt_provider_bound(library: &Path) -> bool {
+    let dir = library.parent().unwrap_or(Path::new("/"));
+    let path = dir.join("libonnxruntime_providers_tensorrt.so");
+    // SAFETY: opens only a library already loaded (its initialisers have
+    // run) and takes another reference to it, dropped at once.
+    let loaded = unsafe {
+        libloading::os::unix::Library::open(
+            Some(&path),
+            libloading::os::unix::RTLD_LAZY | RTLD_NOLOAD,
+        )
+    }
+    .is_ok();
+    loaded && std::fs::read(&path).is_ok_and(|b| binds_now(&b))
+}
+
+/// Whether the ELF64 little-endian shared library `elf` asks the loader
+/// to bind every symbol at load time: `DT_BIND_NOW`, `DF_BIND_NOW` in
+/// `DT_FLAGS` or `DF_1_NOW` in `DT_FLAGS_1` in its dynamic section. False
+/// for anything that cannot be read as such.
+pub fn binds_now(elf: &[u8]) -> bool {
+    let u = |at: usize, n: usize| -> Option<u64> {
+        let b = elf.get(at..at.checked_add(n)?)?;
+        Some(b.iter().rev().fold(0, |v, &x| (v << 8) | u64::from(x)))
+    };
+    // ELF magic, ELFCLASS64, ELFDATA2LSB.
+    if elf.get(..6) != Some(b"\x7fELF\x02\x01".as_slice()) {
+        return false;
+    }
+    let dynamic = (|| {
+        let (phoff, phentsize, phnum) = (u(0x20, 8)?, u(0x36, 2)?, u(0x38, 2)?);
+        (0..phnum).find_map(|i| {
+            let ph = usize::try_from(phoff + i * phentsize).ok()?;
+            // PT_DYNAMIC: its p_offset and p_filesz.
+            (u(ph, 4)? == 2).then_some((u(ph + 8, 8)?, u(ph + 32, 8)?))
+        })
+    })();
+    let Some((off, size)) = dynamic else {
+        return false;
+    };
+    (0..size / 16).any(|i| {
+        let at = usize::try_from(off + i * 16).unwrap_or(usize::MAX);
+        match (u(at, 8), u(at.saturating_add(8), 8)) {
+            (Some(24), _) => true,                      // DT_BIND_NOW
+            (Some(30), Some(v)) => v & 0x8 != 0,        // DT_FLAGS, DF_BIND_NOW
+            (Some(0x6fff_fffb), Some(v)) => v & 1 != 0, // DT_FLAGS_1, DF_1_NOW
+            _ => false,
+        }
+    })
 }
 
 /// The absolute path of the file the already-loaded library `name` was
@@ -772,6 +888,80 @@ mod tests {
         );
         assert_eq!(loaded_file("libobc-no-such-library.so.0", "malloc"), None);
         assert_eq!(loaded_file("libc.so.6", "obc_no_such_symbol"), None);
+    }
+
+    #[test]
+    fn a_global_symbol_is_found_with_the_file_that_defines_it() {
+        // libc is in every process's global scope.
+        let (addr, file) = global_symbol(c"malloc").expect("malloc is global");
+        assert!(!addr.is_null());
+        assert!(
+            file.is_absolute()
+                && file
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("libc"),
+            "{}",
+            file.display()
+        );
+        assert!(global_symbol(c"obc_no_such_symbol").is_none());
+    }
+
+    #[test]
+    fn no_tensorrt_is_global_in_a_process_that_loaded_none() {
+        // The test process loads TensorRT, if ever, without `RTLD_GLOBAL`
+        // (`tensorrt_version`), so the global scope has none.
+        assert_eq!(global_tensorrt(), None);
+    }
+
+    #[test]
+    fn a_provider_not_loaded_is_not_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libonnxruntime.so.1");
+        assert!(!tensorrt_provider_bound(&lib));
+        // Even when its file is there.
+        std::fs::write(dir.path().join("libonnxruntime_providers_tensorrt.so"), b"").unwrap();
+        assert!(!tensorrt_provider_bound(&lib));
+    }
+
+    /// A minimal ELF64 little-endian file: the header, one `PT_DYNAMIC`
+    /// program header, and a dynamic section of `entries` then `DT_NULL`.
+    fn elf_with_dynamic(entries: &[(u64, u64)]) -> Vec<u8> {
+        let mut e = vec![0u8; 64 + 56];
+        e[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        e[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        e[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        e[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        let size = (entries.len() as u64 + 1) * 16;
+        e[64..68].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        e[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        e[96..104].copy_from_slice(&size.to_le_bytes()); // p_filesz
+        for &(tag, val) in entries.iter().chain([(0, 0)].iter()) {
+            e.extend_from_slice(&tag.to_le_bytes());
+            e.extend_from_slice(&val.to_le_bytes());
+        }
+        e
+    }
+
+    #[test]
+    fn immediate_binding_is_read_from_the_dynamic_section() {
+        assert!(binds_now(&elf_with_dynamic(&[(1, 5), (24, 0)])));
+        assert!(binds_now(&elf_with_dynamic(&[(30, 0x8)])));
+        assert!(binds_now(&elf_with_dynamic(&[(0x6fff_fffb, 0x1)])));
+        // Lazy: other flags only, or none.
+        assert!(!binds_now(&elf_with_dynamic(&[
+            (30, 0x10),
+            (0x6fff_fffb, 0x8)
+        ])));
+        assert!(!binds_now(&elf_with_dynamic(&[(1, 5)])));
+        assert!(!binds_now(b""));
+        assert!(!binds_now(b"\x7fELF\x02\x01"));
+        // The installed provider, when there, is linked with BIND_NOW.
+        let p = Path::new("/usr/lib/libonnxruntime_providers_tensorrt.so");
+        if let Ok(b) = std::fs::read(p) {
+            assert!(binds_now(&b), "{}", p.display());
+        }
     }
 
     #[test]
