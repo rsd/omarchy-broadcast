@@ -1,5 +1,4 @@
-//! Who holds the virtual camera (`docs/adr/0011-daemon-lifecycle-and-dbus-api.md`,
-//! "Consumer detection").
+//! Who holds the virtual camera.
 //!
 //! An inotify watch on the loopback node (`IN_OPEN`, `IN_CLOSE_WRITE`,
 //! `IN_CLOSE_NOWRITE`) says *when* to look; [`count_holders`] says *who*:

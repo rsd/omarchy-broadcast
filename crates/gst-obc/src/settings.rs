@@ -92,7 +92,7 @@ pub fn parse_effect(s: &str) -> Result<EffectKind, String> {
 /// its parameters, whose keys and meaning are the backend's
 /// (`obc_backend`, "Stages and their parameters").
 ///
-/// A stage hides nothing (`docs/adr/0018-video-noise-removal.md`), so it
+/// A stage hides nothing, so it
 /// never changes what the privacy rules show: a failure of the stage alone
 /// drops it and leaves the effect running ([`EffectStatus`] of the effect
 /// unchanged; the element's status of the stage says why).
@@ -633,7 +633,7 @@ pub(crate) enum FrameAction {
     Process,
 }
 
-/// The decision of the privacy rules (ADR-0012): the raw input is shown only
+/// The decision of the privacy rules: the raw input is shown only
 /// for `none`, or after a failure with `on-failure=none` (and, through
 /// [`decide_frame`], while an effect turned on mid-stream loads with the
 /// room already on screen, and with `on-failure=none` while any effect
@@ -647,7 +647,7 @@ pub(crate) enum FrameAction {
 /// any. `stages` says a stage is effectively requested (requested, and not
 /// failed). The stages hide nothing, so they change nothing for blur and
 /// replace; `none` with one is processed once loaded and passed through
-/// until then, and after the stages failed (ADR-0018).
+/// until then, and after the stages failed.
 pub(crate) fn decide(
     kind: EffectKind,
     status: &EffectStatus,

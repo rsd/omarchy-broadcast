@@ -1,5 +1,5 @@
 //! The Output stage: one long-lived pipeline per sink, paced by its own
-//! clock (`docs/adr/0009-ingest-process-output.md`).
+//! clock.
 //!
 //! ```text
 //! appsrc        <canonical caps>,framerate=<contract>  is-live format=time
@@ -93,7 +93,7 @@
 //! source (the first after a source switch, and the first of the first
 //! source) with [`gst_obc::NEW_SOURCE_FLAG`], and clears the flag on every
 //! other buffer, so the effect element resets the temporal state of its
-//! backend (the denoise stage's, `docs/adr/0018-video-noise-removal.md`)
+//! backend (the denoise stage's)
 //! instead of blending two cameras. `DISCONT` cannot carry this: the clock
 //! sets it after every skipped tick too.
 //!

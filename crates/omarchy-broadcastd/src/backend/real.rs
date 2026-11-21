@@ -20,7 +20,7 @@
 //! models (the effect's and the noise removal's) are loaded only while they
 //! are requested and the session runs; stopping the session unloads them
 //! before the CUDA context goes
-//! (`docs/adr/0012-video-effects-and-maxine-backend.md`, "Lifecycle").
+//!.
 //!
 //! **Parking.** Once a session has run, CUDA stays initialised in the
 //! process and the GPU cannot power down, even with every context gone.
@@ -1490,7 +1490,7 @@ impl MediaBackend for GstBackend {
         r.counts = counts;
         let window = r.live.take_window();
         let latency = window.latency_p50_ms.unwrap_or(Stats::NOT_MEASURABLE);
-        // What the latency depends on (ADR-0010): the camera's own rate and
+        // What the latency depends on: the camera's own rate and
         // whether the output clock is phase-locked to it. Debug only (`-v`).
         let out = r.session.output().counts();
         crate::debug!(

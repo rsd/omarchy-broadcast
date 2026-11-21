@@ -808,7 +808,7 @@ pub trait MediaBackend: Send + 'static {
 
     /// Opens the library of module `entry` with its configuration `config`
     /// (JSON), and probes it: its stages' availability (the filesystem
-    /// only, ADR 0006: no CUDA call) and its settings. `Err` is the reason
+    /// only: no CUDA call) and its settings. `Err` is the reason
     /// the module is unavailable.
     fn open_module(
         &mut self,

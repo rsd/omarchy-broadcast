@@ -1,8 +1,5 @@
-//! The `obceffect` element: the effect of the Process stage
-//! (`docs/adr/0012-video-effects-and-maxine-backend.md`), and its optional
-//! stackable stages (`docs/adr/0018-video-noise-removal.md`,
-//! `docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md`),
-//! such as video noise removal and relighting of the person.
+//! The `obceffect` element: the effect of the Process stage, and its optional
+//! stackable stages, such as video noise removal and relighting of the person.
 //!
 //! ```text
 //! sink, src: video/x-raw(memory:CUDAMemory), format=NV12   (same caps both sides)

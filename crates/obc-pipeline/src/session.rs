@@ -1,5 +1,5 @@
 //! A running stream: one output and the ingest currently feeding it, with
-//! source switching (`docs/adr/0009-ingest-process-output.md`).
+//! source switching.
 //!
 //! A switch stops the current ingest (camera closed, its controls restored)
 //! and only then starts the next one, so the same camera can be reopened in

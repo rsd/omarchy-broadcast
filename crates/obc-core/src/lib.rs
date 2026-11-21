@@ -24,8 +24,7 @@ pub mod config_schema;
 pub mod modules;
 pub mod sdk_env;
 
-/// Card label of the dedicated virtual camera (see
-/// `docs/adr/0004-v4l2loopback-first.md`).
+/// Card label of the dedicated virtual camera.
 pub const DEFAULT_SINK_LABEL: &str = "Omarchy Broadcast";
 
 /// Errors produced while parsing or validating the shared types.
@@ -272,8 +271,7 @@ impl FromStr for AspectPolicy {
     }
 }
 
-/// The video effect of the output (see
-/// `docs/adr/0012-video-effects-and-maxine-backend.md`).
+/// The video effect of the output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectMode {
@@ -546,8 +544,7 @@ impl FromStr for RelightLight {
 }
 
 /// What the output delivers, whatever feeds it: format, size, frame rate and
-/// colour range. Set by configuration and never derived from a source (see
-/// `docs/adr/0009-ingest-process-output.md`).
+/// colour range. Set by configuration and never derived from a source.
 ///
 /// Parsed from `WxH@FPS` (the format and range keep their defaults; set them
 /// separately). Both dimensions must be even: every output format is 4:2:0.

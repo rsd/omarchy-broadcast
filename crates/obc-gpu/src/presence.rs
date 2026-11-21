@@ -26,9 +26,7 @@
 //! device, and opening the driver library (or NVRTC, a compiler that knows
 //! no device) runs its initialisers only (as
 //! [`crate::park`] does to find its entry points). It is therefore safe while
-//! the process is parked and while a runtime-suspended GPU sleeps
-//! (`docs/adr/0006-on-demand-gpu-lifecycle.md`,
-//! `docs/adr/0017-cuda-checkpoint-parking.md`). The caller must not
+//! the process is parked and while a runtime-suspended GPU sleeps. The caller must not
 //! make a CUDA element (`gst::ElementFactory::make`) to answer step 5:
 //! loading the `nvcodec` plugin calls `cuInit`.
 //!

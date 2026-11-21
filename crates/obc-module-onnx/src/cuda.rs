@@ -320,11 +320,11 @@ pub fn gpu_sessions() -> usize {
 /// whose `cudaSetDevice` activates the device's primary context, and
 /// nothing releases it when the sessions go: it would outlive them, a
 /// context the daemon did not ask for (which keeps the GPU from being
-/// parked, ADR-0017). When the last of these is dropped, the primary
+/// parked). When the last of these is dropped, the primary
 /// context of [`ORT_DEVICE`] is reset (`cuDevicePrimaryCtxReset`), which
 /// frees what the runtime left in it and makes it inactive. That touches
 /// the primary context only: the frames' context (GStreamer's, made with
-/// `cuCtxCreate`, ADR-0012) and the contexts of other backends (Maxine's
+/// `cuCtxCreate`) and the contexts of other backends (Maxine's
 /// run in that same one) are other contexts and are left as they were.
 ///
 /// The count and the reset are under one lock, and a session is counted

@@ -172,8 +172,7 @@
 
 use std::collections::VecDeque;
 
-/// Phase lock parameters (see the module docs). The defaults and the
-/// reasons for them are in `docs/adr/0010-phase-locked-output-clock.md`.
+/// Phase lock parameters (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PhaseLockConfig {
     /// Lock the emission phase to the input. Off: the phase stays 0 and

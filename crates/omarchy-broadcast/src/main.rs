@@ -1,6 +1,5 @@
 //! `omarchy-broadcast`: the command-line remote control of `omarchy-broadcastd`,
-//! over the D-Bus interface `br.com.dias.OmarchyBroadcast1` (`docs/dbus-api.md`,
-//! ADR-0011). `--json` output is the contract of `docs/cli-json.md`.
+//! over the D-Bus interface `br.com.dias.OmarchyBroadcast1` (`docs/dbus-api.md`). `--json` output is the contract of `docs/cli-json.md`.
 
 mod bus;
 mod config;

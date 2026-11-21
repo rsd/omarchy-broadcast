@@ -3,7 +3,7 @@
 //! inspection and the loopback format check.
 //!
 //! The stream itself is two pipelines joined by a latest-frame slot
-//! (`docs/adr/0009-ingest-process-output.md`): one ingest pipeline per source
+//!: one ingest pipeline per source
 //! ([`crate::ingest`]) and one long-lived output pipeline
 //! ([`crate::output`]).
 //!
@@ -106,7 +106,7 @@ pub mod names {
     pub const FROM_BGR: &str = "from_bgr";
     /// Output, roundtrip process stage: the NV12 capsfilter after it.
     pub const PROCESS_CAPS: &str = "process_caps";
-    /// Output, Process stage: the `obceffect` element (ADR-0012).
+    /// Output, Process stage: the `obceffect` element.
     pub const EFFECT: &str = "effect";
 
     pub const CONSUMER_SRC: &str = "consumer_src";
@@ -166,7 +166,7 @@ pub enum PipelineError {
     #[error("CUDA: {0}")]
     Cuda(String),
     /// Effect settings that cannot be applied, or an output that has no
-    /// effect element (`docs/adr/0012-video-effects-and-maxine-backend.md`).
+    /// effect element.
     #[error("effect: {0}")]
     Effect(String),
     /// Module stages that cannot be built or applied, or an output that

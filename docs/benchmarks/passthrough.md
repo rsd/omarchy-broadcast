@@ -12,7 +12,7 @@
 | Added latency ≤ 1 frame (16.7 ms) versus reading the camera directly; method recorded | **PASS** | Worst p99 across all runs is 6.9 ms (roundtrip) and worst max is 8.0 ms. Through the loopback into a consumer, the worst max is 9.0 ms. The method is described [below](#latency-method). |
 | CPU % and GPU % recorded at steady state | **Recorded**, but GPU % is contaminated | CPU is 10 % of one core in passthrough and 22 % in roundtrip. Device-wide GPU % is dominated by another process; see the [GPU note](#gpu-note). |
 | Frames in `memory:CUDAMemory` between upload and the sink, with no CPU round-trip mid-pipeline | **PASS** | `caps.cuda_memory_between_upload_and_download = true` in every run. Every link from `cudaupload` to `cudadownload` is checked programmatically. The dot graph is [roundtrip-pipeline.dot](roundtrip-pipeline.dot). |
-| After teardown, the dGPU reaches `suspended` | **Not judged here** (see [dgpu-idle.md](dgpu-idle.md)), but see the [teardown finding](#teardown-finding-adr-0006) | GStreamer destroys its CUDA context at teardown. However, the process keeps 7 `/dev/nvidia*` fds until it exits. |
+| After teardown, the dGPU reaches `suspended` | **Not judged here** (see [dgpu-idle.md](dgpu-idle.md)), but see the [teardown finding](#teardown-finding) | GStreamer destroys its CUDA context at teardown. However, the process keeps 7 `/dev/nvidia*` fds until it exits. |
 
 **Camera caveat.** The reference camera had `exposure_dynamic_framerate=1`, which is not the camera default (`0`). With it on, the camera lowers its own frame rate in dim light.
 - Run `passthrough-30s-dynamic-framerate.json` shows this: only 23.4 fps arrived, with 1-second windows down to 15. All 1108 missing frames were missing at the camera's src pad (PTS gaps). The pipeline dropped none.
@@ -119,7 +119,7 @@ A GPU-heavy 3D workload (three processes, listed under `gpu.other_gpu_pids` in e
 
 A re-run on an idle GPU would give the uncontended figures. The commands above are repeatable.
 
-### Teardown finding (ADR-0006)
+### Teardown finding
 
 What happens at teardown:
 - **GStreamer releases its CUDA context.** At NULL, `GST_DEBUG=cudacontext:6` logs `gst_cuda_context_finalize: Destroying CUDA context`.
@@ -127,7 +127,7 @@ What happens at teardown:
 - **The process still holds `/dev/nvidia*` handles.** Right after teardown, and still at the end of the 5 s linger, it held 7 of them: `/dev/nvidiactl`, `/dev/nvidia-uvm` ×2 and `/dev/nvidia0` ×4. `libcuda.so` also stays mapped.
 - **This happens with `--no-gpu-stats` too, so the handles come from `libcuda`, not NVML.** The CUDA driver opens them at `cuInit` (the GStreamer nvcodec plugin calls it) and never closes them before process exit; there is no `cuDeinit`.
 - **`runtime_status` read `active` during the linger.** That reading is not meaningful while another workload is keeping the dGPU awake.
-- **[dgpu-idle.md](dgpu-idle.md) addresses** whether these handles alone block runtime D3 on driver 615.78. If they do, ADR-0006's "idle = zero CUDA contexts" needs a process boundary: the daemon would run the GPU pipeline in a child process that exits at teardown.
+- **[dgpu-idle.md](dgpu-idle.md) addresses** whether these handles alone block runtime D3 on driver 615.78. If they do, the rule "idle = zero CUDA contexts" needs a process boundary: the daemon would run the GPU pipeline in a child process that exits at teardown.
 - **How to reproduce:** `--linger-after-teardown N` keeps the process alive after teardown, with no pipeline and no NVML. The JSON field `teardown.nvidia_fds_after_teardown` lists the handles.
 
 ## Latency method

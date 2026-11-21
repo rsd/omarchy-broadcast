@@ -1,6 +1,4 @@
-//! The daemon's configuration file and its runtime state file (see
-//! `docs/adr/0011-daemon-lifecycle-and-dbus-api.md`, "Configuration and
-//! state").
+//! The daemon's configuration file and its runtime state file.
 //!
 //! - [`Config`]: `$XDG_CONFIG_HOME/omarchy-broadcast/config.toml`, what the user
 //!   decides. Versioned (`version = 1`), every key optional, unknown keys
@@ -288,8 +286,7 @@ impl Default for LifecycleConfig {
     }
 }
 
-/// `[effect]`: the video effect (see
-/// `docs/adr/0012-video-effects-and-maxine-backend.md`). Also the type of
+/// `[effect]`: the video effect. Also the type of
 /// the effective settings the daemon runs with, once the state file's
 /// overrides are applied ([`RuntimeState::effect_over`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

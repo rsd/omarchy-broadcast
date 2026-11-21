@@ -1,4 +1,4 @@
-//! The effect of the Process stage (`docs/adr/0012-video-effects-and-maxine-backend.md`):
+//! The effect of the Process stage:
 //! the settings, the backend it runs on, and the `obceffect` element that
 //! applies it at the head of the output pipeline.
 //!
@@ -6,7 +6,7 @@
 //! set holds one `obceffect` element for its whole life; the effect, the blur
 //! strength, the background, the fallback and the stackable stages
 //! ([`EffectSettings::stages`]: each a [`StageId`] with its parameters, for
-//! example noise removal, `docs/adr/0018-video-noise-removal.md`, and
+//! example noise removal and
 //! relighting) change on it while it streams
 //! ([`Output::set_effect`](crate::Output::set_effect)), without
 //! renegotiating caps. `EffectSettings::default()` (`none`, no stage)

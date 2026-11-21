@@ -1,5 +1,5 @@
 //! The Ingest stage: one pipeline per source, from the camera to canonical
-//! frames in the output's slot (`docs/adr/0009-ingest-process-output.md`).
+//! frames in the output's slot.
 //!
 //! ```text
 //! v4l2src device=<camera> io-mode=mmap                       corrupt-frame guard on src

@@ -1,6 +1,5 @@
 //! D-Bus interface `br.com.dias.OmarchyBroadcast1` (zbus), shared by the daemon
-//! and its clients (see `docs/adr/0005-dbus-zbus-control-plane.md` and
-//! `docs/adr/0011-daemon-lifecycle-and-dbus-api.md`; the reference for
+//! and its clients (the reference for
 //! client authors is `docs/dbus-api.md`).
 //!
 //! This crate holds the names, the value types carried on the bus, the error

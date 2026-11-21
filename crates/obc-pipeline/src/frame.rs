@@ -3,7 +3,7 @@
 //! The **canonical frame** is what every ingest pipeline produces and the
 //! output pipeline consumes: NV12 at the processing size (the contract
 //! size), square pixels, with the contract's colour label
-//! (`docs/adr/0009-ingest-process-output.md`). Its frame rate is whatever
+//!. Its frame rate is whatever
 //! the source delivers; the output clock sets the rate.
 //!
 //! **Memory.** Canonical frames live in the memory the output was built

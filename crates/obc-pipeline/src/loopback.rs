@@ -1,7 +1,6 @@
 //! The persistent loopback writer: the one pipeline that opens the
 //! v4l2loopback device, for the whole life of the daemon
-//! (`docs/adr/0011-daemon-lifecycle-and-dbus-api.md`, "A persistent
-//! loopback writer").
+//!.
 //!
 //! ```text
 //! appsrc   <contract caps>, colorimetry=2:4:5:4   is-live format=time, system memory
@@ -137,7 +136,7 @@
 //! timestamp, so a reader of the loopback sees `CLOCK_MONOTONIC` times, as a
 //! UVC camera stamps them: a writer of a new daemon process (a restart, a
 //! crash) continues forward instead of starting again at 0. The output's
-//! own timeline (ADR 0010, `D(n)`) is restamped away here and unaffected.
+//! own timeline`) is restamped away here and unaffected.
 //!
 //! **Crash cover.** At each start on a loopback, once the second buffer
 //! reaches `v4l2sink` (the first has then set the device's format and
@@ -179,7 +178,7 @@
 //!
 //! **No CUDA.** The writer builds no CUDA element and never loads the
 //! `nvcodec` plugin: a daemon with only the writer running holds no CUDA
-//! context (ADR-0006). A forwarded buffer (`cudadownload` output) is
+//! context. A forwarded buffer (`cudadownload` output) is
 //! system memory from a `GstVideoBufferPool` (observed with GStreamer
 //! 1.28.8), not CUDA or pinned host memory: `v4l2sink` maps it like any
 //! other, and releasing it makes no CUDA call, so the writer and its tap

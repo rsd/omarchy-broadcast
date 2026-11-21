@@ -1,6 +1,6 @@
 # System-memory pipeline results (CPU, no NVIDIA GPU)
 
-Cost of the video pipeline when the frames stay in system memory ([ADR-0033](../adr/0033-system-memory-pipeline.md); [../architecture.md](../architecture.md#2-stage-and-caps-model)), with the open-model cut-out ([ADR-0031](../adr/0031-onnx-cutout-module.md)) blurring the background on the CPU. These are figures for one high-end laptop CPU; they say how much headroom this machine has, not what a small machine will do.
+Cost of the video pipeline when the frames stay in system memory ([../architecture.md](../architecture.md#2-stage-and-caps-model)), with the open-model cut-out blurring the background on the CPU. These are figures for one high-end laptop CPU; they say how much headroom this machine has, not what a small machine will do.
 
 ## Method
 
@@ -19,7 +19,7 @@ Cost of the video pipeline when the frames stay in system memory ([ADR-0033](../
 | GStreamer | 1.28.8 |
 | Cameras | Logitech MX Brio (046d:0944) at NV12 1080p60; laptop-integrated "FHD Camera" (5986:1193) at MJPEG 1080p30 and 720p30 |
 | Output | NV12, 30 fps, limited range, into v4l2loopback; 1080p unless stated |
-| Light | Dim. The FHD camera delivered 18 to 20 fps, so about half of its effect calls were repeats, which the element's repeat cache answers at no cost ([ADR-0027](../adr/0027-output-modes-frame-generation-and-privacy-fallback.md)) |
+| Light | Dim. The FHD camera delivered 18 to 20 fps, so about half of its effect calls were repeats, which the element's repeat cache answers at no cost |
 
 ## Results: the daemon
 
@@ -42,7 +42,7 @@ Ingest, system memory (`gst-launch-1.0`, one chain, ms per frame, wall / CPU):
 |---|---|---|
 | `jpegdec` only, 4:2:2 MJPEG re-encoded from a webcam clip at quality 85 | 1.40 / 1.39 | 2.65 / 2.65 |
 | `jpegdec` of the camera's own 720p MJPEG (about 290 KB a frame) | 2.57 / 2.56 | not measured |
-| `jpegdec ! I420 ! videoconvertscale ! NV12` at the same size (without the range adapter: it converts the format, but not the range, see the colour range below and the ADR) | 1.55 / 1.54 | 3.04 / 3.04 |
+| `jpegdec ! I420 ! videoconvertscale ! NV12` at the same size (without the range adapter: it converts the format, but not the range, see the colour range below) | 1.55 / 1.54 | 3.04 / 3.04 |
 | the same with a scale (1080p camera to 720p; 720p camera to 1080p) | 5.78 / 5.76 | 4.43 / 4.41 (from 720p) |
 | YUY2 to NV12 at the same size, `videoconvertscale` (the test source's own cost subtracted) | about 0.7 | about 1.6 |
 | NV12 to I420 for an I420 contract, `videoconvert` | about 0.12 | about 0.28 |
@@ -72,7 +72,7 @@ The cameras' colour description against the levels they send (the luma range ove
 | MX Brio, MJPEG | decoded as full range | 0 to 255 | full, as labelled |
 | MX Brio, YUYV and NV12 | limited (`2:4:5:1`) | 0 to 255 (not reproduced, see below) | ~~full range, labelled limited~~ limited, as labelled |
 
-The loopback's output (NV12, limited): luma 18 to 235 from the FHD camera (MJPEG, correct), and 0 to 255 from the MX Brio's NV12, because the pipeline trusts the label of a raw camera on both memory paths ([ADR-0033](../adr/0033-system-memory-pipeline.md), known limitations).
+The loopback's output (NV12, limited): luma 18 to 235 from the FHD camera (MJPEG, correct), and 0 to 255 from the MX Brio's NV12, because the pipeline trusts the label of a raw camera on both memory paths. A raw camera that labels full range as limited is a known limitation.
 
 **Correction (2026-11-14): the MX Brio's 0 to 255 did not reproduce.** Controlled re-measurements with the camera connected (fixed settings, formats alternated MJPEG, YUYV, NV12, MJPEG at 1920x1080@30) show its YUYV and NV12 to be limited range as labelled: black at 16, highlights stopping at 235, the raw luma within 1 to 4 levels of 16 + MJPEG x 219/255 at every percentile, and 0.00 to 0.13 % of the samples outside 16 to 235. The MX Brio YUYV and NV12 row and the MX Brio output figure above are kept as the record of that run and are superseded by this paragraph; the cause of the first reading is not known. The FHD camera's rows are unaffected.
 
@@ -84,7 +84,7 @@ The loopback's output (NV12, limited): luma 18 to 235 from the FHD camera (MJPEG
 - **A 720p camera mode into a 720p output costs about 40 % less CPU than 1080p** (25 % against 42 %). A 720p output from a 1080p camera does not, because the camera is still decoded and then scaled.
 - **`replace` costs less than `blur`** in the module: 3.4 ms (720p) and 4.9 ms (1080p) of CPU per frame less.
 - **The model matters more than the resolution.** PP-HumanSeg v2 mobile costs about 2.1 to 2.4 times the CPU of the default MediaPipe model for blur, and takes about twice as long per frame, as its matte step is 5.3 ms against 1.1 ms.
-- **The range conversion of the MJPEG path is small**: +0.55 ms per 1080p frame for `videobalance`, against +2.1 ms for a conversion through RGB, which was the alternative ([ADR-0033](../adr/0033-system-memory-pipeline.md)).
+- **The range conversion of the MJPEG path is small**: +0.55 ms per 1080p frame for `videobalance`, against +2.1 ms for a conversion through RGB, which was the alternative.
 
 ## Not measured
 

@@ -9,7 +9,7 @@
 # crashed, the source keeps delivering the microphone's own audio. Independent
 # of omarchy-broadcastd: neither unit needs the other.
 #
-# This is the alternative to the ADR 0014 single-engine units
+# This is the alternative to the single-engine units
 # (omarchy-broadcast-mic@rnnoise.service and
 # omarchy-broadcast-mic@deepfilter.service). All of them create the same
 # source name, so only one may run: each declares Conflicts= with the others,
@@ -46,12 +46,12 @@ BindsTo=pipewire.service
 # by a connection, so a mic host that nothing records from does not start it.
 Wants=omarchy-broadcast-audiod.socket
 After=omarchy-broadcast-audiod.socket
-# The ADR 0014 instances create the same source; see the header.
+# The single-engine instances create the same source; see the header.
 Conflicts=omarchy-broadcast-mic@rnnoise.service omarchy-broadcast-mic@deepfilter.service
 
 [Service]
 # Hardening, type, restart policy and slice as in PipeWire's own
-# filter-chain.service and the ADR 0014 unit. MemoryDenyWriteExecute stays on
+# filter-chain.service and the single-engine unit. MemoryDenyWriteExecute stays on
 # because this process runs no effect and no JIT-compiled code, only the
 # forwarding plugin.
 LockPersonality=yes

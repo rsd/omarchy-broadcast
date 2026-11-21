@@ -1,5 +1,5 @@
 //! NVIDIA Maxine Video Effects backend
-//! (`docs/adr/0012-video-effects-and-maxine-backend.md`).
+//!.
 //!
 //! The user-installed SDK is opened at run time with `dlopen`, never linked
 //! and never vendored. [`MaxineFactory`] finds it in the SDK root

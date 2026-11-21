@@ -1,7 +1,7 @@
 //! What the daemon learnt about the GPU and keeps across restarts: the
 //! CUDA compute capability, which picks the inference models made for this
 //! GPU. It is learnt only while a session has the GPU up (never at idle:
-//! the GPU may be parked, `docs/adr/0017-cuda-checkpoint-parking.md`), so
+//! the GPU may be parked), so
 //! without this file a freshly started daemon would not know it until its
 //! first session, and would count the models of another GPU as installed.
 //!

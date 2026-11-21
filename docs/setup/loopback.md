@@ -2,7 +2,7 @@
 
 The daemon writes the processed video into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) device, the virtual camera. Applications such as OBS, Chrome and Zoom select that device as their camera. Creating it needs root, once. Do this before you start the daemon ([daemon.md](daemon.md)).
 
-The daemon finds the device by its **label**, `Omarchy Broadcast`, not by its `/dev/videoN` number ([ADR-0004](../adr/0004-v4l2loopback-first.md)).
+The daemon finds the device by its **label**, `Omarchy Broadcast`, not by its `/dev/videoN` number, so the device number can change.
 
 ## Before you start
 
@@ -108,14 +108,14 @@ Chrome requires this: it lists only devices that expose capture capability and n
 
 ## What the daemon sets on the device
 
-At every start of its loopback writer, the daemon sets two things on the device so that a daemon crash does not make applications lose the camera ([ADR-0022](../adr/0022-crash-recovery-for-consumers.md)). No root is needed:
+At every start of its loopback writer, the daemon sets two things on the device so that a daemon crash does not make applications lose the camera. No root is needed:
 
-- a **timeout image**, uploaded through the driver's `timeout_image_io` control: black, or the away image when `[output] placeholder = "image"` and `[effect] fallback_image` are set ([ADR-0034](../adr/0034-away-image.md)), and
+- a **timeout image**, uploaded through the driver's `timeout_image_io` control: black, or the away image when `[output] placeholder = "image"` and `[effect] fallback_image` are set, and
 - the **`timeout`** control, in milliseconds: 250 at the default 30 fps contract.
 
 When no frame arrives within that time, the driver serves the timeout image, also after the daemon's process has died. Chromium-based applications restart their capture after about a second without a frame. v4l2loopback refuses that restart while no writer streams, so without the timeout image they lose the camera.
 
-Both settings are device-wide and persist until the module is reloaded. The daemon does not reset them when it stops. An application that still holds the node after a clean stop gets the timeout image (black, or the away image) at a few frames per second instead of a frozen image.
+Both settings are device-wide and persist until the module is reloaded. The daemon does not reset them when it stops. The driver's timeout flag is device-wide and cleared by the first reader that dequeues. With several readers on the node the timeout frames are shared, so one reader can go longer than Chromium's limit of about one second without a frame. The crash cover reliably protects a single consumer. While the daemon uploads the timeout image, a program that opens the device in the instant between the daemon's control write and its own `open()` gets the upload descriptor, which receives no frames. The window is as short as it can be made, and `v4l2loopback-ctl set-timeout-image` has the same race. It can only occur at a writer start. An application that still holds the node after a clean stop gets the timeout image (black, or the away image) at a few frames per second instead of a frozen image.
 
 To inspect the timeout, run this. The query opens the node, so it counts as a consumer while it runs:
 
@@ -138,7 +138,7 @@ The size and frame rate of the virtual camera are `[output] mode` ([config.examp
 omarchy-broadcast config set output.mode 1280x720@30
 ```
 
-The daemon computes the list of choices for the camera in use: its 16:9 sizes from 3840x2160 to 640x360 at the rates it offers. With a frame-generation module, rates at twice the camera's are marked "(generated)". The change is written to `config.d/50-panel.toml`.
+The daemon computes the list of choices for the camera in use: its 16:9 sizes from 3840x2160 to 640x360 at the rates it offers. With a frame-generation module, rates at twice the camera's are marked "(generated)". A "(generated)" rate shows the picture one output frame later than the same rate without frame generation, because each new camera frame is held back to be blended with the one before it. An effect still runs once per camera frame, and its result is repeated for the in-between frame, so the cost of an expensive effect is paid at the camera's rate, not the output's. Frame generation is planned when a session starts, from the cameras the daemon knows then. A camera plugged in during a session whose rate is half the output rate repeats frames until the next session, and gets frame generation from that session on. The change is written to `config.d/50-panel.toml`.
 
 The format of a loopback device that is open is fixed ([`exclusive_caps=1`](#why-exclusive_caps1)), so a format change cannot reach an application that already holds the device:
 

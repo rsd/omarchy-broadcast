@@ -52,7 +52,7 @@
 //! PipeWire buffer that is needed anyway. Not on the GPU before the
 //! download, because the format is the consumer's choice at run time
 //! (and can differ between consumers over the node's life), the idle
-//! placeholders never touch the GPU (ADR-0011: Idle holds no CUDA
+//! placeholders never touch the GPU (Idle holds no CUDA
 //! context), and a GPU conversion would need a second `cudadownload` next
 //! to the loopback's.
 //!

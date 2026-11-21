@@ -1,6 +1,6 @@
 //! The audio settings snapshot: everything the worker needs to know of the
 //! user's microphone choices, pushed by the video daemon (the single
-//! writer of every setting, ADR 0026) with `ApplySnapshot` and written by
+//! writer of every setting) with `ApplySnapshot` and written by
 //! it atomically to `$XDG_STATE_HOME/omarchy-broadcast/audio-settings.json`.
 //!
 //! The worker reads the file at start, so it runs correctly with the

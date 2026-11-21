@@ -24,7 +24,7 @@
 //! calls run on the blocking pool, and `MediaSerial` is kept here, from 1,
 //! raised after each import that stored a file, each removal and each
 //! poster made, with its `PropertiesChanged`. `GetMedia` lists posters
-//! that exist only (the listing never decodes, ADR 0032) and hands the
+//! that exist only (the listing never decodes) and hands the
 //! videos without one to the store's one [`PosterMaker`]; each poster it
 //! makes raises `MediaSerial` (posters landing together raise it once), so
 //! a client lists again and finds it. It restarts at 1 at each daemon
@@ -625,7 +625,7 @@ impl Server {
     /// Turns the microphone on (the mic host unit enabled and started) or
     /// off (the previous default microphone restored if the Omarchy
     /// Broadcast Mic is the default, then the unit stopped and disabled)
-    /// (revision 13). Refused with `Unavailable` while an ADR 0014
+    /// (revision 13). Refused with `Unavailable` while a single-engine
     /// filter-chain unit runs (naming it) or without a service manager.
     async fn set_mic_host(&self, on: bool) -> Result<(), IpcError> {
         self.call(|reply| Command::SetMicHost(on, reply)).await

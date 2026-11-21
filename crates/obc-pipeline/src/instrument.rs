@@ -1,7 +1,7 @@
 //! Per-buffer instrumentation of the ingest and output pipelines.
 //!
 //! The stream runs in two pipelines joined by a latest-frame slot
-//! (`docs/adr/0009-ingest-process-output.md`): one ingest pipeline per
+//!: one ingest pipeline per
 //! source, rebuilt on every switch, and one output pipeline paced by its own
 //! clock. The output buffer's PTS is the output tick (`n x period`), not the
 //! camera's, so a frame is followed across the slot through the output's

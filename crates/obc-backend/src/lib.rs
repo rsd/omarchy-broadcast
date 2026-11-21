@@ -1,6 +1,4 @@
-//! The inference backend seam that the effect element talks to
-//! (`docs/adr/0003-maxine-first-behind-backend-seam.md`,
-//! `docs/adr/0012-video-effects-and-maxine-backend.md`).
+//! The inference backend seam that the effect element talks to.
 //!
 //! This crate has no GPU dependency. It defines what an effect element hands
 //! to a backend and what it gets back:
@@ -61,7 +59,7 @@
 //! Which stages are pre-mask and which post-mask is the backend's to know;
 //! a pre-mask stage always runs before the mask, whatever its place in the
 //! list. An empty list adds nothing: no pass, copy or allocation
-//! (`docs/adr/0018-video-noise-removal.md`, "off costs nothing").
+//!.
 //!
 //! # Frames and the CUDA context
 //!

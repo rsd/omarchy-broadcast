@@ -2,7 +2,7 @@
 
 `scripts/camera-tune.py` measures one camera and prints proposals for the camera rows of `crates/obc-pipeline/src/quirks.rs`. Use it when you add support for a camera model. It is a developer tool, not part of the installed daemon.
 
-The proposals are a `RangeQuirk`, a `ControlQuirk` (with `reset_at_open`) and a `CameraProfile`. The rows are data keyed by USB vendor and product id ([Quirks as data](architecture.md#camera-settings), [ADR-0036](adr/0036-camera-quirk-rows-and-camera-health.md)), so adding a camera is adding rows and no code. The tool does not edit the table. It prints Rust text and the evidence next to it, and a person decides what goes in.
+The proposals are a `RangeQuirk`, a `ControlQuirk` (with `reset_at_open`) and a `CameraProfile`. The rows are data keyed by USB vendor and product id ([Quirks as data](architecture.md#camera-settings))), so adding a camera is adding rows and no code. The tool does not edit the table. It prints Rust text and the evidence next to it, and a person decides what goes in.
 
 The daemon never runs the tool, and the tool never starts or stops the daemon.
 
@@ -138,7 +138,7 @@ A run drives a real device, so the tool is conservative:
   - A control that was inactive at the start is not written back once its master is back at its starting value, since the camera drives it again.
   - A written control that still differs afterwards is named, and the exit status is 1.
 - **Controls it never writes** (nor restores): privacy, LED, and motion controls (pan, tilt, zoom, roll, iris, focus), the power-line frequency and the other controls that do not show in the picture, read-only controls, and inactive controls. There is one exception: a dependent of an automatic master that the sweep covers (white balance temperature, gain) is written while the tool holds the master on manual, and the master is put back afterwards. A master is switched only when it has such a dependent, never for a lens motor.
-- **A raw mode of at least 12 MB/s (12 000 000 bytes per second) is skipped behind a shared hub** unless you pass `--allow-shared-hub`. The skip applies when a hub above the camera, other than the root hub, has a HID device anywhere below it. The nearest such hub counts. The camera itself and any device with a video interface do not. Such a stream can fill the hub's link and reset the keyboard and mouse on it: a 640x480 YUYV stream at 30 fps (18.4 MB/s) did so in practice ([ADR-0036](adr/0036-camera-quirk-rows-and-camera-health.md)), and it is the same condition under which the daemon warns. MJPEG has no fixed rate and is never skipped. Use the flag only when you can afford to lose the keyboard and mouse, or move the camera to a port on the root hub.
+- **A raw mode of at least 12 MB/s (12 000 000 bytes per second) is skipped behind a shared hub** unless you pass `--allow-shared-hub`. The skip applies when a hub above the camera, other than the root hub, has a HID device anywhere below it. The nearest such hub counts. The camera itself and any device with a video interface do not. Such a stream can fill the hub's link and reset the keyboard and mouse on it: a 640x480 YUYV stream at 30 fps (18.4 MB/s) did so in practice, and it is the same condition under which the daemon warns. MJPEG has no fixed rate and is never skipped. Use the flag only when you can afford to lose the keyboard and mouse, or move the camera to a port on the root hub.
 
 ## Limits
 

@@ -1,6 +1,5 @@
 //! Live statistics of a running stream, for the daemon's ~1 Hz `Stats`
-//! signal (`docs/adr/0011-daemon-lifecycle-and-dbus-api.md`, "D-Bus API
-//! v1").
+//! signal.
 //!
 //! The same join as `obc-bench` ([`crate::instrument`]), cut down to what a
 //! long-running daemon needs:

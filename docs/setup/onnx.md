@@ -1,6 +1,6 @@
 # Open-model cut-out (ONNX)
 
-The open-model cut-out gives you background blur and background replacement without NVIDIA Maxine and without an NVIDIA GPU. It is a loadable module with the id `br.com.dias.onnx-cutout` ([modules.md](../modules.md), [ADR-0025](../adr/0025-loadable-modules.md)). It provides the `background` stage: it cuts the person out and blurs or replaces the room behind them. It uses open models under the Apache License 2.0. The design reasons are in [ADR-0031](../adr/0031-onnx-cutout-module.md).
+The open-model cut-out gives you background blur and background replacement without NVIDIA Maxine and without an NVIDIA GPU. It is a loadable module with the id `br.com.dias.onnx-cutout` ([modules.md](../modules.md)). It provides the `background` stage: it cuts the person out and blurs or replaces the room behind them. It uses open models under the Apache License 2.0. The module loads ONNX Runtime at run time, so one build works with whichever `onnxruntime-*` package you install.
 
 This page covers how to install the module, its runtime and its models, how to choose the model and the engine, how to read the reasons an engine is not used, and the failures specific to omarchy-broadcast. Every setting, key and variable of the module is in its [README](../../crates/obc-module-onnx/README.md).
 
@@ -22,7 +22,7 @@ On an NVIDIA GPU, or for an Intel NPU or GPU, install the runtime and provider p
 
 ## Using it on a machine without an NVIDIA GPU
 
-The module needs no NVIDIA GPU, and neither does the daemon's effect path. When the machine has no usable CUDA, the daemon keeps video frames in system memory ([ADR-0033](../adr/0033-system-memory-pipeline.md)) and hands the module host frames.
+The module needs no NVIDIA GPU, and neither does the daemon's effect path. When the machine has no usable CUDA, the daemon keeps video frames in system memory and hands the module host frames.
 
 ### Install
 
@@ -122,13 +122,14 @@ Measured on the reference machine: an Intel Core Ultra 9 275HX laptop, the CPU b
 - The blur adds about 25 to 27 % of one core at 1080p and about 16 % at 720p. The rest is the camera's own decode and conversion, which is the cost of an MJPEG camera in any case.
 - This is a high-end laptop CPU. A machine with four low-power cores is expected to take two to three times as long per frame. That has not been measured.
 - A 720p camera mode into a 720p output costs about 40 % less (25 % against 42 %). A 720p output from a 1080p camera does not, because the camera is still decoded at 1080p and then scaled (43 %).
+- Known limit: with a camera that delivered about 20 fps in dim light, two black frames appeared in about 5,300 under blur, each after an output gap of 70 to 74 ms. None appeared in 60 s without an effect or with the other camera. The writer shows its placeholder when no frame arrives for two output periods (66.7 ms at 30 fps). The cause is not isolated.
 - `threads` in the module's table sets the CPU threads (see the module's [README](../../crates/obc-module-onnx/README.md)). More threads shorten a frame and cost more CPU in total.
 
 Method and per-step figures: [../benchmarks/system-memory.md](../benchmarks/system-memory.md).
 
 ### Privacy on the CPU path
 
-The privacy rules are the same as with CUDA ([ADR-0033](../adr/0033-system-memory-pipeline.md)):
+The privacy rules are the same as with CUDA:
 
 - **Privacy on** (`[effect] privacy`): the room is never shown while an effect is on and cannot run. You get black frames, the away image or the last frame, by `privacy_mode`. At a start the picture goes black until the matte is ready.
 - **Privacy off** (the default): the camera is shown instead. Turning the blur on mid-stream keeps the picture for under a frame on the CPU, then switches with no black frame.
@@ -461,7 +462,7 @@ TensorRT compiles the model into an engine for your GPU. The first time a model 
 
 The engine is cached in `$XDG_CACHE_HOME/omarchy-broadcast/trt/`, in a directory named for the model file's checksum, the ONNX Runtime version, the TensorRT version, the GPU and its compute capability. An engine built for another GPU or another TensorRT is never taken for the current one. Later loads read the cache in under a second.
 
-The build runs when the effect is turned on or when the camera starts. Until it ends, the picture is black at a start, and it is the camera as it was when the effect is turned on mid-stream.
+The build runs when the effect is turned on or when the camera starts. Until it ends, with privacy on (`[effect] privacy`) the picture is black (or the away image, or the last frame) at a start; with privacy off, the default, it is the camera as it is. When the effect is turned on mid-stream, the picture stays as it was until the effect is ready.
 
 **Changing the model while the camera runs is different,** because the stream waits for a switch:
 
@@ -470,7 +471,7 @@ The build runs when the effect is turned on or when the camera starts. Until it 
 
 ## 7. The GPU is left as it was found
 
-ONNX Runtime's CUDA and TensorRT engines run through the CUDA runtime, which activates the device's primary CUDA context. When the last session that used one of them ends (an unload, or a failed attempt of `auto`), the module resets that primary context. No CUDA context of the module's outlives its sessions, so the GPU can be parked at idle ([ADR-0017](../adr/0017-cuda-checkpoint-parking.md)). The context of the frames, GStreamer's, is another context and is untouched. The rule and its bounds are in [../modules.md](../modules.md#threading-and-cuda-rules).
+ONNX Runtime's CUDA and TensorRT engines run through the CUDA runtime, which activates the device's primary CUDA context. When the last session that used one of them ends (an unload, or a failed attempt of `auto`), the module resets that primary context. No CUDA context of the module's outlives its sessions, so the GPU can be parked at idle. The context of the frames, GStreamer's, is another context and is untouched. The rule and its bounds are in [../modules.md](../modules.md#threading-and-cuda-rules).
 
 ### The Intel GPU engine and the NVIDIA GPU
 
@@ -498,8 +499,8 @@ The NVIDIA GPU then stays asleep under `openvino-gpu`. The log says whether the 
 | The load fails with `<engine> was chosen and cannot run: ...; no later engine could run it (...)` | The chosen engine and every engine after it in the order failed | Read the reasons in the list. Choose `auto` or an engine that can run |
 | After changing the engine or model the picture did not change, and `Warning` ends `the previous setting keeps running` | The new setting could not load. The previous one keeps running by design | Read the reason before the semicolon and fix it, or set the setting back. Change it again or apply it again to try it once more |
 | The NVIDIA GPU wakes up when `openvino-gpu` is chosen | The OpenCL loader opened NVIDIA's driver: the module's limit was not applied (an `OCL_ICD_*` variable was already set, or the loader was in the process before) | Remove your `OCL_ICD_*` setting from the daemon's environment, or make it list the Intel driver only. The log says why the limit was left alone |
-| The picture is black for many seconds the first time the effect is on | The TensorRT engine is being built | Wait for `the TensorRT engine for <model> is ready` in the log (section 6) |
-| On a machine without an NVIDIA GPU the picture is black and `Warning` says the Maxine module cannot run | Only the Maxine module provides `background`: the ONNX module, its models or its runtime are missing, so its stage is `unavailable` | Install the module, the models and `onnxruntime-cpu` (sections 2 and 3). `omarchy-broadcast modules` shows the reason |
+| The picture is black for many seconds the first time the effect is on (with privacy on; with privacy off the camera is shown until the engine is ready) | The TensorRT engine is being built | Wait for `the TensorRT engine for <model> is ready` in the log (section 6) |
+| On a machine without an NVIDIA GPU the effect does not run (the picture is black with privacy on) and `Warning` says the Maxine module cannot run | Only the Maxine module provides `background`: the ONNX module, its models or its runtime are missing, so its stage is `unavailable` | Install the module, the models and `onnxruntime-cpu` (sections 2 and 3). `omarchy-broadcast modules` shows the reason |
 | The log says `video memory: system` on an NVIDIA machine | `[video] memory` is `system`, or the probe found no usable CUDA (`auto`: for example ``the CUDA toolkit (NVRTC) is not installed; install `cuda` for the GPU path``), or a start fell back after CUDA failed, or the battery saver is active (`auto: battery saver, on battery` or `... power profile power-saver`) | The log line gives the reason. Set `memory = "cuda"` to require CUDA, or `battery_saver = "off"` to keep CUDA on the battery, and reload |
 | `OpenVINO GPU: ... Device GPU is not available`, and the model runs on another engine | There is no Intel GPU in the running system. On a laptop with a GPU switch (a MUX), the discrete-only mode leaves the integrated Intel GPU off the bus (`lspci` shows no Intel display device, and `/dev/dri` holds only the NVIDIA GPU). The module limits OpenCL to Intel's driver (section 7), so the NVIDIA GPU is not offered to OpenVINO in its place | Use another engine, or switch the laptop to its hybrid mode and reboot if you want the Intel GPU. With only an NVIDIA GPU, `auto` is correct to use TensorRT, CUDA or the CPU |
 | `OpenVINO NPU: ... Device NPU is not available`, with the NPU's driver installed | The daemon cannot open `/dev/accel/accel0`: the node belongs to the group `render` and your user is not in it (check with `ls -l /dev/accel/accel0` and `id`). The NPU's user-space packages are not enough | Add your user to the group with `sudo usermod -aG render $USER`, log in again and restart the daemon. Or give the node the access you want with a udev rule of your own, then `sudo udevadm trigger -s accel` |

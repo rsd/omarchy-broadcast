@@ -1,6 +1,6 @@
 # Camera and ingest-path results
 
-Cost of each ingest path (see [../architecture.md](../architecture.md), section 2 and [ADR-0008](../adr/0008-cpu-ingest-adapters.md)) measured with `obc-bench` on two cameras.
+Cost of each ingest path (see [../architecture.md](../architecture.md), section 2) measured with `obc-bench` on two cameras.
 
 ## Method
 

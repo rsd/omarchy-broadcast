@@ -1,6 +1,6 @@
 //! `obc-bench`: benchmark and development runner for the stream.
 //!
-//! Runs the three-stage stream of `docs/adr/0009-ingest-process-output.md`:
+//! Runs the three-stage stream (ingest, process, output):
 //! one ingest pipeline per camera feeding a latest-frame slot, and one output
 //! pipeline with a fixed contract (`--output`, `--output-format`,
 //! `--output-range`) paced by its own clock, writing to a v4l2loopback
@@ -28,14 +28,14 @@
 //! most `--hold-timeout` seconds), so a switch shows no black frames unless
 //! the next camera takes longer than that to start.
 //!
-//! The output clock locks the phase of its ticks to the camera's frames
-//! (`docs/adr/0010-phase-locked-output-clock.md`); `--no-phase-lock` emits
+//! The output clock locks the phase of its ticks to the camera's frames;
+//! `--no-phase-lock` emits
 //! on the fixed grid instead, for comparison. Because emission instants
 //! then follow the camera within one period, `fps_sustained` judges the
 //! output by its PTS sequence, its frame count and the deviation of its
 //! arrivals from the PTS grid (see [`FpsSection`]).
 //!
-//! Effects (`docs/adr/0012-video-effects-and-maxine-backend.md`):
+//! Effects:
 //! `--effect none|blur|replace` inserts the `obceffect` element in the
 //! Process stage, its backend the module that provides the `background`
 //! stage, loaded as the daemon loads it (`--modules`: a `modules.d`
@@ -43,7 +43,7 @@
 //! without it) (`none` in passthrough, to measure the element's own cost;
 //! without `--effect` there is no element), with `--blur-strength` and
 //! `--background`. `--denoise` adds the video noise removal stage
-//! (`docs/adr/0018-video-noise-removal.md`) before the effect, or alone with
+//! before the effect, or alone with
 //! `--effect none`. `--relight[=warm|neutral|cool]` adds the relighting
 //! stage after it (light `neutral` without a value), with `--relight-pan`
 //! (degrees) and `--relight-gain`, under the effect or alone with
@@ -1056,7 +1056,7 @@ struct LatencySection {
     method: &'static str,
     output_period_ms: f64,
     /// One output period plus one camera frame period: the wait for the
-    /// next output tick (up to one output period, ADR-0009) plus one camera
+    /// next output tick (up to one output period) plus one camera
     /// frame period for the stages themselves (the slowest camera's among
     /// those that delivered frames in the window). See
     /// [`latency_budget_ms`].

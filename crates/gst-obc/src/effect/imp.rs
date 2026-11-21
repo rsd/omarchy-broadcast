@@ -162,8 +162,7 @@
 //!
 //! # The stages
 //!
-//! The stackable stages (`docs/adr/0018-video-noise-removal.md`,
-//! `docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md`)
+//! The stackable stages
 //! live in the same backend instance as the effect: one load request carries
 //! the effect and every requested stage (`LoadRequest::stages`, in the
 //! settings' order, with their load-time parameters), and they unload with
@@ -1367,7 +1366,7 @@ impl GpuResources {
 impl Drop for GpuResources {
     /// Turns the pool off and destroys the events with the context current,
     /// then releases the stream and, last, the context reference (the
-    /// context is destroyed with its last reference, ADR-0006). Runs once:
+    /// context is destroyed with its last reference). Runs once:
     /// `stop` releases by dropping, and a finalised element drops whatever
     /// `stop` did not take.
     fn drop(&mut self) {
@@ -1440,7 +1439,7 @@ impl<F: FnOnce()> Drop for OnExit<F> {
 /// context could not be pushed: unloading (or dropping, which unloads)
 /// without it would make the SDK's CUDA runtime free its objects in no
 /// context or in another one, and could create the primary context
-/// (ADR-0006). Its memory is reclaimed when the context is destroyed.
+///. Its memory is reclaimed when the context is destroyed.
 fn leak_backend(instance: Box<dyn InferenceBackend>, why: &str) {
     gst::error!(
         CAT,

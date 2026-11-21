@@ -33,7 +33,7 @@
 //!   failed) and `scale`.
 //! * **Stopping** (PAUSED to READY) unloads the enhancer and releases the
 //!   pool, the stream and the context reference, in that order: nothing of
-//!   the stage outlives its ingest (`docs/adr/0017-cuda-checkpoint-parking.md`).
+//!   the stage outlives its ingest.
 
 mod imp;
 

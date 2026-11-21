@@ -1,4 +1,4 @@
-//! Video backgrounds of `replace` (ADR-0035, "CUDA and system memory"): what
+//! Video backgrounds of `replace`: what
 //! the controller asks of a video chosen as the background, and what it
 //! keeps of one.
 //!

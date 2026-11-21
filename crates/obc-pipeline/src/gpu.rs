@@ -3,7 +3,7 @@
 //! The sampler owns NVML on its own thread: [`GpuSampler::stop`] joins the
 //! thread, which calls `nvmlShutdown` before exiting. NVML holds
 //! `/dev/nvidia*` open while initialised, so it must be stopped before the
-//! pipeline teardown is judged (ADR-0006: idle means no GPU handles).
+//! pipeline teardown is judged (idle means no GPU handles).
 //!
 //! Initialising NVML wakes a runtime-suspended dGPU.
 

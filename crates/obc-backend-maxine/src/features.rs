@@ -14,7 +14,7 @@
 //!
 //! [`feature_availability`] reads directories and nothing else: no CUDA
 //! call, no `dlopen`, so it never wakes a runtime-suspended GPU
-//! (`docs/adr/0017-cuda-checkpoint-parking.md`).
+//!.
 
 use std::collections::BTreeSet;
 use std::fmt;

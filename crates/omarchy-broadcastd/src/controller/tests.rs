@@ -1,5 +1,5 @@
 //! The lifecycle state machine against the fake backend, with explicit
-//! instants: every transition of the ADR-0011 diagram, the debounce and the
+//! instants: every transition of the lifecycle diagram, the debounce and the
 //! grace, persistence, camera selection, hotplug, reloads and the writer.
 
 use std::fs;
@@ -1702,7 +1702,7 @@ fn a_writer_rebuild_recounts_the_holders_and_waits_for_them() {
     );
 }
 
-// ---- effects (docs/adr/0012-video-effects-and-maxine-backend.md) ----
+// ---- effects ----
 
 impl H {
     fn set_effect(&mut self, name: &str, ms: u64) -> Result<(), IpcError> {
@@ -17066,7 +17066,7 @@ fn a_system_memory_session_that_did_not_stop_cleanly_is_warned_and_never_taints(
     assert_eq!(w.gpu_log, ["build", "park"]);
 }
 
-// ---- video backgrounds (revision 18; ADR-0035, "CUDA and system memory") ----
+// ---- video backgrounds (revision 18) ----
 
 /// What the fake video service was asked and answers.
 #[derive(Default)]

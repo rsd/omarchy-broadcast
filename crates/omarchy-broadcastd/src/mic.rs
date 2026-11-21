@@ -1,4 +1,4 @@
-//! The microphone, seen from the daemon (ADR 0029): the daemon is the
+//! The microphone, seen from the daemon: the daemon is the
 //! façade of the Omarchy Broadcast Mic and the single writer of its
 //! settings, but runs none of it. Three processes share the work: the mic
 //! host (`omarchy-broadcast-mic.service`, a PipeWire filter-chain with the
@@ -51,7 +51,7 @@ use crate::settings::Refusal;
 
 /// The mic host's unit (decision G1): enabled and started by `mic on`.
 pub const HOST_UNIT: &str = "omarchy-broadcast-mic.service";
-/// The filter-chain units of ADR 0014, which share the mic's node name: the
+/// The single-engine filter-chain units, which share the mic's node name: the
 /// mic host is refused while one runs (decision G2).
 pub const LEGACY_UNITS: [&str; 2] = [
     "omarchy-broadcast-mic@rnnoise.service",

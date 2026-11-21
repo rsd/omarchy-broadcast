@@ -2,7 +2,7 @@
 
 "Omarchy Broadcast Mic" is an optional virtual microphone: your microphone with the background noise removed. Any application can select it like a hardware microphone. Turn it on with `omarchy-broadcast mic on`. The default CPU module needs no GPU and no vendor SDK.
 
-Audio modules do the processing, loadable like the video effects ([modules.md](../modules.md#audio-modules)). The default module runs on the CPU with two engines: DeepFilterNet (the default) and RNNoise. A second module, for NVIDIA GPUs, runs the NVIDIA Maxine Audio Effects. It needs the SDK, which you obtain yourself ([On an NVIDIA GPU](#on-an-nvidia-gpu-maxine-audio-effects)). Other engines can be installed as further modules. They appear as further providers of the same stages, with no change to this setup. The design and the reasons are in [ADR-0029](../adr/0029-audio-modules-mic-host-and-worker.md).
+Audio modules do the processing, loadable like the video effects ([modules.md](../modules.md#audio-modules)). The default module runs on the CPU with two engines: DeepFilterNet (the default) and RNNoise. A second module, for NVIDIA GPUs, runs the NVIDIA Maxine Audio Effects. It needs the SDK, which you obtain yourself ([On an NVIDIA GPU](#on-an-nvidia-gpu-maxine-audio-effects)). Other engines can be installed as further modules. They appear as further providers of the same stages, with no change to this setup.
 
 The virtual microphone is independent of the virtual camera: neither needs the other. The daemon is only the control panel of the microphone and is not in the audio path.
 
@@ -13,7 +13,7 @@ You can run the virtual microphone in two ways, one at a time:
 | Way | What you get | Use it when |
 |---|---|---|
 | **Audio modules** (this page, before [the filter-chain section](#the-lightweight-alternative-the-filter-chain-units)) | Settings (on and off, the microphone, the engine, the strength), several providers, status | Recommended |
-| **Filter-chain units** of [ADR-0014](../adr/0014-mic-noise-removal-filter-chain.md) ([below](#the-lightweight-alternative-the-filter-chain-units)) | One fixed engine per unit, no settings, no worker | You want a lightweight, supported alternative |
+| **Filter-chain units** ([below](#the-lightweight-alternative-the-filter-chain-units)) | One fixed engine per unit, no settings, no worker | You want a lightweight, supported alternative |
 
 Both create a source with the same name, so they exclude each other. Each unit declares `Conflicts=` with the others. `omarchy-broadcast mic on` refuses, and names the unit, while a filter-chain unit is running.
 
@@ -199,7 +199,7 @@ omarchy-broadcast config set mic.hardware_gain_db 36.0    # the same, as a confi
 | Delay of the engine | About 10 ms | About 30 ms |
 | `mic.noise.strength` | A mix of the processed and the original sound, with the original delayed to match | The limit on how many decibels of noise are taken away, from a light touch at 0 % (about 1 dB) to no limit at 100 %. 25 % is about 3 dB, 50 % about 10 dB, 75 % about 30 dB |
 
-DeepFilterNet is the default because it keeps the voice and removes noise from under it. Choose RNNoise when the CPU matters more, for instance on a laptop battery. For measured CPU figures of the two engines, see [ADR-0014](../adr/0014-mic-noise-removal-filter-chain.md). The module runs the same engines. Compare by ear with your own microphone and room.
+DeepFilterNet is the default because it keeps the voice and removes noise from under it. Choose RNNoise when the CPU matters more, for instance on a laptop battery. Measured on an Intel Core Ultra 9 275HX, RNNoise used about 2.4 % of one core and 14 MB of memory, and DeepFilterNet about 21.5 % of one core and 155 MB. The module runs the same engines. Compare by ear with your own microphone and room.
 
 ### Configuration
 
@@ -223,7 +223,7 @@ Which module provides a stage is chosen as for video: by rank, by the backend pr
 On a machine with an NVIDIA RTX GPU, the microphone can run the NVIDIA Maxine Audio Effects through a second audio module, `br.com.dias.maxine-afx`. It provides the same noise removal stage as the CPU module, ranked above it, and four more:
 
 - speaker focus
-- room echo removal
+- room echo removal (it removes the room's reverberation, not the far end of a call; see [What the Mic tab offers](#what-the-mic-tab-offers))
 - headset bandwidth restoration
 - studio voice
 
@@ -308,7 +308,7 @@ With the module usable, the same page gains groups, and noise removal's switch a
 |---|---|
 | `mic.noise.enabled`, `mic.noise.strength` | The same switch and strength as with the CPU module (shared by every provider of noise removal). The strength applies live: it mixes the processed sound with your own, delayed to match, so a change never steps or reloads |
 | `mic.focus.enabled` ("Speaker focus (removes other voices)", off by default) | Keeps the main speaker and removes other voices and background talk. It has no strength. It removes neither noise nor echo, so it works alongside the other effects, studio voice included. It runs first in the chain. It needs a separate download: until that is installed, the switch is greyed with the reason "Models not installed" ([below](#optional-features-speaker-focus-and-headset-bandwidth)) |
-| `mic.echo.enabled`, `mic.echo.strength` ("Room echo removal", off by default) | Removes the room's reverberation from the voice, before noise removal. Its strength applies live. While noise removal is on, the strength is greyed: both effects then run as one combined model, whose single strength is noise removal's. Turn noise removal off to set the echo strength on its own |
+| `mic.echo.enabled`, `mic.echo.strength` ("Room echo removal", off by default) | Removes the room's reverberation from the voice, before noise removal. Its strength applies live. While noise removal is on, the strength is greyed: both effects then run as one combined model, whose single strength is noise removal's. Turn noise removal off to set the echo strength on its own. It is not acoustic echo cancellation: it does not remove the far end of a call coming back through your speakers. For that, use PipeWire's own echo-cancel module or a headset |
 | `mic.bandwidth.enabled` ("Restore headset audio (for narrowband mics)", group "Headset bandwidth", off by default) | Restores the high band of a narrowband microphone, such as a Bluetooth headset in its 16 kHz mode, whose voice otherwise sounds muffled. It has no strength and conflicts with no other effect. It runs after noise and room echo removal, so it extends a signal that has already been cleaned. The audio is reduced to 16 kHz for it and rebuilt at 48 kHz. The small delay that adds is counted in the chain's delay. It needs a separate download: until that is installed, the switch is greyed with the reason "Models not installed" ([below](#optional-features-speaker-focus-and-headset-bandwidth)) |
 | `mic.voice.enabled` ("Studio voice (adds noticeable delay)", off by default), `mic.voice.profile` ("Mic profile") | Re-creates the voice as if recorded in a studio. The profile (None, Bright, Vibrant, Flat, Full, Thin or Warm) changes the character. Changing it reloads the chain |
 
@@ -475,6 +475,8 @@ flowchart LR
   - Audio stops a few seconds after the last application stops recording, when PipeWire suspends the source. A status query from the daemon or the panel postpones the exit.
 - The **daemon** is where you control it: `omarchy-broadcast mic`, the settings tree and the bar. It writes your settings to a file the worker reads, so the microphone works as you set it with the daemon down.
 
+The virtual microphone serves one recording stream at a time: a second connection to the same host is refused while one is connected. It is mono at 48 kHz, and the processing stages run in a fixed order.
+
 The processing adds a delay. It is 10 ms to hand the audio to the worker and back (20 ms when a stage runs on a GPU), plus the engine's own: about 10 ms for RNNoise and about 30 ms for DeepFilterNet. `omarchy-broadcast mic` shows the total in force.
 
 ### What it touches
@@ -499,11 +501,11 @@ The processing adds a delay. It is 10 ms to hand the audio to the worker and bac
 
 # The lightweight alternative: the filter-chain units
 
-[ADR-0014](../adr/0014-mic-noise-removal-filter-chain.md)'s units stay supported for anyone who wants a fixed engine with no worker, no settings and no daemon. A PipeWire `filter-chain` hosts a LADSPA noise-suppression plugin and exposes the result as the same source, "Omarchy Broadcast Mic". It runs on the CPU only and is independent of `omarchy-broadcastd`.
+The filter-chain units stay supported for anyone who wants a fixed engine with no worker, no settings and no daemon. A PipeWire `filter-chain` hosts a LADSPA noise-suppression plugin and exposes the result as the same source, "Omarchy Broadcast Mic". It runs on the CPU only and is independent of `omarchy-broadcastd`.
 
 The units are **mutually exclusive** with the microphone with audio modules above. `omarchy-broadcast mic on` refuses while one of these units runs. Starting either kind of unit stops the other (`Conflicts=`).
 
-Two engines are available, each with its own configuration file: RNNoise (the default, light on CPU) and DeepFilterNet (higher quality, more CPU). See [Choose the engine of the units](#choose-the-engine-of-the-units). Each runs as its own process, started by one instance of the systemd user unit `omarchy-broadcast-mic@.service`. Both create a source with the same name, so run one at a time.
+Two engines are available, each with its own configuration file: RNNoise (the default, light on CPU) and DeepFilterNet (higher quality, more CPU). See [Choose the engine of the units](#choose-the-engine-of-the-units). Each runs as its own process, started by one instance of the systemd user unit `omarchy-broadcast-mic@.service`. Both create a source with the same name, so run one at a time. Each engine has its own `pipewire -c` process, not a `pipewire.conf.d` drop-in or PipeWire's stock `filter-chain.service`. A plugin fault or overrun then stays inside that process and cannot disturb other audio streams, and starting, stopping or reconfiguring the filter does not restart PipeWire or drop any stream. A drop-in directory would also load both engines together, and the stock unit is shared with any other filters you run.
 
 The configuration files and the unit are in the repository's `dist/` directory (`dist/pipewire/` and `dist/systemd/`). There are three ways to install them. Each installs both engines' configurations and the unit, and none enables anything.
 
@@ -518,7 +520,7 @@ sudo pacman -S noise-suppression-for-voice   # RNNoise engine (default)
 sudo pacman -S deepfilternet-ladspa          # DeepFilterNet engine
 ```
 
-`noise-suppression-for-voice` installs `/usr/lib/ladspa/librnnoise_ladspa.so`. `deepfilternet-ladspa` installs `/usr/lib/ladspa/libdeep_filter_ladspa.so`. The configurations were written against `noise-suppression-for-voice` 1.21 and `deepfilternet-ladspa` 0.5.6.
+`noise-suppression-for-voice` installs `/usr/lib/ladspa/librnnoise_ladspa.so`. `deepfilternet-ladspa` installs `/usr/lib/ladspa/libdeep_filter_ladspa.so`. The configurations were written against `noise-suppression-for-voice` 1.21 and `deepfilternet-ladspa` 0.5.6. The RNNoise plugin (`noise-suppression-for-voice`) is GPL-3.0 and DeepFilterNet's LADSPA plugin (`deepfilternet-ladspa`) is MIT or Apache-2.0. omarchy-broadcast uses these plugins but does not ship them; they are optional dependencies of the package.
 
 ## Install the units
 

@@ -16,7 +16,7 @@
 //!
 //! * [`CameraProfile`]: what a measurement found best for a camera model:
 //!   the control values to offer as "recommended settings" (never applied
-//!   without the user asking: the controls are the user's, ADR-0020), and
+//!   without the user asking: the controls are the user's), and
 //!   whether its picture is noisy enough to suggest noise removal.
 //! * [`StatusQuirk`]: what the daemon can tell of a camera's state from
 //!   its frames or its HID interface, for the camera status of

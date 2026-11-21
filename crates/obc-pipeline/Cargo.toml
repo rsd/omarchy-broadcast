@@ -19,7 +19,7 @@ libc = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 nvml-wrapper = { workspace = true }
-# The Process stage's effect element and the backend seams (ADR-0012).
+# The Process stage's effect element and the backend seams.
 gst-obc = { workspace = true }
 obc-backend = { workspace = true }
 # obc-bench loads its effect backends as the daemon does: from modules.

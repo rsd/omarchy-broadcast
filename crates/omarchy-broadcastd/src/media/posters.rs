@@ -1,4 +1,4 @@
-//! The posters a listing found missing, made off the listing (ADR 0032:
+//! The posters a listing found missing, made off the listing (:
 //! listing the gallery never decodes).
 //!
 //! [`PosterMaker::request`] queues videos and returns at once; one worker

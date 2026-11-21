@@ -31,7 +31,7 @@
 //! must not move), switched on and off on a loaded chain, before blur and
 //! replace, its temporal reset, both strengths, its GPU memory, its forced
 //! load and run failures, and a load after the GPU was parked and unparked
-//! (ADR 0017), which runs in a child process of this binary.
+//!, which runs in a child process of this binary.
 //!
 //! The `maxine_relight_` tests cover the relight stage: that it lights on
 //! every load in a process and after every live change of its light (the
@@ -1406,7 +1406,7 @@ fn maxine_denoise_gpu_memory_returns_after_unload() {
     denoise_rig(|gpu, stream, src, dst| {
         let mut backend = f.create_maxine().unwrap();
         // Prime the SDK's own per-context state, which stays until the
-        // context goes (ADR 0012), so it does not count as the stage's.
+        // context goes, so it does not count as the stage's.
         backend
             .load(gpu, &denoise_request(EffectKind::None))
             .unwrap();
@@ -1668,7 +1668,7 @@ fn maxine_denoise_loads_again_after_the_gpu_was_parked() {
     let f = factory();
     denoise_session(&f, "before parking");
     // The backend, the stream and the context are gone: what a session
-    // stop leaves behind (ADR 0017).
+    // stop leaves behind.
     match obc_gpu::park() {
         Ok(ParkOutcome::Parked { lock, checkpoint }) => {
             println!("PARK parked: lock {lock:?}, checkpoint {checkpoint:?}")
@@ -2412,7 +2412,7 @@ fn relight_session(f: &MaxineFactory, label: &str) {
 }
 
 /// The relight stage releases everything with its session (its stream
-/// included), so the GPU parks (ADR 0017), and it loads and lights again
+/// included), so the GPU parks, and it loads and lights again
 /// after unparking. Runs in a child process of this binary.
 #[test]
 #[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]

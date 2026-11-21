@@ -2,7 +2,7 @@
 //! `br.com.dias.OmarchyBroadcast1`, over a peer-to-peer D-Bus connection on a
 //! Unix socket pair: no session bus needed.
 //!
-//! The mock mirrors the daemon's contract (ADR-0011) closely enough to
+//! The mock mirrors the daemon's contract closely enough to
 //! exercise every property, method, error mapping and signal; it is not the
 //! daemon's implementation.
 
@@ -967,7 +967,7 @@ impl Mock {
 
     /// On: the mock's microphone as [`mic_on`], and one `MicStats`; off:
     /// `off`. Refused while the mock's microphone is in `error` (as the
-    /// daemon refuses with an ADR 0014 unit running).
+    /// daemon refuses with a single-engine unit running).
     async fn set_mic_host(
         &mut self,
         on: bool,

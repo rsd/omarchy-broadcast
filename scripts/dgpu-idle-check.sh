@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dgpu-idle-check.sh — does the NVIDIA dGPU runtime-suspend, and who keeps it awake?
 #
-# Acceptance check for ADR-0006 ("idle means zero CUDA contexts"); see
+# Acceptance check for the on-demand GPU lifecycle ("idle means zero CUDA contexts"); see
 # docs/benchmarks/dgpu-idle.md for the method and measured results.
 # Reads ONLY sysfs and /proc. It never calls nvidia-smi or NVML: both wake a
 # runtime-suspended dGPU and would defeat the measurement.

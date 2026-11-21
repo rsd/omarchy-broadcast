@@ -16,7 +16,7 @@ gst-video = { workspace = true }
 gst-app = { workspace = true }
 obc-backend = { workspace = true }
 obc-gpu = { workspace = true }
-# GStreamer's CUDA library is opened at run time, never linked (ADR-0012).
+# GStreamer's CUDA library is opened at run time, never linked.
 libloading = { workspace = true }
 # Opening the background image without blocking on a FIFO or a device.
 libc = { workspace = true }

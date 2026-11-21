@@ -574,7 +574,7 @@ impl<W: Worker, U: Units> Agent<W, U> {
         }
     }
 
-    /// `mic on`: refused while an ADR 0014 unit runs; else the mic host
+    /// `mic on`: refused while a single-engine unit runs; else the mic host
     /// enabled and started.
     async fn host_on_now(&mut self) -> Result<(), IpcError> {
         for legacy in LEGACY_UNITS {

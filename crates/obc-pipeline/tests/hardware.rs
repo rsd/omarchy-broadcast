@@ -2814,7 +2814,7 @@ fn the_writer_alone_is_a_capture_device_with_black_frames() {
     }
 }
 
-/// The core invariant of the daemon (ADR-0011): a consumer in another
+/// The core invariant of the daemon: a consumer in another
 /// process that holds the loopback across Idle -> Active -> Idle sees one
 /// format and an uninterrupted stream: black placeholders from the writer,
 /// then the frames a CUDA session's output forwards from the camera, then

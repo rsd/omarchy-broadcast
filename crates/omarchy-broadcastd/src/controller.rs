@@ -1,5 +1,4 @@
-//! The lifecycle state machine (`docs/adr/0011-daemon-lifecycle-and-dbus-api.md`,
-//! "Lifecycle").
+//! The lifecycle state machine.
 //!
 //! One [`Controller`] owns the config, the runtime state and, through its
 //! [`MediaBackend`], every pipeline. It reacts to [`Command`]s (D-Bus
@@ -70,7 +69,7 @@
 //! effect value this daemon does not accept: it never streams the raw
 //! image in place of an effect it could not read.
 //!
-//! The effect (`docs/adr/0012-video-effects-and-maxine-backend.md`): the
+//! The effect: the
 //! effective settings are the state file's (set by `SetEffect`,
 //! `SetBlurStrength`, `SetBackgroundImage`, `SetDenoise`) over the config's
 //! `[effect]`. A change applies to the running session without restarting
@@ -182,8 +181,8 @@
 //! controller's business: the backend reports them to the D-Bus side
 //! directly.
 //!
-//! Each camera keeps its own settings (`docs/adr/0020-camera-image-controls.md`,
-//! extended by the settings channel of revision 7, [`crate::settings`]):
+//! Each camera keeps its own settings (extended by the settings channel of revision 7,
+//! [`crate::settings`]):
 //! every control its node reports that the settings model publishes, and
 //! the Extension Unit rows of `obc_pipeline::xu`, stored by camera id and
 //! control name in the state file (raw device values). The device is
@@ -235,7 +234,7 @@
 //! (`RateLimited`, nothing stored). A settings change is saved once no
 //! other came for [`SAVE_DELAY`], and at once at shutdown, before a camera
 //! switch and with any other state change. While the state file is known
-//! not to take it (damaged, ADR 0011, or its last save failed) a settings
+//! not to take it (damaged, or its last save failed) a settings
 //! change is saved, or refused, at once instead, and the set or reset is
 //! `Failed` with why (the change is in force), as revision 6 answered; a
 //! delayed save that fails is logged and shown in `Error` when nothing
@@ -4592,7 +4591,7 @@ impl<B: MediaBackend> Controller<B> {
     /// Publishes the properties, and the settings tree when `settings`.
     /// Without it the tree is left for a later [`Self::publish`] of the same
     /// operation, so that an operation sends one `SettingsChanged` at most
-    /// (`docs/adr/0023-settings-schema.md`); the properties then carry the
+    ///; the properties then carry the
     /// revision published so far.
     fn publish_with(&mut self, settings: bool) {
         // The module the session keeps for its background effect, and the
@@ -6688,7 +6687,7 @@ impl<B: MediaBackend> Controller<B> {
 
     /// A settings change was made at `now`: saved after [`SAVE_DELAY`]
     /// (write-behind), unless the state file is known not to take it (it
-    /// is damaged and never overwritten before `SetEnabled`, ADR 0011, or
+    /// is damaged and never overwritten before `SetEnabled`, or
     /// its last save failed). Then it is saved (or refused) at once, and
     /// the call answers `Failed` with why, as revision 6 did.
     fn settings_saved(&mut self, now: Instant) -> Result<(), IpcError> {

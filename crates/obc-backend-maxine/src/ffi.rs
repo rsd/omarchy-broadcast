@@ -4,7 +4,7 @@
 //! Written by hand from NVIDIA's public API documentation for the Video
 //! Effects SDK and NvCVImage (function signatures, the `NvCVImage` layout,
 //! the parameter-name strings and the status codes used here). No SDK file
-//! is copied or needed at build time (`docs/adr/0012-video-effects-and-maxine-backend.md`).
+//! is copied or needed at build time.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
@@ -333,8 +333,7 @@ struct Registry {
     pin: Option<Source>,
     /// The SDKs opened, reused by later opens from the same place with the
     /// same names. Never closed: the SDK's libraries stay mapped for the
-    /// life of the process (`docs/adr/0012-video-effects-and-maxine-backend.md`,
-    /// Consequences).
+    /// life of the process.
     opened: Vec<Opened>,
 }
 

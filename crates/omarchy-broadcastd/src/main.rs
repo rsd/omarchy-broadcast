@@ -1,6 +1,5 @@
-//! `omarchy-broadcastd`: the headless daemon (see the library docs and
-//! `docs/adr/0011-daemon-lifecycle-and-dbus-api.md`). Normally run as the
-//! systemd user service `omarchy-broadcastd.service`.
+//! `omarchy-broadcastd`: the headless daemon (see the library docs).
+//! Normally run as the systemd user service `omarchy-broadcastd.service`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

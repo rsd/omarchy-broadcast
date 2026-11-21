@@ -2,7 +2,7 @@
 
 This guide covers running and configuring the daemon, `omarchy-broadcastd`, as a systemd user service. You need the daemon on every machine: it is the program that makes the virtual camera work. To install it, follow [INSTALL.md](../../INSTALL.md) first.
 
-The daemon owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus. It starts the camera and the GPU pipeline only while an application uses the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)).
+The daemon owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus. It starts the camera and the GPU pipeline only while an application uses the virtual camera ([architecture.md](../architecture.md)).
 
 ## Before you start
 
@@ -136,7 +136,7 @@ A v4l2loopback device serves one capture stream at a time: a second application 
 
 ### The PipeWire output
 
-The daemon can also register a native PipeWire video source, "Omarchy Broadcast", next to the loopback device ([ADR-0016](../adr/0016-pipewire-output.md)). The loopback stays as it is and remains the default. Applications that use PipeWire for cameras find the node without WirePlumber having to probe the loopback.
+The daemon can also register a native PipeWire video source, "Omarchy Broadcast", next to the loopback device. The loopback stays as it is and remains the default. Applications that use PipeWire for cameras find the node without WirePlumber having to probe the loopback.
 
 It is off in two places: the daemon must be built with the cargo feature, and the configuration must enable it.
 
@@ -176,12 +176,16 @@ gst-launch-1.0 pipewiresrc target-object=omarchy-broadcast ! videoconvert ! auto
 
 | Value | Meaning |
 |---|---|
+| `off` | The output is not enabled |
+| `connecting` | The connection to PipeWire is being made |
 | `ready` | The node is registered |
 | `streaming` | An application is linked |
 | `failed` | PipeWire is not running or the connection was lost. The daemon retries every 2 s, stays usable, and the loopback keeps working |
 | `unsupported` | The configuration enables the node in a daemon built without the feature |
 
 A PipeWire consumer starts the camera like a loopback consumer does, and `Consumers` is the total of both kinds.
+
+The node carries exactly the frames the loopback carries: the same contract and timestamps, black placeholders while no camera runs, and the last frame repeated (not black) while the output pauses for an effect change. Nothing is sent while no application streams from the node. No colour range or matrix is announced to consumers.
 
 **Applications.**
 
@@ -253,9 +257,9 @@ Applications that open `/dev/video*` directly are unaffected. The package does n
 
 A clean restart (`systemctl --user restart omarchy-broadcastd`, or an upgrade) is invisible to applications that hold the virtual camera. The old writer sends placeholders until it closes, and the new one starts within about 50 ms.
 
-If the daemon crashes, the unit restarts it after 250 ms (`RestartSec=250ms`). The camera picture returns once the new process has opened the camera and initialised CUDA, which takes seconds. Until then applications see the crash cover's image: black, or the away image when `[output] placeholder = "image"` and `[effect] fallback_image` are set ([ADR-0034](../adr/0034-away-image.md)).
+If the daemon crashes, the unit restarts it after 250 ms (`RestartSec=250ms`). The camera picture returns once the new process has opened the camera and initialised CUDA, which takes seconds. Until then applications see the crash cover's image: black, or the away image when `[output] placeholder = "image"` and `[effect] fallback_image` are set.
 
-Chromium-based applications (Chrome, Edge, Teams, Zoom in the browser, Discord, Slack and other Electron applications) could lose the camera in that time. To prevent it, the daemon prepares the loopback at every writer start. It uploads the cover's image (black, or the away image) and sets the driver's `timeout`, so the driver keeps serving that image after the daemon is gone ([loopback.md](loopback.md#what-the-daemon-sets-on-the-device), [ADR-0022](../adr/0022-crash-recovery-for-consumers.md)). The outcome is in the journal:
+Chromium-based applications (Chrome, Edge, Teams, Zoom in the browser, Discord, Slack and other Electron applications) could lose the camera in that time. To prevent it, the daemon prepares the loopback at every writer start. It uploads the cover's image (black, or the away image) and sets the driver's `timeout`, so the driver keeps serving that image after the daemon is gone ([loopback.md](loopback.md#what-the-daemon-sets-on-the-device)). The outcome is in the journal:
 
 ```text
 crash cover in place, timeout 250 ms (consumers keep receiving its timeout image if the daemon stops writing)
@@ -265,7 +269,7 @@ crash cover shows black in place of the away image: <reason>
 crash cover not in place: <reason>; a consumer may lose the camera if the daemon crashes
 ```
 
-The last line is only a warning. The daemon runs; an older v4l2loopback without the controls is one cause. The `crash cover shows` lines are logged once a cover is in place, and again whenever what it shows changes. The line "crash cover shows black in place of the away image" is a warning that the away image cannot be shown, with its reason; black is shown instead ([ADR-0034](../adr/0034-away-image.md)).
+The last line is only a warning. The daemon runs; an older v4l2loopback without the controls is one cause. The `crash cover shows` lines are logged once a cover is in place, and again whenever what it shows changes. The line "crash cover shows black in place of the away image" is a warning that the away image cannot be shown, with its reason;  black is shown instead.
 
 A crash loop is stopped. After 5 starts within 60 s (`StartLimitBurst=5`, `StartLimitIntervalSec=60`) systemd stops restarting the unit and it is `failed`. Manual starts and restarts count too. Bring it back with:
 
@@ -280,7 +284,7 @@ systemctl --user start omarchy-broadcastd
 
 The images you add as backgrounds, and your away images, are kept in a folder called `omarchy-broadcast` in your Pictures folder (`$(xdg-user-dir PICTURES)`, else `~/Pictures`). The away images are in its `away` folder. The videos, and the WebM made from an animated image, are kept in a folder of the same name in your Videos folder (`$(xdg-user-dir VIDEOS)`, else `~/Videos`).
 
-A file you copy there yourself is listed the next time the gallery is shown. The folders have nothing to do with the desktop's wallpapers. A gallery that an earlier version kept in `~/.local/share/omarchy-broadcast/media` is moved there once, when the daemon starts ([../adr/0032-background-gallery.md](../adr/0032-background-gallery.md)). The posters of videos are in the cache, `~/.cache/omarchy-broadcast/`, and you can delete them at any time.
+A file you copy there yourself is listed the next time the gallery is shown. The folders have nothing to do with the desktop's wallpapers. A gallery that an earlier version kept in `~/.local/share/omarchy-broadcast/media` is moved there once, when the daemon starts. The posters of videos are in the cache, `~/.cache/omarchy-broadcast/`, and you can delete them at any time.
 
 ### Playing a video without an NVIDIA GPU
 
@@ -293,6 +297,8 @@ A video background plays on every machine, but how depends on the GPU. With an N
 ```text
 The video background is shown as a still: it can't play without an NVIDIA GPU; run omarchy-broadcast media convert-command '/home/user/Videos/clip.mp4' for the conversion command
 ```
+
+The CPU plays VP9 only, on purpose: it is the one CPU decoder that ships in a required GStreamer package, so the same file behaves the same on every machine, and it costs two to four times less CPU than H.264, HEVC or AV1 at 1080p. Hardware decoding on an integrated GPU (VA-API) is not used, so a video that the integrated GPU could decode still shows as its poster until you convert it.
 
 The daemon does not convert the video itself. It tells you how, and you decide when.
 
@@ -312,7 +318,7 @@ Copy that line into a terminal and run it. It needs `ffmpeg` with `libvpx-vp9`. 
 
 **In the panel.** The Backgrounds section of the bar's setup dialog (bar plugin) lists your videos. A video the CPU cannot play has a note under it, the same command, and a **Copy** button that puts the command on the clipboard. Paste it in a terminal. The panel needs a daemon of interface revision 19 or later.
 
-A video chosen from outside the gallery, by a path in `config.toml`, has no row in the panel. But `omarchy-broadcast media convert-command PATH` works for any file ([../cli-json.md](../cli-json.md#media)). The rules, and why the daemon does not make the copy itself, are in [../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md).
+A video chosen from outside the gallery, by a path in `config.toml`, has no row in the panel. But `omarchy-broadcast media convert-command PATH` works for any file ([../cli-json.md](../cli-json.md#media)). The daemon does not make the converted copy itself. The command makes it in a folder you see and keep, and the daemon needs no conversion queue or cache.
 
 ### Configuration
 
@@ -329,7 +335,7 @@ omarchy-broadcast config show     # every key with the file that sets it
 omarchy-broadcast config files    # the files in load order
 ```
 
-See also [config.example.toml](../config.example.toml) and [ADR-0026](../adr/0026-config-d-and-managed-config.md).
+See also [config.example.toml](../config.example.toml).
 
 **Reload after editing**, without restarting:
 

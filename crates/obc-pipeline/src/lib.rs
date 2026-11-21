@@ -2,7 +2,7 @@
 //!
 //! Selects the camera (and its capture mode, from the capabilities it
 //! enumerates) and the v4l2loopback sink, and runs the stream in three
-//! stages (`docs/adr/0009-ingest-process-output.md`):
+//! stages:
 //!
 //! * **Ingest** ([`ingest`]), one pipeline per source: camera, CPU ingest
 //!   adapter where the format needs one, upload to CUDA memory, then crop
@@ -13,7 +13,7 @@
 //!   at the head of the output pipeline: nothing by default, or the
 //!   `obceffect` element when [`OutputConfig::effect`] is set, whose effect
 //!   (`none`, `blur`, `replace`) changes while the output streams
-//!   ([`Output::set_effect`]; `docs/adr/0012-video-effects-and-maxine-backend.md`),
+//!   ([`Output::set_effect`]),
 //!   and around it the stages of loadable modules ([`module`]), one
 //!   `obcmodule` element per [`OutputConfig::module_stages`] entry.
 //! * **Output** ([`output`]), one long-lived pipeline per sink with a fixed

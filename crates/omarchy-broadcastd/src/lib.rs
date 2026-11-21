@@ -1,6 +1,5 @@
 //! `omarchy-broadcastd`: the headless daemon that drives the virtual camera
-//! (`docs/adr/0011-daemon-lifecycle-and-dbus-api.md`; the client reference
-//! is `docs/dbus-api.md`).
+//! (the client reference is `docs/dbus-api.md`).
 //!
 //! Threads and their roles:
 //!

@@ -1,4 +1,4 @@
-//! CUDA driver helpers for the effect path (`docs/adr/0012-video-effects-and-maxine-backend.md`).
+//! CUDA driver helpers for the effect path.
 //!
 //! The driver (`libcuda.so.1`) is opened at run time, once per process
 //! ([`driver`]); nothing links against it. When it is missing, every helper

@@ -1,7 +1,7 @@
 //! The background image of the `replace` effect: checked, decoded with
 //! GStreamer, cropped to fill the output's aspect ratio (centred) and scaled
 //! to the output size, as packed BGR in host memory
-//! (`docs/adr/0012-video-effects-and-maxine-backend.md`).
+//!.
 //!
 //! The file is limited to [`MAX_FILE_BYTES`], to PNG, JPEG and still WebP,
 //! and to [`MAX_DIMENSION`] pixels on each side; anything else is refused

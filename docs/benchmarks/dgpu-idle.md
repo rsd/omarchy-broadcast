@@ -1,10 +1,9 @@
 # dGPU idle check after teardown
 
 Criterion: after teardown, the dGPU reaches `suspended`. Reframed as what can be measured: **the process holds no
-CUDA context when it is idle**, verified from sysfs (`power/runtime_status`) and `/proc`. Background is in
-[ADR-0006](../adr/0006-on-demand-gpu-lifecycle.md).
+CUDA context when it is idle**, verified from sysfs (`power/runtime_status`) and `/proc`. The daemon's design rule is that idle means zero CUDA contexts, so the NVIDIA GPU can suspend ([architecture.md](../architecture.md)).
 
-## Update: parked at Idle ([ADR-0017](../adr/0017-cuda-checkpoint-parking.md))
+## Update: parked at Idle
 
 The findings below are those of a daemon that tears down in-process only. The daemon now also parks its process with the CUDA checkpoint API once a session has fully stopped.
 
@@ -136,14 +135,14 @@ other clients):
 
 ## Unresolved question (answered by parking)
 
-The 7 fds and the UVM registration are now released by parking the process ([ADR-0017](../adr/0017-cuda-checkpoint-parking.md)), so the worker-process branch below is not needed. What remains open is observing the suspend itself.
+The 7 fds and the UVM registration are now released by parking the process, so the worker-process branch below is not needed. What remains open is observing the suspend itself.
 
-ADR-0006 needs the dGPU to suspend while the daemon idles in a live process. The evidence above leaves one question
+The design needs the dGPU to suspend while the daemon idles in a live process. The evidence above leaves one question
 open: **in fine-grained RTD3 mode, do the 7 `cuInit` handles that survive in-process teardown (no context, no
 memory) block runtime suspend?**
 
 - **If they do not block it:** a single-process daemon that builds and tears down pipelines in-process meets
-  ADR-0006 as designed.
+  the design as intended.
 - **If they do block it:** the CUDA/GStreamer work must live in a process that exits on teardown. Candidates are a
   separate worker process, or a daemon that re-execs. In that case the daemon itself must never load the `nvcodec`
   plugin or `libcuda`.

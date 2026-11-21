@@ -1,5 +1,5 @@
 //! The Process stage: the effect chain applied to canonical frames, at the
-//! head of the output pipeline (`docs/adr/0009-ingest-process-output.md`).
+//! head of the output pipeline.
 //!
 //! Its input and output are canonical frames (NV12 in CUDA memory, at the
 //! contract size, with the contract's colour label). It is empty by default.

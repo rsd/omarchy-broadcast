@@ -448,7 +448,7 @@ struct Mock {
     config_files: Vec<obc_ipc::ConfigFileEntry>,
     /// The microphone (revision 13).
     mic: MicStatus,
-    /// `SetMicHost` is refused with this (an ADR 0014 unit running).
+    /// `SetMicHost` is refused with this (a single-engine unit running).
     mic_refusal: Option<String>,
     /// The media gallery (revision 15): the items of each kind (the
     /// bundled ones first) and `MediaSerial`.

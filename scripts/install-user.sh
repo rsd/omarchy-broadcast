@@ -82,7 +82,7 @@
 # It does not install the WirePlumber drop-in or, without --mic or --audio, a
 # microphone. The Omarchy bar plugin is a separate project.
 #
-# The two microphones are alternatives: --mic installs the ADR 0014 units
+# The two microphones are alternatives: --mic installs the single-engine units
 # (omarchy-broadcast-mic@rnnoise and @deepfilter, one fixed engine each) and
 # --audio the mic host with audio modules (omarchy-broadcast-mic.service). All
 # of them create the same source name, so only one may run: their units declare
@@ -97,7 +97,7 @@
 #   --dry-run    Print every action; build nothing, change nothing.
 #   --no-build   Build nothing: install the binaries and the module library
 #                already in ${CARGO_TARGET_DIR:-target}/release.
-#   --mic        Also install the noise-removed microphone of ADR 0014 (see
+#   --mic        Also install the noise-removed microphone of the single-engine units (see
 #                above). Without it, microphone files installed by an earlier
 #                run stay in place and in the manifest, so --uninstall still
 #                removes them.
@@ -1063,7 +1063,7 @@ Optional, the microphone with audio modules (noise removal, room echo
 removal; see docs/setup/microphone.md). The CPU voice module $module_state
 ($(printf '%q' "$voice_lib_dst")). The mic host and the worker are not
 enabled; the worker starts when something records from the source. Enable the
-mic host only if no ADR 0014 unit (omarchy-broadcast-mic@...) is enabled:
+mic host only if no single-engine unit (omarchy-broadcast-mic@...) is enabled:
   systemctl --user daemon-reload
   systemctl --user enable --now omarchy-broadcast-mic.service
 The NVIDIA Maxine audio effects module $module_state ($(printf '%q' "$afx_lib_dst")).

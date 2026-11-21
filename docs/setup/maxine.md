@@ -2,7 +2,7 @@
 
 On an NVIDIA RTX GPU, the Maxine modules give you the GPU video effects `blur` and `replace`, video noise removal, relighting, the enhancement of a low-resolution camera, the HDR look and frame generation. Two more modules add eye contact and auto-framing, and GPU microphone effects. Use this page if you have such a GPU and your own copy of the NVIDIA SDKs. Without an NVIDIA GPU, use the open-model cut-out instead ([onnx.md](onnx.md)).
 
-The effects run on the NVIDIA Maxine Video Effects SDK, through the **Maxine module**. The module is a loadable module of omarchy-broadcast ([../modules.md](../modules.md), [ADR-0025](../adr/0025-loadable-modules.md)) that the daemon loads and that opens the SDK at run time.
+The effects run on the NVIDIA Maxine Video Effects SDK, through the **Maxine module**. The module is a loadable module of omarchy-broadcast ([../modules.md](../modules.md)) that the daemon loads and that opens the SDK at run time.
 
 omarchy-broadcast does not contain, build or download the SDK. The SDK is a personal download from NVIDIA. The sibling project omarchy-nvidia-sdks (the omarchy-nvidia-sdks repository) packages it for Arch as `maxine-vfx-sdk-local`.
 
@@ -27,7 +27,7 @@ Two more modules have their own sections below:
 - The AR effects, eye contact and auto-framing, run on a second SDK through a second module: [The Maxine AR module](#the-maxine-ar-module).
 - The microphone's GPU effects (noise removal, room echo removal and studio voice) run on a third, the Audio Effects SDK, through a third module. The audio worker loads that module, not the daemon: [The Maxine audio effects module](#the-maxine-audio-effects-module).
 
-Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, licence, API). The SDK is never vendored in this repository, see [ADR-0003](../adr/0003-maxine-first-behind-backend-seam.md). The decision to leave the SDK tooling to omarchy-nvidia-sdks is in [ADR-0021](../adr/0021-nvidia-sdk-handover.md).
+Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, licence, API). The SDK is never vendored in this repository, because its licence forbids redistribution. The SDK tooling lives in omarchy-nvidia-sdks.
 
 ## Quick start
 
@@ -114,7 +114,7 @@ Use an absolute path. `[effect] maxine_root` is still honoured: the daemon passe
 | Item | Requirement | Check |
 |---|---|---|
 | GPU | NVIDIA, compute capability 7.5 or newer (Turing and up). Tested on the reference machine: RTX 5080 Laptop, CC 12.0 (sm_120) | `nvidia-smi --query-gpu=name,compute_cap --format=csv` |
-| Driver | 570.26 or newer. Tested: 615.78.08. The mask-hardening kernel ([ADR-0013](../adr/0013-mask-hardening-cuda-kernel.md)) does not raise this floor or the GPU floor | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
+| Driver | 570.26 or newer. Tested: 615.78.08. The mask-hardening kernel does not raise this floor or the GPU floor | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
 | System CUDA toolkit | The SDK does not need it: the SDK bundles CUDA 12.8, cuDNN 9.7.1 and TensorRT 10.9 and only takes `libcuda.so.1` from the driver (`nvidia-utils`). The daemon's CUDA video path does need `cuda` for NVRTC (`libnvrtc.so`), which GStreamer's CUDA converters open, so the packages of the Maxine video module and the AR module depend on `cuda` | |
 | SDK features | One SDK package that contains the features below, with the models for your GPU architecture | `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` |
 
@@ -236,7 +236,7 @@ systemctl --user restart omarchy-broadcastd.service
 
 The SDK's model loader reads `/etc/os-release` and refuses distributions that are not on NVIDIA's list. Omarchy reports `ID=omarchy`, and the SDK then fails with `-1209` ("no kernel image is available for execution on the device"). That message is misleading: no CUDA error occurs.
 
-`os-release-shim.so` is an `LD_PRELOAD` library, part of `maxine-vfx-sdk-local`. It shows the preloading process a replacement `os-release` (Ubuntu 24.04) instead of the real file. Only that process is affected, and no root is needed. It does not modify the SDK, the models or their encryption. NVIDIA does not support this configuration. How it works is in the "The compatibility shim" section of `docs/usage.md` in the omarchy-nvidia-sdks repository.
+`os-release-shim.so` is an `LD_PRELOAD` library, part of `maxine-vfx-sdk-local`. It shows the preloading process a replacement `os-release` (Ubuntu 24.04) instead of the real file. Only that process is affected, and no root is needed. It does not modify the SDK, the models or their encryption. NVIDIA does not support this configuration. The shim works because the SDK reads `/etc/os-release` through an ordinary C library call. A future SDK version that reads it another way, or checks something else, would make the load fail again with `-1209`. The Maxine hardware tests detect this. How it works is in the "The compatibility shim" section of `docs/usage.md` in the omarchy-nvidia-sdks repository.
 
 Set `MAXINE_OS_RELEASE_DEBUG=1` in the daemon's environment to make the shim log each redirect on stderr. The journal then shows whether the shim is active.
 
@@ -244,7 +244,7 @@ Set `MAXINE_OS_RELEASE_DEBUG=1` in the daemon's environment to make the shim log
 
 The environment file never sets `LD_PRELOAD`, and you must not set it on a wrapper such as `timeout`, `sh -c` or `cargo`. The wrapper would load the shim, drop the variable and start the program without it, which then fails with `-1209`.
 
-The daemon does not run in a namespace with a bind-mounted `os-release`. The daemon finds consumers of the virtual camera by reading `/proc/<pid>/fd/N` of the user's other processes, which the kernel refuses inside a user namespace. See [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md).
+The daemon does not run in a namespace with a bind-mounted `os-release`. The daemon finds consumers of the virtual camera by reading `/proc/<pid>/fd/N` of the user's other processes, which the kernel refuses inside a user namespace.
 
 ## 4. The SDK root and the environment
 
@@ -323,15 +323,14 @@ With the SDK installed and its environment applied to the daemon (section 3), yo
 
 Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or `omarchy-broadcast denoise on|off` at run time. It removes the grain a webcam produces, which is mostly visible in dim rooms. It runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the package (section 2).
 
-- **It fails open.** Noise removal hides nothing. If it cannot load or run (the feature or SDK is missing, or the frame size is out of range), the stream continues without it, and the daemon's `Error` property says `noise removal unavailable: <reason>`. `[effect] on_failure` does not apply to it and the daemon does not enter `error`. The effects themselves still fail closed, as below.
+- **It fails open.** Noise removal hides nothing. If it cannot load or run (the feature or SDK is missing, or the frame size is out of range), the stream continues without it, and the daemon's `Error` property says `noise removal unavailable: <reason>`. The privacy setting (`[effect] privacy`) does not apply to it and the daemon does not enter `error`. With privacy on, the effects themselves fail closed, as below.
 - **Frame size.** The feature supports frames from 80x80 up to 1920x1080 (the SDK's range). An output contract above 1080p runs without noise removal and reports the reason.
 - **Strength.** The SDK's strength is binary: 0 favours texture, 1 favours noise removal. The daemon uses 1 and has no setting for it. For comparisons during development, `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process overrides it. It is a development knob only and is not a supported configuration.
 - **Cost.** It adds one GPU pass per frame and its model's GPU memory. With it off, nothing is added: no pass, copy or allocation. The models load only while it is on. Measure on your machine with `obc-bench --denoise` ([../testing.md](../testing.md)).
-- The design is in [ADR-0018](../adr/0018-video-noise-removal.md).
 
 ### Relighting, enhancement, HDR look and chair
 
-Relighting and enhancement are stages that stack the same way ([ADR-0024](../adr/0024-stackable-stages-and-effects-in-the-settings-schema.md)), and they fail open too. If one cannot run, the video continues without it and `Error` says why (`relighting unavailable: <reason>; the video continues without it`, `enhance unavailable: ...`).
+Relighting and enhancement are stages that stack the same way, and they fail open too. If one cannot run, the video continues without it and `Error` says why (`relighting unavailable: <reason>; the video continues without it`, `enhance unavailable: ...`).
 
 - **Relighting** (`[effect] relight = true`, or `omarchy-broadcast settings set effect.lighting.relight on`) lights the person with a warm, neutral or cool key light (`relight_light`). The direction is from -90 to 90 degrees (`relight_direction`) and the brightness from 50 to 200 percent (`relight_brightness`). The direction and the brightness change while it runs, with no reload. It runs after the green-screen mask, so it needs `nvvfxgreenscreen` as well. It lights only the person: the camera image (`none`), the blurred image or the replacement behind them is not relit. The daemon makes the lighting environments; the SDK ships none. When the camera is switched, the stage is built again from scratch, so the first frames of the new camera run without it.
 - **Enhancement** (`[effect] enhance = true`, or `settings set effect.video.enhance on`) upscales a camera that captures well below the output size. It runs before the picture is fitted to the output, by one of two methods (below). It applies only where it helps:
@@ -345,15 +344,16 @@ Relighting and enhancement are stages that stack the same way ([ADR-0024](../adr
   - `fast` ("Fast upscale (lower power)") is NVIDIA's non-AI upscale, the `nvvfxupscale` feature, at the SDK's default sharpening. It is lighter on the GPU and draws less power, for a picture with less restored detail than the AI method. It has no model files.
   - With neither method chosen, the installed one runs, `ai` first. If `ai` is chosen (it is the default) and its feature is not installed while `nvvfxupscale` is, the fast method runs instead and the daemon's log says so. If `fast` is chosen and `nvvfxupscale` is not installed, the stage is refused with the reason (`enhance unavailable: ...`). The costlier AI method never replaces it. The stage is shown as "Not installed" only when neither feature is.
 - **HDR look** (`omarchy-broadcast settings set effect.video.hdr true`, or the "HDR look" switch in the panel; off by default) gives the picture the look of NVIDIA's TrueHDR. TrueHDR converts the picture to HDR10 (the PQ transfer, BT.2020 primaries, 10 bits). omarchy-broadcast then converts the result back to an ordinary 8-bit SDR picture: a tone map that keeps the mid-tones where the camera had them, rolls the highlights off to SDR white and keeps the colour. So the virtual camera, the PipeWire node and the preview all show it, in any application. The picture has more contrast in the highlights and shadows and richer colour. It is a matter of taste, and with the switch off nothing is loaded. It needs the `nvvfxtruehdr` feature, which has no model files; without it the setting is greyed "Not installed". It runs on the finished picture, after the cut-out, the blur or the replacement, and relighting, and before frame generation.
-  - **No HDR output.** The output is 8-bit SDR and no application receives HDR. A real 10-bit HDR output is not built: no application that reads the camera on the reference system would show it as HDR ([ADR-0030](../adr/0030-hdr-look-and-truehdr.md)).
+  - **No HDR output.** The output is 8-bit SDR and no application receives HDR. A real 10-bit HDR output is not built: no application that reads the camera on the reference system would show it as HDR.
   - **Banding.** NVIDIA's debander is on (the SDK default), and it limits banding in smooth gradients of an 8-bit source (a plain wall, a soft shadow). Banding may still show there. If you see it, turn the look off.
-  - **High output rates.** The HDR look is tested up to 60 fps. When frames arrive much faster than a camera delivers them, NVIDIA's TrueHDR can give a frame an output that depends on the frames before it. At an output rate above 60 fps (the setting allows up to 240) this is untested, and it would show as faint temporal blending or flicker. There is no restriction ([ADR-0030](../adr/0030-hdr-look-and-truehdr.md#known-limitation-frames-run-much-faster-than-a-camera-delivers-them)).
+  - **High output rates.** The HDR look is tested up to 60 fps. When frames arrive much faster than a camera delivers them, NVIDIA's TrueHDR can give a frame an output that depends on the frames before it. At an output rate above 60 fps (the setting allows up to 240) this is untested, and it would show as faint temporal blending or flicker. There is no restriction.
   - **It fails open.** If the look cannot load or fails on a frame, the picture goes out without it. The cut-out is not affected.
 - **Chair.** The setting `effect.cutout.chair` ("Hide the chair with the background", in the "Cut-out" group; off by default) chooses what the green screen does with a chair the person sits on.
   - Off: the chair is cut out with the person (NVIDIA's "chair as foreground" segmentation).
   - On: the chair is treated as part of the background, so `blur` blurs it and `replace` covers it ("chair as background").
 
-  It applies to `blur` and `replace` (and to the relighting that uses the same mask), is greyed while the effect is `none`, and has no key in `config.toml`. Only the SDK's quality modes of the green screen are used. A change loads the green screen again in the other mode. The new one is built before the old one is released, so the previous cut-out keeps running until it is ready, and if the new one cannot be built the previous chain keeps running. The cut-out hides the room, so a failure here follows `[effect] on_failure` like any other failure of the effect and never lets the camera image through.
+  It applies to `blur` and `replace` (and to the relighting that uses the same mask), is greyed while the effect is `none`, and has no key in `config.toml`. Only the SDK's quality modes of the green screen are used. A change loads the green screen again in the other mode. The new one is built before the old one is released, so the previous cut-out keeps running until it is ready, and if the new one cannot be built the previous chain keeps running. The cut-out hides the room, so a failure here follows the privacy setting (`[effect] privacy`) like any other failure of the effect. With privacy on, it never lets the camera image through.
+- **The mask edge.** Before the background effects use the person mask, the Maxine module maps it through a fixed curve: a mask value of 128 or less becomes fully background, 224 or more becomes fully person, and values in between rise linearly. The values are fixed and there is no setting for them. The room no longer shows around the subject or faintly through it. The cost is that the outline sits 1 to 2 px further in, and fine structures such as hair and fingers lose a little of their soft edge. Two limits remain. The curve changes the edge, not the classification: if the model counts an object (a pile of blankets, say) as part of the person, it stays visible. The edge can also flicker slightly on a still subject, because the curve turns some small mask changes into larger changes of opacity at the edge.
 - **Cost.** Each stage adds a GPU pass per frame and its models' GPU memory while it is on, and nothing while it is off. Measure on your machine with `obc-bench --effect blur --denoise --relight` ([../testing.md](../testing.md)). The figures are not published.
 
 ### The replacement image and what you see while an effect loads
@@ -362,11 +362,11 @@ The background image for `replace` must be a PNG, JPEG or still WebP file. WebP 
 
 What the virtual camera shows while an effect loads:
 
-- **The camera starts with an effect requested.** The virtual camera shows black until the effect is ready, rather than the unprocessed camera image.
+- **The camera starts with an effect requested.** With privacy on (`[effect] privacy`), the virtual camera shows black, the away image or the last frame until the effect is ready, rather than the unprocessed camera image. With privacy off, the default, it shows the camera as it is until the effect is ready.
 - **You turn an effect on while the camera streams.** The camera picture, which was already on screen, continues until the effect is ready. Then the effect replaces it.
-- **The SDK cannot be loaded.** The virtual camera keeps showing black (the default `on_failure = "black"`; the camera stays open and the daemon's `Warning` property says why) instead of the unprocessed image.
+- **The SDK cannot be loaded.** With privacy off (`[effect] privacy`, the default), the virtual camera shows the camera as it is, without the effect; the camera stays open and the daemon's `Warning` property says why. With privacy on, it shows black, the away image or the last frame, by `privacy_mode`, instead of the unprocessed image.
 
-The design is in [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence. Reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
+Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence. Reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
 
 To check the SDK installation itself, use the check commands in the "Check the installation" section of `docs/usage.md` in the omarchy-nvidia-sdks repository, and its own tests. omarchy-broadcast has no probe of its own.
 
@@ -386,16 +386,17 @@ Problems with the SDK itself (download, package, architecture) are in omarchy-nv
 | The module is listed `unavailable`, with a reason such as `The library /... is not installed` or `Built for module ABI N; this daemon supports module ABI 1` | The library named by the manifest's `library` is missing, or was built for another version of the module interface than this daemon's | Check the paths with `omarchy-broadcast modules info br.com.dias.maxine-vfx`. Rebuild and reinstall the module from the same checkout as the daemon |
 | The module is `disabled` with `Disabled after crashing the daemon twice in a row` | The module's code was running when the daemon went down twice in a row (see the journal for the crash) | Fix the cause (the SDK installation and the shim of section 3 are the usual ones), then `omarchy-broadcast modules enable br.com.dias.maxine-vfx` |
 | A setting such as `effect.lighting.relight`, `effect.video.denoise` or `effect.video.hdr` is greyed "Not installed" | The package has no library, or no models for this GPU's architecture, for that feature (relighting also needs `nvvfxgreenscreen`; the HDR look needs `nvvfxtruehdr`, which has no model files) | `ls /opt/nvidia/maxine/videofx/features` and `ls /opt/nvidia/maxine/videofx/lib/models`. Rebuild the package with the feature and your architecture (section 2). The daemon looks again at its next start, reload and session |
+| A stage shows as installed, but the effect fails when it loads, and `Warning` gives the SDK's reason | Until the GPU's compute capability is known (before the first session on a machine, with no cache file), the check counts models for any architecture as installed. A model for another architecture then fails when the stage loads, and the stage fails open with the SDK's reason. The check reports what is on disk, not what loads | Install models for your GPU's architecture (section 2). After the first session the daemon knows the architecture and shows the stage as "Not installed" |
 | The daemon's `Error` says `relighting unavailable: ...` or `enhance unavailable: ...`, and the video is shown without it | The feature failed to load or run (the reason says which) | The reason names the SDK's status. Check section 3 (the shim applies to every feature's library) and the models. The video is not affected otherwise |
 | The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The package does not contain the `nvvfxdenoising` feature, or the daemon found no SDK root (section 4) and so looked for it on the library search path only | Check that `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` lists `nvvfxdenoising`. If not, rebuild the package with it (section 2). Check the `SDK environment` line (section 3) |
 | The same, with `-1209` or `-13` | The shim is not applied to this process (the feature's library needs it too), or the `Denoise-*` models for your architecture are not in the package | Section 3. `ls /opt/nvidia/maxine/videofx/lib/models` must show `Denoise-agg-<SM>.engine.trtpkg` and `Denoise-con-<SM>.engine.trtpkg`. Otherwise rebuild the package for your architecture |
 | The same, with a message that the frame size is out of range | The output contract is smaller than 80x80 or larger than 1920x1080 | Use an output mode within the range (`[output]` in `config.toml`). Noise removal does not run outside it |
-| The daemon's `Warning` property (`Error` before interface revision 11) or the element's status names the mask-hardening kernel and a CUDA error `222` ("the NVIDIA driver is older than this build supports") | The driver rejects the PTX of the mask-hardening kernel: it is older than 570.26 | Update the NVIDIA driver to 570.26 or newer (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`). With the default `on_failure = "black"` the virtual camera stays black until then |
+| The daemon's `Warning` property (`Error` before interface revision 11) or the element's status names the mask-hardening kernel and a CUDA error `222` ("the NVIDIA driver is older than this build supports") | The driver rejects the PTX of the mask-hardening kernel: it is older than 570.26 | Update the NVIDIA driver to 570.26 or newer (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`). With privacy on (`[effect] privacy`), the virtual camera stays black until then; with the default, privacy off, it shows the camera without the effect |
 | The same, with CUDA error `221` | The driver cannot JIT-compile the kernel: `libnvidia-ptxjitcompiler.so.1` is missing from the driver installation | Reinstall the driver's userspace package (`nvidia-utils`) so that it provides `libnvidia-ptxjitcompiler.so.1`. Check with `ldconfig -p \| grep ptxjitcompiler` |
 
 ## The Maxine AR module
 
-Two more effects run on the NVIDIA Maxine **AR** SDK, through a second module of omarchy-broadcast, `br.com.dias.maxine-ar` ([ADR-0028](../adr/0028-maxine-ar-module.md)):
+Two more effects run on the NVIDIA Maxine **AR** SDK, through a second module of omarchy-broadcast, `br.com.dias.maxine-ar`:
 
 - **Eye contact** redirects the eyes towards the camera.
 - **Auto-framing** is a digital pan and zoom that keeps the face in frame.
@@ -457,6 +458,7 @@ Both effects are off by default. They are in the settings tree (the bar plugin's
 
 - **Eye contact** (`effect.eye_contact.enabled`). It redirects the eyes of the largest face in view towards the camera. With no face the picture is unchanged. There is no strength control: the SDK has none, and its other parameters are left at the SDK's defaults. **Natural look-away** (`effect.eye_contact.look_away`, applies on reload) lets the eyes leave the camera now and then, as a person's do.
 - **Auto-framing** (`effect.auto_frame.enabled`). It crops the frame around the largest face and scales the crop back to the frame's size, so the face stays centred as the person moves. **Framing** (`effect.auto_frame.framing`: Tight, Medium or Wide, live) sets how close the crop is.
+  - **Framing** sets how much of the cropped picture the face fills: Tight 65 %, Medium 52 %, Wide 45 % of the crop's height. At a normal desk distance a face is 35 to 45 % of the frame's height, so Tight always zooms, Medium zooms moderately, and Wide stays at the full frame for a face larger than about 41 % of the height: Wide zooms only when you sit farther from the camera. A resting crop moves only when the zoom would exceed about 1.09, so small zooms do not show. The bar's panel shows the current zoom as a read-only line.
   - The zoom is capped at 1.5 times.
   - Small head movements do not move the picture, and the motion is smoothed.
   - When the face is lost, the crop holds for about two seconds and then eases back to the full frame.
@@ -479,7 +481,7 @@ A drop-in `maxine-ar.conf` written for an earlier version is not needed any more
 
 ## The Maxine audio effects module
 
-The microphone's GPU effects run on the NVIDIA Maxine **Audio Effects** SDK, through a third module of omarchy-broadcast, `br.com.dias.maxine-afx` (an `audio-filter` module: [../modules.md](../modules.md#the-audio-modules-in-this-repository), [ADR-0029](../adr/0029-audio-modules-mic-host-and-worker.md)). The Audio Effects SDK is a separate personal download from the Video Effects and AR SDKs. omarchy-nvidia-sdks packages it as `maxine-afx-sdk-local`. Section 9 applies to it too.
+The microphone's GPU effects run on the NVIDIA Maxine **Audio Effects** SDK, through a third module of omarchy-broadcast, `br.com.dias.maxine-afx` (an `audio-filter` module: [../modules.md](../modules.md#the-audio-modules-in-this-repository)). The Audio Effects SDK is a separate personal download from the Video Effects and AR SDKs. omarchy-nvidia-sdks packages it as `maxine-afx-sdk-local`. Section 9 applies to it too.
 
 It differs from the two video modules in three ways, which is why this page does not describe it with them:
 

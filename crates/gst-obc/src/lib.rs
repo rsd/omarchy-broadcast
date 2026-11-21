@@ -1,7 +1,7 @@
 //! The GStreamer effect element of omarchy-broadcast, `obceffect`, written in
 //! Rust in the gst-plugins-rs style and registered in-process
 //! ([`register`]), not as a plugin file
-//! (`docs/adr/0012-video-effects-and-maxine-backend.md`).
+//!.
 //!
 //! * [`ObcEffect`]: the element and its Rust API (backend factory, settings,
 //!   status, the status of each stage, statistics); see [`effect`] for its
