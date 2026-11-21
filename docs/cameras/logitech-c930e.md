@@ -1,8 +1,8 @@
 # Logitech Webcam C930e (046d:0843) on Linux
 
-Reference for the Logitech Webcam C930e: what the plain Linux kernel gives you, its vendor extension units and what each one holds, its microphone, and how omarchy-broadcast uses it.
+The Logitech Webcam C930e works on Linux with the standard `uvcvideo` driver and needs no extra software. It delivers 1080p at 30 fps in MJPEG, and it has no 60 fps mode. This page is the reference for the camera. It covers what the plain kernel gives you, its vendor extension units and what each one holds, its microphone, and how omarchy-broadcast uses it.
 
-Date: 2026-11-16. Firmware `bcdDevice` 0.21, USB 2.0 (480M), kernel 7.2 `uvcvideo` and `snd-usb-audio`. Measurements were made with one camera on a lit desk.
+Measured on 2026-11-16 with one camera on a lit desk: firmware `bcdDevice` 0.21, USB 2.0 (480M), kernel 7.2 `uvcvideo` and `snd-usb-audio`.
 
 ## Evidence levels
 
@@ -14,9 +14,9 @@ Date: 2026-11-16. Firmware `bcdDevice` 0.21, USB 2.0 (480M), kernel 7.2 `uvcvide
 
 ## Device topology
 
-Interfaces: VideoControl, VideoStreaming, and a USB Audio Class microphone. The camera has no HID interface.
+The camera has three interfaces: VideoControl, VideoStreaming, and a USB Audio Class microphone. It has no HID interface.
 
-The UVC descriptors list a camera terminal, a processing unit and seven extension units (XU). In every control request `wIndex = unit << 8 | interface` (interface 0) and `wValue = selector << 8`. Unit IDs are specific to the camera and firmware: **match extension units by GUID, never by unit ID**.
+The UVC descriptors list a camera terminal, a processing unit and seven extension units (XU). In every control request, `wIndex = unit << 8 | interface` (interface 0) and `wValue = selector << 8`. Unit IDs are specific to the camera and firmware. **Match extension units by GUID, never by unit ID.**
 
 | Unit | Type | GUID | Selectors present | Identified as |
 |---|---|---|---|---|
@@ -30,7 +30,7 @@ The UVC descriptors list a camera terminal, a processing unit and seven extensio
 | 12 | XU | `a29e7641-de04-47e3-8b2b-f4341aff003b` | `0x01`–`0x03`, `0x09`–`0x0f` | UVC H.264 extension (UVCX) |
 | 13 | XU | `13612d26-5aaa-46c4-b13d-ff4d9a60db86` | `0x02` | not in public Logitech data |
 
-"Selectors present" is what answered `GET_INFO` among selectors 1 to 32 of each unit (measured); the others answer `ENOENT`. It matches the units' `bmControls` bitmaps, except unit 10, whose bitmap marks eight selectors while its `bNumControls` says seven.
+"Selectors present" is what answered `GET_INFO` among selectors 1 to 32 of each unit (measured). The others answer `ENOENT`. The list matches the units' `bmControls` bitmaps, except for unit 10: its bitmap marks eight selectors, while its `bNumControls` says seven.
 
 ## Video formats and modes
 
@@ -41,7 +41,7 @@ Two formats, measured with `v4l2-ctl --list-formats-ext`:
 
 There is **no 60 fps mode** at any size. 1080p at 30 fps is MJPEG only.
 
-The H.264 encoder of the camera (unit 12) is not a separate format on the video node: it is reached through the UVCX extension unit, as GStreamer's `uvch264src` does. Read-verified, its committed configuration is 1920x1080 at 30 fps (frame interval 333333 x 100 ns) and 3 Mb/s, with bit rates from 64 kb/s to 12 Mb/s and frame intervals up to 200 ms (5 fps); the UVCX version (selector `0x0a`) reads 1.00.
+The camera's H.264 encoder (unit 12) is not a separate format on the video node. You reach it through the UVCX extension unit, as GStreamer's `uvch264src` does. Read-verified, its committed configuration is 1920x1080 at 30 fps (frame interval 333333 x 100 ns) and 3 Mb/s. Bit rates run from 64 kb/s to 12 Mb/s, and frame intervals go up to 200 ms (5 fps). The UVCX version (selector `0x0a`) reads 1.00.
 
 ## Standard UVC controls
 
@@ -150,38 +150,30 @@ Levels, measured through the Omarchy Broadcast Mic with the C930e as its pinned 
 |---|---|---|---|
 | The camera's own PipeWire source, left / right | −25.5 / −23.7 dBFS | −1.9 / −1.2 dBFS | −43.6 / −41.4 dBFS |
 | Omarchy Broadcast Mic, noise removal off | −27.2 dBFS | −2.9 dBFS | −43.7 dBFS |
-| Omarchy Broadcast Mic, noise removal on (NVIDIA Maxine) | −30.7 dBFS | −8.2 dBFS | −76.7 dBFS |
 
-Noise removal lowers the noise floor by about 33 dB and the speech level by about 3.5 dB. The peaks come close to full scale at the default gain; a lower hardware gain leaves more headroom for a loud voice.
+The peaks come close to full scale at the default gain; a lower hardware gain leaves more headroom for a loud voice.
 
 ## In omarchy-broadcast
 
 ### Mode selection
 
-The default capture request (`camera.mode`, 1080p60) resolves to **MJPEG 1920x1080 at 30 fps**: there is no 60 fps mode, and at 1080p the rate is kept over the format (YUYV is 5 fps there), so the camera is decoded on the CPU. Requests for 720p60 give MJPEG 1280x720 at 30 fps. Small sizes offered by both formats at the same rate (640x360 at 30) take YUYV. The capture-mode setting lists the MJPEG sizes from 1920x1080 down to 640x360, at 30 fps and, down to 960x540, at 24 fps.
+The default capture request (`camera.mode`, 1080p60) resolves to **MJPEG 1920x1080 at 30 fps**. There is no 60 fps mode, and at 1080p the rate is kept over the format (YUYV is 5 fps there), so the CPU decodes the camera. Requests for 720p60 give MJPEG 1280x720 at 30 fps. Small sizes that both formats offer at the same rate (640x360 at 30) take YUYV. The capture-mode setting lists the MJPEG sizes from 1920x1080 down to 640x360 at 30 fps, and down to 960x540 at 24 fps.
 
 ### Measured with the virtual camera
 
-1080p30 output (NV12), the camera in MJPEG 1080p30, 10 s per row; frame rate from a consumer of the virtual camera, added latency (`latency_p50_ms`, camera buffer to output tick) and load from the daemon's statistics; NVIDIA GPU effects.
+1080p30 output (NV12), the camera in MJPEG 1080p30, 10 s per run; frame rate from a consumer of the virtual camera, added latency (`latency_p50_ms`, camera buffer to output tick) and load from the daemon's statistics.
 
 | Effect | Consumer fps | Added latency p50 | Daemon CPU | GPU |
 |---|---|---|---|---|
-| none | 30.2 | 6.0 ms | 13 % | 1 % |
-| blur | 30.4 | 5.8 ms | 17 % | 9 % |
-| replace (image) | 30.2 | 5.8 ms | 17 % | 16 % |
-| noise removal | 30.4 | 5.9 ms | 19 % | 19 % |
-| HDR look | 30.2 | 5.7 ms | 16 % | 4 % |
-| relighting | 30.5 | 5.6 ms | 48 % | 47 % |
-| eye contact | 30.8 | 5.7 ms | 19 % | 10 % |
-| auto-framing | 30.2 | 5.6 ms | 14 % | 14 % |
+| none (passthrough) | 30.2 | 6.0 ms | 13 % | 1 % |
 
-No frame was dropped in any run. "Enhance low-resolution camera" does not apply: the camera captures at the output's full resolution.
+Every NVIDIA Maxine effect was also run: blur, replace, noise removal, HDR look, relighting, eye contact and auto-framing. Each held the camera's 30 fps, and no frame was dropped in any run. Maxine performance figures are not published ([README](../../README.md#limitations)). "Enhance low-resolution camera" does not apply: the camera captures at the output's full resolution.
 
 ### Settings
 
-Every standard control is published. The camera's row of control labels (`CONTROL_LABELS`) keeps the stock labels and gives three settings a description: pan and tilt move the picture only while zoomed in, and the gain is the camera's own while automatic exposure is on. No control is hidden, and no range is rewritten: the exposure time keeps its 3 to 2047 range although the camera keeps only about one value per stop in it.
+omarchy-broadcast publishes every standard control. The camera's row of control labels (`CONTROL_LABELS`) keeps the stock labels and gives three settings a description: pan and tilt move the picture only while zoomed in, and the gain is the camera's own while automatic exposure is on. No control is hidden, and no range is rewritten. The exposure time keeps its 3 to 2047 range, although the camera keeps only about one value per stop in it.
 
-The recommended settings of this model are the camera's defaults (noise removal is not suggested: it cleans the picture by about 20 %).
+The recommended settings of this model are the camera's defaults (video noise removal is not suggested: it adds little on this camera).
 
 ## Open questions
 

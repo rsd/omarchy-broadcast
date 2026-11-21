@@ -1,86 +1,198 @@
 # omarchy-broadcast
 
-A webcam-effects pipeline for Linux, with GPU acceleration on NVIDIA hardware. Frames flow from a camera through GStreamer, in CUDA or system memory, into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) virtual camera that any application can select. The effects (background blur and background replacement), video noise removal, relighting of the person and enhancement of a low-resolution camera are provided by **modules**: a manifest and a shared library behind a versioned C ABI, which the daemon discovers at run time and which can be built and distributed separately ([docs/modules.md](docs/modules.md)). The Maxine module, which uses the NVIDIA Maxine Video Effects SDK, is the first; with no module installed the daemon passes the camera image through.
+**A virtual camera and a virtual microphone with live effects for Omarchy and Arch Linux.** Blur or replace your background, remove noise, fix the light and look into the lens, in any application that reads a camera or a microphone.
 
-Optionally, the daemon also offers the camera as a native PipeWire video source, "Omarchy Broadcast", next to the loopback device, for applications that use PipeWire for cameras ([docs/setup/daemon.md](docs/setup/daemon.md#the-pipewire-output)).
+The daemon, `omarchy-broadcastd`, reads your webcam, applies the effects you choose and writes the result to a virtual camera. Chrome, OBS, Zoom and Discord select it like any other camera. Any UVC webcam works. UVC is the standard USB camera class.
 
-Any UVC webcam works: the pipeline picks a capture mode from what the camera advertises, and adds a CPU decode step for MJPEG cameras and a CPU convert step for YUYV/UYVY.
+**Install:** `yay -S omarchy-broadcast-bin omarchy-broadcast-onnx-bin`, then do the [other install steps](#install). An NVIDIA GPU is optional.
 
-## Status
+## What you get
 
-Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. The `omarchy-broadcastd` daemon (a systemd user service controlled over D-Bus) and the `omarchy-broadcast` command-line client run it on demand: the camera and GPU start when an application opens the virtual camera ([docs/setup/daemon.md](docs/setup/daemon.md)). `omarchy-broadcast start` starts the daemon itself through D-Bus activation, without `systemctl`, and prints its status; it changes no setting and does not turn the camera on ([docs/cli-json.md](docs/cli-json.md)). Background blur and background replacement run on the GPU through the Maxine module and the Maxine SDK, which each user installs ([docs/setup/maxine.md](docs/setup/maxine.md)); they are selected with `omarchy-broadcast effect` and add a small GPU cost per frame; choosing `replace` with no background set uses the first bundled background, so it works at once (`effect replace --image FILE` or the panel chooses another). Video noise removal, which removes the grain a webcam shows in dim rooms, is a separate switch that combines with either effect or runs alone: `omarchy-broadcast denoise on|off` ([docs/adr/0018-video-noise-removal.md](docs/adr/0018-video-noise-removal.md)). It adds one GPU pass per frame while it is on, and it fails open: if it cannot run, the stream continues without it. Two more stages stack the same way and fail open too ([docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md](docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md)): relighting lights the person with a warm, neutral or cool key light whose direction and brightness can be adjusted, and the background behind them is never relit; and enhancement upscales a camera that captures well below the output size (for example a 960x540 or 640x360 mode into 1080p) before it is fitted to the output, so it is sharper than scaling alone. All of them, and the effect itself, are settings of the same tree as the camera's (`omarchy-broadcast settings`, `effect.*`), and a stage whose SDK feature is not installed is shown as not installed. Blur and replace harden the segmentation mask edge, so the room does not show through around the subject ([docs/adr/0013-mask-hardening-cuda-kernel.md](docs/adr/0013-mask-hardening-cuda-kernel.md)). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [docs/testing.md](docs/testing.md)). Other measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
+**On any machine** (CPU, or an Intel GPU or NPU through ONNX Runtime):
 
-If the daemon crashes, applications that hold the virtual camera keep it: the daemon leaves a black timeout image and a `timeout` on the loopback, so Chromium-based applications get black frames until the restarted daemon writes again, and the unit restarts it after 250 ms. Known limitation: consumers of the native PipeWire node do not reconnect after a crash; use the loopback device where that matters ([docs/adr/0022-crash-recovery-for-consumers.md](docs/adr/0022-crash-recovery-for-consumers.md), [docs/setup/daemon.md](docs/setup/daemon.md#restarts-and-crashes)).
+- Background blur and background replacement with open Apache-2.0 models. A replacement can be an image, an animated image or a video; two loops and a set of backgrounds are bundled.
+- Camera passthrough with the camera's own image settings: brightness, contrast, saturation, exposure, white balance, focus and zoom, set per camera.
+- A choice of the camera's resolution and frame rate and of the virtual camera's size and rate.
+- A virtual microphone, **Omarchy Broadcast Mic**, with noise removal on the CPU (DeepFilterNet by default, or RNNoise).
 
-The effects are modules ([docs/adr/0025-loadable-modules.md](docs/adr/0025-loadable-modules.md), D-Bus revision 9 and later; the interface is at revision 28). The Arch package `omarchy-broadcast-maxine-vfx-git` installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so`, with its manifest in `/usr/lib/omarchy-broadcast/modules.d/`; it loads the SDK at run time, and the package depends on the SDK package `maxine-vfx-sdk-local`. `omarchy-broadcast modules` lists the modules found, with their status, the reason when one is unavailable, and the stages each provides; `modules enable|disable ID`, `modules profile quality|battery` and `modules pin STAGE MODULE` choose which module provides a stage (applied when the camera next starts; a disabled module's stages leave the running stream at once, a selected background effect that no module can run shows the camera image, or with privacy on (`[effect] privacy`) black frames, the away image or the effect's last frame, and any other stage that no module provides is left out with a warning), and `omarchy-broadcast order` shows and sets the order the stages run in, within the limits each module declares. The daemon writes these choices, and the settings the bar's setup dialog changes (`omarchy-broadcast config`), to `~/.config/omarchy-broadcast/config.d/50-panel.toml`, which it manages; `config.toml` stays yours, a later file such as `config.d/90-local.toml` wins over the managed one, and the daemon refuses to change a key such as that ([docs/adr/0026-config-d-and-managed-config.md](docs/adr/0026-config-d-and-managed-config.md)). The Arch package `omarchy-broadcast-maxine-ar-git` installs the Maxine AR module (`br.com.dias.maxine-ar`, which needs the NVIDIA Maxine AR SDK as `maxine-ar-sdk-local`), which adds two effects, off by default: **Eye contact**, which redirects the eyes towards the camera, and **Auto-framing**, which pans and zooms digitally to keep the face in frame ([docs/setup/maxine.md](docs/setup/maxine.md#the-maxine-ar-module), [docs/adr/0028-maxine-ar-module.md](docs/adr/0028-maxine-ar-module.md)). The Arch package `omarchy-broadcast-onnx-git` adds the open-model cut-out (`br.com.dias.onnx-cutout`): the same `background` stage with open Apache-2.0 models run by ONNX Runtime, so the background effect needs no NVIDIA SDK; it is preferred by the `battery` profile, Maxine by `quality`, and it also runs in the system-memory pipeline without an NVIDIA GPU ([docs/setup/onnx.md](docs/setup/onnx.md), [docs/adr/0031-onnx-cutout-module.md](docs/adr/0031-onnx-cutout-module.md)). A module's settings appear in `omarchy-broadcast settings` and in the bar panel with no change to them. Someone can write a module with the Rust SDK or against the C header and install it in `~/.local/share/omarchy-broadcast/modules.d/`: [docs/modules.md](docs/modules.md) is the author guide and `examples/module-hello` a complete example. The Maxine SDK root is the module's setting, `sdk_root` in `[module."br.com.dias.maxine-vfx"]` (`[effect] maxine_root` still works).
+**With an NVIDIA RTX GPU** (the optional NVIDIA Maxine modules, with an SDK you obtain yourself):
+
+- Background blur and replacement on the GPU, with a hardened mask edge.
+- Video noise removal, which clears the grain a webcam shows in dim rooms.
+- Relighting of the person with a warm, neutral or cool key light. You adjust its direction and brightness. The background is never relit.
+- Enhancement, which upscales a camera that captures well below the output size.
+- Eye contact and auto-framing. Eye contact redirects your eyes towards the camera. Auto-framing pans and zooms digitally to keep your face in frame. Both are off by default.
+- Frame generation: an output at twice the camera's rate, for example 60 fps from a 30 fps camera.
+- Room echo removal and studio voice for the microphone.
+
+Each effect is a **module**: a manifest and a shared library that the daemon discovers at run time. With no module installed, the daemon passes the camera image through. You can [write your own module](docs/modules.md).
+
+## Why use it
+
+- **It runs on your machine.** The daemon processes video and audio locally. The open-model path needs no NVIDIA SDK.
+- **It works in any application.** The virtual camera is a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) device. An optional PipeWire camera node, "Omarchy Broadcast", serves several applications at once.
+- **It leaves the GPU alone when you do not use it.** The camera and GPU start when an application opens the virtual camera. Idle means no CUDA context. On a battery, the daemon can keep the frames in system memory and not wake the NVIDIA GPU.
+- **You control it from the Omarchy bar.** The [bar plugin](#the-bar-plugin) shows the camera's state and opens a panel with a live preview, the effects, the camera's settings and the microphone.
+- **It fails safe.** If the daemon stops, applications keep receiving your microphone, unprocessed. If an effect cannot run, the virtual camera shows the camera as it is. Turn privacy on to show black frames, an away image or the last frame instead.
+
+## Install
+
+Install the core and one module. The virtual camera needs a v4l2loopback device, which the package does not set up. Do the steps in order.
+
+1. **Install the packages from the AUR.** The `-bin` packages are prebuilt. The `-git` packages build from the latest source. They conflict with each other, so install one kind.
+
+   ```sh
+   yay -S omarchy-broadcast-bin omarchy-broadcast-onnx-bin     # prebuilt
+   yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git     # built from source
+   ```
+
+   Without an NVIDIA GPU, add `onnxruntime-cpu`. With one, add `cuda`. The packages do not include the NVIDIA SDKs or ONNX Runtime, which are licensed separately. Right after a release, an AUR helper can show the previous version for a few minutes. Details: [docs/setup/daemon.md](docs/setup/daemon.md#from-the-aur).
+
+2. **Create the virtual camera device.** This needs root and runs once. If `/etc/modprobe.d` already has an `options v4l2loopback` line, merge the two lines as [docs/setup/loopback.md](docs/setup/loopback.md) describes.
+
+   ```sh
+   sudo install -Dm644 /usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf /etc/modprobe.d/omarchy-broadcast.conf
+   echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
+   sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
+   ```
+
+   The reload fails with "Module v4l2loopback is in use" while an application holds a loopback node. Close it and run the reload again.
+
+3. **Start the daemon at every login.**
+
+   ```sh
+   systemctl --user enable --now omarchy-broadcastd
+   ```
+
+4. **Turn on the microphone (optional).**
+
+   ```sh
+   omarchy-broadcast mic on
+   ```
+
+On a first install the package prints these steps. On an upgrade it prints one line: `systemctl --user try-restart omarchy-broadcastd`.
+
+### Check that it works
+
+```sh
+omarchy-broadcast start
+```
+
+`start` starts the daemon through D-Bus activation if it is not running, and prints its status. It changes no setting and does not turn the camera on. Expect a block of lines that includes your camera:
+
+```text
+State:      idle
+Camera:     <your camera>
+Consumers:  0
+```
+
+`State` is `idle` while no application uses the camera and `active` while one does. It is `off` if you turned the camera off: run `omarchy-broadcast on`. Now select **Omarchy Broadcast** as the camera in OBS or Chrome and choose an effect:
+
+```sh
+omarchy-broadcast effect blur
+omarchy-broadcast effect replace      # with no background set, uses the first bundled background
+```
+
+`effect replace --image FILE` or the bar panel chooses another background. The effect list and a few more commands are below. All of them are in [docs/cli-json.md](docs/cli-json.md).
 
 ```sh
 omarchy-broadcast modules                      # the modules, their status and stages
 omarchy-broadcast modules profile battery      # prefer an NPU or the CPU over a GPU, where a module offers one
-omarchy-broadcast order                        # the order the stages run in
-```
-
-The microphone is a feature of its own: **Omarchy Broadcast Mic**, a virtual microphone with noise removal that any application can select, produced by audio modules (a CPU module with DeepFilterNet, the default, and RNNoise ships, and a module for NVIDIA GPUs with room echo removal and studio voice besides noise removal runs on the NVIDIA Maxine Audio Effects SDK, which you obtain yourself; other engines can be added as modules). It runs apart from the video daemon, as a stable PipeWire node and an audio worker, so that whatever stops, applications keep receiving your microphone, unprocessed, and are never left silent. It is off until you turn it on, makes itself the default microphone only when you ask, and restores the previous default when you ask or turn it off: `omarchy-broadcast mic on`, `mic default`, `mic restore-default`, `mic off` ([docs/setup/microphone.md](docs/setup/microphone.md), [docs/adr/0029-audio-modules-mic-host-and-worker.md](docs/adr/0029-audio-modules-mic-host-and-worker.md), D-Bus revision 13). The older single-engine filter-chain units remain as a lightweight alternative.
-
-Some cameras keep image settings from other software far from their defaults (oversharpened, oversaturated). `omarchy-broadcast controls` shows a camera's brightness, contrast, saturation, sharpness and backlight compensation, `omarchy-broadcast controls set NAME VALUE` changes one and `omarchy-broadcast controls reset` puts them back to the camera's defaults. The daemon keeps the values per camera and writes them whenever that camera opens ([docs/adr/0020-camera-image-controls.md](docs/adr/0020-camera-image-controls.md)).
-
-Beyond those five, `omarchy-broadcast settings` lists every standard setting the camera offers, by group (image, white balance, exposure, focus and zoom, anything else), with its value, what it takes and, for one that cannot be changed now, why: exposure time is greyed with "Set exposure to manual to change this" while exposure is automatic. The daemon works the rules out from the camera's own flags, so no client carries a list of controls. On a Logitech Brio or MX Brio the field of view (90, 78 or 65 degrees) is among them. The values are stored per camera and written whenever the camera opens, as above.
-
-```sh
-omarchy-broadcast settings                                        # show them all
+omarchy-broadcast denoise on                   # video noise removal
+omarchy-broadcast settings                     # every setting of the camera and of the effects
 omarchy-broadcast settings set camera.exposure.auto_exposure manual
-omarchy-broadcast settings set camera.exposure.exposure_time_absolute 400
-omarchy-broadcast settings set camera.exposure.keep_framerate on  # keep 30 fps in low light
-omarchy-broadcast settings set -- camera.focus.pan_absolute -3600
-omarchy-broadcast settings reset --group=exposure                 # or --setting=ID, or nothing for the whole camera
-omarchy-broadcast settings set effect.lighting.relight on          # the video effects, for every camera
-omarchy-broadcast settings set effect.lighting.light warm
-omarchy-broadcast settings set -- effect.lighting.direction -30
+omarchy-broadcast settings reset --group=exposure   # or --setting=ID, or nothing for the whole camera
+omarchy-broadcast settings set effect.lighting.relight on
+omarchy-broadcast mic default                  # make Omarchy Broadcast Mic the default microphone
 ```
 
-A change applies at once while the camera is in use, and otherwise at the next time it opens. While the daemon has the camera open it also follows changes other software makes to it, with no polling. From D-Bus revision 8 the tree also holds the video effects (`effect.*`, scope `global`: the same for every camera, present with no camera, never reset by a camera reset). The tree, the D-Bus revision 7 and 8 members and the `watch --json` lines that carry it are described in [docs/adr/0023-settings-schema.md](docs/adr/0023-settings-schema.md), [docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md](docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md), [docs/dbus-api.md](docs/dbus-api.md#camera-settings) and [docs/cli-json.md](docs/cli-json.md#camera-settings).
+### Choose your modules
 
-The camera's resolution and frame rate are the first settings of the list (`camera.capture.mode`, from D-Bus revision 12): `auto` or one of the sizes and rates the camera reports, kept per camera and applied at once. The size and rate of the virtual camera are `output.mode`, a choice computed from the camera that `omarchy-broadcast config set output.mode 1280x720@30` or the setup dialog changes; while an application holds the virtual camera the change waits for it, and `Warning` says for whom, and a format that cannot start reverts to one that works ([docs/setup/loopback.md](docs/setup/loopback.md#changing-the-output-size-and-rate)). With the Maxine module and a camera at half the output rate (a 30 fps camera into a 60 fps output), the output can also be made at twice the camera's rate with video frame generation, one output tick later ([docs/adr/0027-output-modes-frame-generation-and-privacy-fallback.md](docs/adr/0027-output-modes-frame-generation-and-privacy-fallback.md)). When an effect cannot run, the virtual camera shows the camera as it is, unless privacy is on (`[effect] privacy`, off by default from daemon 0.48.0; "Hide the camera when an effect can't run" in the setup dialog). With privacy on, `[effect] privacy_mode` chooses what is shown instead: black (`black`, the default), your own still image (`away`, the `fallback_image` set in the configuration file or the dialog) or the last frame the effect produced (`freeze`). The older key `on_failure` is still read ([docs/adr/0037-privacy-as-an-option.md](docs/adr/0037-privacy-as-an-option.md)).
+The core installs the daemon, the CLI, the units, the CPU voice module and the microphone's parts. Each module is a package of its own, so you install only what you use. Add `-bin` or `-git` to the name, the same kind as the core.
+
+| Package | What it adds | Depends on |
+|---|---|---|
+| `omarchy-broadcast` | The core: the daemon and the CLI, the audio worker, the CPU voice module, the microphone's host and plug-in, the units, the D-Bus files, the udev rule, the media and the documentation. The CPU video path is part of the daemon | optional: `nvidia-utils` and `cuda`, for the CUDA video path on NVIDIA GPUs |
+| `omarchy-broadcast-onnx` | The open-model cut-out module (blur and replace, no NVIDIA SDK). Models are separate packages | `onnxruntime>=1.29`, `omarchy-onnx-model-mediapipe-landscape`; optional: the other `omarchy-onnx-model-*` packages and an `onnxruntime-provider-cuda`, `-tensorrt` or `-openvino` engine |
+| `omarchy-broadcast-maxine-vfx` | The Maxine video effects module | `cuda`, `maxine-vfx-sdk-local` |
+| `omarchy-broadcast-maxine-ar` | The Maxine AR module (eye contact, auto-framing) | `cuda`, `maxine-ar-sdk-local` |
+| `omarchy-broadcast-maxine-afx` | The Maxine audio effects module for the microphone | `maxine-afx-sdk-local` |
+
+- Each `-bin` package installs the files of its `-git` twin and provides the plain name, so a module package of either kind works with the core of the other.
+- Each module package depends on the module ABI range it was built for (`omarchy-broadcast-module-abi>=1.6` and `<2`), which the core provides. The daemon refuses a module built for a newer ABI minor than its own.
+- The NVIDIA SDK is never packaged here. Build `maxine-vfx-sdk-local`, `maxine-ar-sdk-local` or `maxine-afx-sdk-local` yourself from the [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) repository. The daemon and the audio worker find the SDK's environment and apply it to themselves, so no systemd drop-in and no `LD_LIBRARY_PATH` are needed.
+- The ONNX models are packages of their own from [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models): `omarchy-onnx-model-<id>`, with `<id>` one of `mediapipe-landscape` (the default), `pphumanseg-v2-mobile`, `pphumanseg-v2-lite` or `modnet`. They install in `/usr/share/omarchy-onnx-models` with each model's own licence.
+
+### Setup guides
+
+| To set up | Guide |
+|---|---|
+| The daemon, the packages, the unit files and the optional PipeWire camera | [docs/setup/daemon.md](docs/setup/daemon.md) |
+| The v4l2loopback device and the virtual camera's size and rate | [docs/setup/loopback.md](docs/setup/loopback.md) |
+| Open-model background effects, without an NVIDIA SDK | [docs/setup/onnx.md](docs/setup/onnx.md) |
+| NVIDIA Maxine video effects, eye contact and auto-framing | [docs/setup/maxine.md](docs/setup/maxine.md) |
+| The virtual microphone | [docs/setup/microphone.md](docs/setup/microphone.md) |
 
 ## Requirements
 
-- GStreamer 1.x with the base/good/bad plugin sets (`videoconvert`, `jpegdec`)
-- Optional, for the GPU pipeline and the NVIDIA effects: an NVIDIA GPU with the proprietary driver, the CUDA toolkit (for `nvrtc`) and GStreamer's `nvcodec` plugin (`cudaupload`, `cudaconvert`, `cudadownload`). On an NVIDIA machine without the CUDA toolkit (NVRTC), the default `[video] memory = "auto"` runs the system-memory pipeline too and says why in the log and in `omarchy-broadcast settings`; install `cuda` for the GPU path. Without an NVIDIA GPU the daemon runs its system-memory pipeline ([docs/adr/0033-system-memory-pipeline.md](docs/adr/0033-system-memory-pipeline.md)): the camera passthrough, the open-model cut-out on the CPU, an Intel GPU or an NPU through ONNX Runtime, and the CPU microphone module need no CUDA. The Maxine video effects, the Maxine AR module (eye contact, auto-framing), the Maxine audio module and the CUDA frame path need an NVIDIA GPU
-- v4l2loopback, configured as described in [docs/setup/loopback.md](docs/setup/loopback.md)
-- Rust toolchain (only to build from source; the Arch package is built with it, and installed without it)
-- Optional, for the native PipeWire camera output: a build with the cargo feature `omarchy-broadcastd/pipewire` (libpipewire headers and clang at build time; the Arch package has it) and `[pipewire] enabled = true` in the configuration
-- Optional, for effects, noise removal, relighting and enhancement: the Maxine module (the package `omarchy-broadcast-maxine-vfx-git`) and the NVIDIA Maxine VFX SDK, as the package `maxine-vfx-sdk-local` that you build yourself from the [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) repository ([docs/setup/maxine.md](docs/setup/maxine.md)); the module finds the SDK in `/opt/nvidia/maxine/videofx` or at `sdk_root` (`[effect] maxine_root` is an alias), and the daemon applies the SDK package's environment to itself, so no drop-in and no `LD_LIBRARY_PATH` are needed
-- Optional, for the background effect without the NVIDIA SDK: the open-model cut-out (the package `omarchy-broadcast-onnx-git`, or `scripts/install-user.sh`), its model (the package `omarchy-onnx-model-mediapipe-landscape` by default, one package per model) and ONNX Runtime 1.29 or newer, from an Arch `onnxruntime-*` package (related repositories: [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime) and [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models); [docs/setup/onnx.md](docs/setup/onnx.md))
-- Optional, for video backgrounds: `ffmpeg`, for importing animated GIF, WebP and APNG files, for the posters of imported videos and, on a machine without an NVIDIA GPU, to run the command that converts a video the CPU cannot play (VP9 profile 0 in WebM, at most 1920x1080 and 30 fps, plays as it is; any other video shows its poster as a still until converted, see [docs/setup/daemon.md](docs/setup/daemon.md#playing-a-video-without-an-nvidia-gpu); the two bundled loops need none of it); a video background itself needs nothing more ([docs/dbus-api.md](docs/dbus-api.md#video-backgrounds-revision-18), [docs/adr/0035-video-backgrounds.md](docs/adr/0035-video-backgrounds.md))
-- Optional, for eye contact and auto-framing: the Maxine AR module (the package `omarchy-broadcast-maxine-ar-git`) and the NVIDIA Maxine AR SDK, as the package `maxine-ar-sdk-local` built from the [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) repository ([docs/setup/maxine.md](docs/setup/maxine.md#the-maxine-ar-module)); the module finds the SDK in `/opt/nvidia/maxine/arsdk` or at `sdk_root` in `[module."br.com.dias.maxine-ar"]`
-- Optional, for the microphone with noise removal: nothing more for the CPU module in the Arch package, which installs it with the mic host and the audio worker ([docs/setup/microphone.md](docs/setup/microphone.md)); for the GPU module, an NVIDIA GPU, the package `omarchy-broadcast-maxine-afx-git` and the SDK package `maxine-afx-sdk-local`, whose environment the worker applies itself ([docs/setup/microphone.md](docs/setup/microphone.md#on-an-nvidia-gpu-maxine-audio-effects)); only the older filter-chain units need `deepfilternet-ladspa` or `noise-suppression-for-voice`
+- GStreamer 1.x with the base, good and bad plugin sets (`videoconvert`, `jpegdec`).
+- v4l2loopback, configured as in [docs/setup/loopback.md](docs/setup/loopback.md).
+- A systemd user session with a D-Bus session bus.
+- **Without an NVIDIA GPU:** nothing more. The daemon runs its system-memory pipeline ([ADR-0033](docs/adr/0033-system-memory-pipeline.md)): camera passthrough, the open-model cut-out on the CPU, an Intel GPU or an NPU through ONNX Runtime, and the CPU microphone module need no CUDA.
+- **With an NVIDIA GPU:** the proprietary driver, the CUDA toolkit (for `nvrtc`) and GStreamer's `nvcodec` plugin (`cudaupload`, `cudaconvert`, `cudadownload`). Without the CUDA toolkit, the default `[video] memory = "auto"` runs the system-memory pipeline and says why in the log and in `omarchy-broadcast settings`. Install `cuda` for the GPU path.
+- **For the open-model cut-out:** the package `omarchy-broadcast-onnx-git` (or `-bin`, or `scripts/install-user.sh`), a model package (`omarchy-onnx-model-mediapipe-landscape` by default) and ONNX Runtime 1.29 or newer from an Arch `onnxruntime-*` package. Related repositories: [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime) and [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models). See [docs/setup/onnx.md](docs/setup/onnx.md) and [ADR-0031](docs/adr/0031-onnx-cutout-module.md).
+- **For the Maxine video effects:** an NVIDIA RTX GPU, the package `omarchy-broadcast-maxine-vfx-git` and the SDK package `maxine-vfx-sdk-local`. The module finds the SDK in `/opt/nvidia/maxine/videofx` or at `sdk_root` in `[module."br.com.dias.maxine-vfx"]` (`[effect] maxine_root` is an alias). See [docs/setup/maxine.md](docs/setup/maxine.md).
+- **For eye contact and auto-framing:** an NVIDIA RTX GPU, the package `omarchy-broadcast-maxine-ar-git` and the SDK package `maxine-ar-sdk-local`. The module finds the SDK in `/opt/nvidia/maxine/arsdk` or at `sdk_root` in `[module."br.com.dias.maxine-ar"]`. See [docs/setup/maxine.md](docs/setup/maxine.md#the-maxine-ar-module).
+- **For the microphone's noise removal on the CPU:** nothing more. The Arch package installs the CPU module with the mic host and the audio worker ([docs/setup/microphone.md](docs/setup/microphone.md)).
+- **For the microphone on an NVIDIA RTX GPU:** the package `omarchy-broadcast-maxine-afx-git` and the SDK package `maxine-afx-sdk-local`, whose environment the worker applies itself ([docs/setup/microphone.md](docs/setup/microphone.md#on-an-nvidia-gpu-maxine-audio-effects)). Only the older filter-chain units need `deepfilternet-ladspa` or `noise-suppression-for-voice`.
+- **For video backgrounds:** `ffmpeg` is optional. It imports animated GIF, WebP and APNG files, makes the posters of imported videos and, on a machine without an NVIDIA GPU, runs the command that converts a video the CPU cannot play. VP9 profile 0 in WebM, at most 1920x1080 and 30 fps, plays as it is. Any other video shows its poster as a still until you convert it. The two bundled loops need none of this. See [docs/setup/daemon.md](docs/setup/daemon.md#playing-a-video-without-an-nvidia-gpu), [docs/dbus-api.md](docs/dbus-api.md#video-backgrounds-revision-18) and [docs/adr/0035-video-backgrounds.md](docs/adr/0035-video-backgrounds.md).
+- **For the native PipeWire camera output:** a build with the cargo feature `omarchy-broadcastd/pipewire` (libpipewire headers and clang at build time; the Arch package has it) and `[pipewire] enabled = true` in the configuration.
+- **To build from source:** the Rust toolchain. The Arch package is built with it and installed without it.
 
-## Build
+## Limitations
+
+- **One application streams from the virtual camera at a time.** From v4l2loopback 0.14, a loopback device lets one process stream from its capture side. A second application that tries to stream gets "device busy" (`EBUSY`), even for the same format. No module option changes that. One application can still share the camera inside itself: Chrome and Chromium share one capture among their tabs. To run several applications at once, enable the PipeWire camera node with `[pipewire] enabled = true` ([docs/setup/daemon.md](docs/setup/daemon.md#the-pipewire-output)). Chrome and Chromium then need the `WebRtcPipeWireCamera` flag (`chrome://flags`), and OBS Studio has a "Video Capture Device (PipeWire)" source. Applications without PipeWire camera support, such as Zoom and Discord, keep using the loopback device ([docs/setup/loopback.md](docs/setup/loopback.md#one-application-at-a-time)).
+- **The PipeWire node and mixed formats.** Consumers of the PipeWire node that ask for different formats (one for YUY2, another that accepts only NV12) can stall it until every consumer has disconnected. The node is optional for that reason.
+- **A daemon crash.** Applications that hold the virtual camera keep it. The daemon leaves a black timeout image and a `timeout` on the loopback, so Chromium-based applications get black frames until the restarted daemon writes again. The unit restarts the daemon after 250 ms. Consumers of the PipeWire node do not reconnect: use the loopback device where that matters ([docs/adr/0022-crash-recovery-for-consumers.md](docs/adr/0022-crash-recovery-for-consumers.md), [docs/setup/daemon.md](docs/setup/daemon.md#restarts-and-crashes)).
+- **TensorRT of the ONNX module after a Maxine effect.** The Maxine SDKs load their own TensorRT into the daemon. Once one has run, ONNX Runtime's TensorRT engine would call the wrong library, so the module refuses it and uses CUDA until the daemon restarts ([docs/setup/onnx.md](docs/setup/onnx.md#tensorrts-library-path)).
+- **OpenVINO needs the device to be there.** The Intel GPU engine needs an Intel GPU present in the running system (on a laptop with a GPU switch, not in discrete-only mode). The NPU engine needs access to `/dev/accel/accel0`, normally through the `render` group ([docs/setup/onnx.md](docs/setup/onnx.md#8-troubleshooting)).
+- **Eye contact runs without the SDK's CUDA graphs,** which are the SDK's default. With them on, a capture on one thread could make another thread's CUDA call fail and abort the daemon ([docs/adr/0028-maxine-ar-module.md](docs/adr/0028-maxine-ar-module.md)).
+- **Maxine performance figures are not published,** per the NVIDIA Maxine SDK licence. Reproduce them locally with `obc-bench` ([docs/testing.md](docs/testing.md)). Other measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
+- **Status: early development.** Passthrough from camera to virtual camera sustains 1080p60 on the reference machine.
+
+## How it works
+
+The daemon runs on demand as a systemd user service, controlled over D-Bus by the CLI, `omarchy-broadcast`, and by the bar plugin. Frames flow from the camera through GStreamer, in CUDA or system memory, into the virtual camera. MJPEG cameras get a CPU decode step and YUYV or UYVY cameras a CPU convert step. The pipeline picks the capture mode from what the camera advertises.
+
+- **Modules.** The effects are modules behind a versioned C ABI (D-Bus revision 9 and later; the interface is at revision 28). `omarchy-broadcast modules` lists them with their status, the reason when one is unavailable and the stages each provides. `modules enable|disable ID`, `modules profile quality|battery` and `modules pin STAGE MODULE` choose which module provides a stage, from the next camera start. The `quality` profile prefers Maxine and the `battery` profile prefers the ONNX module. A disabled module's stages leave the running stream at once. `omarchy-broadcast order` shows and sets the order the stages run in. A module's settings appear in `omarchy-broadcast settings` and in the bar panel with no change to them. A module can come from the Rust SDK or from the C header, installed in `~/.local/share/omarchy-broadcast/modules.d/`: [docs/modules.md](docs/modules.md) is the author guide and `examples/module-hello` a complete example ([ADR-0025](docs/adr/0025-loadable-modules.md)).
+- **Settings.** `omarchy-broadcast settings` lists every standard setting the camera offers by group (image, white balance, exposure, focus and zoom, anything else) with its value, what it takes and, for a setting that cannot change now, why. The effects are settings of the same tree (`effect.*`, the same for every camera). A change applies at once while the camera is in use and otherwise at the next open. The daemon stores the values per camera and writes them whenever the camera opens. `controls` is the short form for brightness, contrast, saturation, sharpness and backlight compensation ([ADR-0020](docs/adr/0020-camera-image-controls.md), [ADR-0023](docs/adr/0023-settings-schema.md), [ADR-0024](docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md), [docs/dbus-api.md](docs/dbus-api.md#camera-settings), [docs/cli-json.md](docs/cli-json.md#camera-settings)).
+- **Configuration.** The daemon writes the choices you make in the CLI and the bar plugin's setup dialog to `~/.config/omarchy-broadcast/config.d/50-panel.toml`. `config.toml` stays yours. A later file such as `config.d/90-local.toml` wins over the managed one, and the daemon refuses to change a key that such a file sets ([ADR-0026](docs/adr/0026-config-d-and-managed-config.md), [docs/config.example.toml](docs/config.example.toml)). The Maxine SDK root is the module's `sdk_root` setting.
+- **Capture and output modes.** `camera.capture.mode` is `auto` or one of the sizes and rates the camera reports. The virtual camera's size and rate are `output.mode`, which `omarchy-broadcast config set output.mode 1280x720@30` or the setup dialog changes. While an application holds the virtual camera, the change waits for it. A format that cannot start reverts to one that works ([docs/setup/loopback.md](docs/setup/loopback.md#changing-the-output-size-and-rate)). Frame generation needs the Maxine module ([ADR-0027](docs/adr/0027-output-modes-frame-generation-and-privacy-fallback.md)).
+- **Privacy.** With `[effect] privacy` off, the default from daemon 0.48.0, the virtual camera shows the camera as it is when an effect cannot run. With it on, `[effect] privacy_mode` chooses what shows instead: `black` (the default), `away` (your own image, the `fallback_image` set in the configuration or the dialog) or `freeze` (the last frame the effect produced). The older key `on_failure` is still read ([ADR-0037](docs/adr/0037-privacy-as-an-option.md)).
+- **Fail-open stages.** Noise removal, relighting and enhancement stack with the effect. Noise removal adds one GPU pass per frame while it is on. If one cannot run, the stream continues without it, and a stage whose SDK feature is not installed shows as not installed ([ADR-0018](docs/adr/0018-video-noise-removal.md), [ADR-0024](docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md)). Blur and replace harden the mask edge, so the room does not show through around you ([ADR-0013](docs/adr/0013-mask-hardening-cuda-kernel.md)).
+- **Camera image controls.** Some cameras keep image settings from other software far from their defaults, oversharpened or oversaturated. `omarchy-broadcast controls reset` puts the five controls back to the camera's defaults. On a Logitech Brio or MX Brio the field of view (90, 78 or 65 degrees) is among the settings.
+- **The microphone.** It runs apart from the video daemon, as a stable PipeWire node and an audio worker, so applications keep receiving your microphone whatever stops. It is off until you turn it on. It becomes the default microphone only when you ask (`mic default`), and `mic restore-default` or `mic off` restores the previous default. The CPU module uses DeepFilterNet by default, or RNNoise. The Maxine module adds room echo removal and studio voice. The older single-engine filter-chain units remain as a lightweight alternative ([docs/setup/microphone.md](docs/setup/microphone.md), [ADR-0029](docs/adr/0029-audio-modules-mic-host-and-worker.md)).
+- **PipeWire camera node.** The daemon can also offer the camera as a native PipeWire video source, "Omarchy Broadcast", next to the loopback device ([docs/setup/daemon.md](docs/setup/daemon.md#the-pipewire-output)).
+
+## The bar plugin
+
+The Omarchy bar plugin is a separate project, the [omarchy-broadcast-plugin](https://github.com/rsd/omarchy-broadcast-plugin) repository, and the package does not install it. It shows the virtual camera's state in the bar and opens a panel with a live preview, the effects, the camera's settings, the microphone and a Details view, and a setup dialog for the modules and the configuration.
+
+- It is a client of the daemon through `omarchy-broadcast watch --json` and the commands of the CLI. It runs no `systemctl`: when the daemon is not running, its Start button runs `omarchy-broadcast start`.
+- Its camera settings need omarchy-broadcast 0.22.0 or newer, the first release with the settings channel ([ADR-0023](docs/adr/0023-settings-schema.md)). Its effect settings need 0.23.0 or newer. Against an older daemon it keeps what the daemon supports and says what needs an update.
+- For its live preview, it runs `omarchy-broadcast preview --json`, which holds a preview lease and prints a line per frame the daemon writes to a small JPEG file under `$XDG_RUNTIME_DIR` ([docs/cli-json.md](docs/cli-json.md#preview)). A preview counts as a user of the camera, so it starts it.
+
+## Build from source
 
 ```sh
 cargo build --release
 ```
 
-The PipeWire output is a cargo feature that is off by default: `cargo build --release --features omarchy-broadcastd/pipewire`.
-
-## Install
-
-Four routes; the daemon, the unit files and the other steps are described in [docs/setup/daemon.md](docs/setup/daemon.md). None of them configures the v4l2loopback device or installs the Maxine SDK.
-
-### From the AUR
-
-The AUR has the split package below in two forms, which conflict with each other, so install one: `omarchy-broadcast-bin` is prebuilt from the files of the GitHub release of the same version (no build tools needed; the packages are `omarchy-broadcast-bin`, `omarchy-broadcast-onnx-bin`, `omarchy-broadcast-maxine-vfx-bin`, `omarchy-broadcast-maxine-ar-bin` and `omarchy-broadcast-maxine-afx-bin`), and `omarchy-broadcast-git` builds from the latest source (the packages of the table below). Each `-bin` package installs the files of its `-git` twin and provides the plain name (`omarchy-broadcast`, `omarchy-broadcast-onnx`, ...), so a module package of either kind works with the core of the other. With an AUR helper:
-
-```sh
-yay -S omarchy-broadcast-bin omarchy-broadcast-onnx-bin     # prebuilt
-yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git     # built from source
-```
-
-On a machine with an NVIDIA GPU add `cuda`; on one without, install `onnxruntime-cpu` with the ONNX module ([docs/setup/daemon.md](docs/setup/daemon.md#from-the-aur)). The prebuilt packages contain neither the NVIDIA SDKs nor ONNX Runtime, which are licensed separately and installed as packages of their own. On a first install the package prints the steps it does not take itself: the loopback device (an example `modprobe.d` line is in `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/`), then `systemctl --user enable --now omarchy-broadcastd`, and optionally `omarchy-broadcast mic on`. An upgrade prints one line, `systemctl --user try-restart omarchy-broadcastd`. Right after a release, an AUR helper may show the previous version for a few minutes, until the AUR's package index has caught up.
+The PipeWire output is a cargo feature that is off by default: `cargo build --release --features omarchy-broadcastd/pipewire`. None of the routes below configures the v4l2loopback device or installs the Maxine SDK. The daemon, the unit files and the other steps are in [docs/setup/daemon.md](docs/setup/daemon.md).
 
 ### Arch package from a checkout
 
-`packaging/arch/PKGBUILD` is one split package: a single build, from the committed HEAD of the local checkout, makes five packages, the core and one package per loadable module, so that you install only the modules you use. Build from `packaging/arch`:
+`packaging/arch/PKGBUILD` is one split package. A single build, from the committed HEAD of the local checkout, makes the five packages of the table above, with the `-git` suffix. Build from `packaging/arch`, install the core, then add the modules you want:
 
 ```sh
 cd packaging/arch
@@ -89,27 +201,30 @@ sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
 systemctl --user enable --now omarchy-broadcastd
 ```
 
-The last two commands install the core. Add the modules wanted. Each module package depends on the module ABI range it was built for (`omarchy-broadcast-module-abi>=1.6` and `<2`), which the core provides; the daemon refuses a module built for a newer ABI minor than its own:
+To install a module too, name its package in the same command, for example `sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst omarchy-broadcast-onnx-git-*.pkg.tar.zst`.
 
-| Package | What it adds | Depends on |
-|---|---|---|
-| `omarchy-broadcast-git` | The core: the daemon and the client, the audio worker, the CPU voice module, the microphone's host and plug-in, the units, the D-Bus files, the udev rule, the media and the documentation. The CPU video path is part of the daemon | optional: `nvidia-utils` and `cuda`, needed for the CUDA video path on NVIDIA GPUs |
-| `omarchy-broadcast-onnx-git` | The open-model cut-out module (no models) | `onnxruntime>=1.29`, `omarchy-onnx-model-mediapipe-landscape`; optional: the other `omarchy-onnx-model-*` packages and an `onnxruntime-provider-cuda`, `-tensorrt` or `-openvino` engine |
-| `omarchy-broadcast-maxine-vfx-git` | The Maxine video effects module | `cuda`, `maxine-vfx-sdk-local` |
-| `omarchy-broadcast-maxine-ar-git` | The Maxine AR module (eye contact, auto-framing) | `cuda`, `maxine-ar-sdk-local` |
-| `omarchy-broadcast-maxine-afx-git` | The Maxine audio effects module for the microphone | `maxine-afx-sdk-local` |
+The core installs:
 
-For example `sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst omarchy-broadcast-onnx-git-*.pkg.tar.zst`.
+- the daemon and the CLI in `/usr/bin`;
+- the microphone's parts (the audio worker, the mic host's unit and configuration, the forwarding plugin and the CPU voice module), all inactive until `omarchy-broadcast mic on`;
+- the directories where modules are found: a module package puts its library in `/usr/lib/omarchy-broadcast/modules` and its manifest in `/usr/lib/omarchy-broadcast/modules.d`;
+- the C header of the module interface in `/usr/include/omarchy-broadcast`;
+- a udev rule that lets the daemon read the MX Brio's Show Mode (`/usr/lib/udev/rules.d/70-omarchy-broadcast-mx-brio.rules`);
+- the systemd user unit, the D-Bus activation file and the documentation.
 
-The AUR recipe of the same split package, pkgbase `omarchy-broadcast-git`, builds from this repository on GitHub; `scripts/aur.sh` generates its PKGBUILD and `.SRCINFO` from `packaging/arch/PKGBUILD`. The prebuilt recipe, pkgbase `omarchy-broadcast-bin`, is made by `scripts/release-bin.sh` (which builds and checks the release assets) and `scripts/aur.sh --bin`; both are for maintainers ([docs/setup/daemon.md](docs/setup/daemon.md#publishing-to-the-aur)).
+The package enables nothing: each user runs the `systemctl --user enable --now` command. See [docs/setup/maxine.md](docs/setup/maxine.md) (section 3) and [ADR-0039](docs/adr/0039-self-applied-sdk-environment-and-module-packages.md) for how the SDK environment is applied.
 
-The core installs the daemon and the client in `/usr/bin`, the microphone's parts (the audio worker, the mic host's unit and configuration, the forwarding plugin and the CPU voice module, all inactive until `omarchy-broadcast mic on`), the directories where modules are found (a module package puts its library in `/usr/lib/omarchy-broadcast/modules` and its manifest in `/usr/lib/omarchy-broadcast/modules.d`), the C header of the module interface in `/usr/include/omarchy-broadcast`, a udev rule that lets the daemon read the MX Brio's Show Mode (`/usr/lib/udev/rules.d/70-omarchy-broadcast-mx-brio.rules`), the systemd user unit, the D-Bus activation file and the documentation. It enables nothing: each user runs the `systemctl --user enable --now` command above (the package prints it, with the loopback steps, after a first install). The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The NVIDIA Maxine SDK is never packaged here: each Maxine module package depends on the SDK package of its own, `maxine-vfx-sdk-local`, `maxine-ar-sdk-local` or `maxine-afx-sdk-local` (each built by the user from the [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) repository). No systemd drop-in is needed for them: at start, the daemon and the audio worker find the SDK's environment and apply it to themselves, and log that they did ([docs/setup/maxine.md](docs/setup/maxine.md), section 3; [docs/adr/0039-self-applied-sdk-environment-and-module-packages.md](docs/adr/0039-self-applied-sdk-environment-and-module-packages.md)).
-
-The ONNX models are not part of this build. Each model is a package of its own from [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models), `omarchy-onnx-model-<id>` (`mediapipe-landscape`, the default, `pphumanseg-v2-mobile`, `pphumanseg-v2-lite` and `modnet`), installed in `/usr/share/omarchy-onnx-models` with the model's own licence, so a rebuild of omarchy-broadcast does not download them again ([docs/setup/onnx.md](docs/setup/onnx.md)).
+The AUR recipe of the same split package, pkgbase `omarchy-broadcast-git`, builds from this repository on GitHub. `scripts/aur.sh` generates its PKGBUILD and `.SRCINFO` from `packaging/arch/PKGBUILD`. The prebuilt recipe, pkgbase `omarchy-broadcast-bin`, is made by `scripts/release-bin.sh`, which builds and checks the release assets, and `scripts/aur.sh --bin`. Both are for maintainers ([docs/setup/daemon.md](docs/setup/daemon.md#publishing-to-the-aur)).
 
 ### Developer install
 
-`scripts/install-user.sh` builds the release binaries and the NVIDIA Maxine module, and installs them for the current user, without root: the binaries in `~/.local/bin`, the unit and the D-Bus file under `~/.local/share`, and the Maxine module's library and manifest under `~/.local/share/omarchy-broadcast`. It does not install the udev rule for the MX Brio, which needs root ([docs/setup/daemon.md](docs/setup/daemon.md#the-udev-rule-for-the-mx-brio)), nor the Maxine SDK, whose environment the daemon applies to itself when it finds the SDK package installed; see [docs/setup/maxine.md](docs/setup/maxine.md) ("The Maxine module", and section 3). It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
+`scripts/install-user.sh` builds the release binaries and the NVIDIA Maxine module and installs them for the current user, without root:
+
+- the binaries in `~/.local/bin`;
+- the unit and the D-Bus file under `~/.local/share`;
+- the Maxine module's library and manifest under `~/.local/share/omarchy-broadcast`.
+
+It does not install the udev rule for the MX Brio, which needs root ([docs/setup/daemon.md](docs/setup/daemon.md#the-udev-rule-for-the-mx-brio)). It does not install the Maxine SDK either; the daemon applies the SDK's environment when it finds the SDK package ([docs/setup/maxine.md](docs/setup/maxine.md), "The Maxine module" and section 3). It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
 
 ```sh
 scripts/install-user.sh
@@ -119,37 +234,36 @@ systemctl --user enable --now omarchy-broadcastd
 
 ### Manual install
 
-`cargo install` of the two crates and a copy of the unit file with `ExecStart=` rewritten: see [docs/setup/daemon.md](docs/setup/daemon.md#install).
+Run `cargo install` for the two crates and copy the unit file with `ExecStart=` rewritten: see [docs/setup/daemon.md](docs/setup/daemon.md#install).
 
-`scripts/check-all.sh` runs every check of the repository in one go and stops at the first failure: the format check, clippy and the workspace tests (with `--locked`); the same three for the video and the audio example module, which are built outside the workspace as third-party modules would be; clippy and the tests of `obc-pipeline` and `omarchy-broadcastd` with the PipeWire feature; that the `pkgver=` of both PKGBUILDs matches the workspace version; and shellcheck over the shell scripts. It needs neither a GPU nor a camera. Besides the Rust toolchain and the packages listed in [docs/testing.md](docs/testing.md), it needs libpipewire, clang and pipewire for the PipeWire build, and either `shellcheck` or `uvx` (which fetches it).
+### Run the benchmark binary
 
-## Run
+`obc-bench` streams from the camera to the "Omarchy Broadcast" loopback device until Ctrl-C:
 
 ```sh
 cargo run --release -p obc-pipeline --bin obc-bench -- --duration 0
 ```
 
-This streams to the "Omarchy Broadcast" loopback device until Ctrl-C. Then select "Omarchy Broadcast" as the camera in OBS or Chrome.
+Then select "Omarchy Broadcast" as the camera in OBS or Chrome. Optional arguments:
 
-Optional arguments:
+- `--camera <name|vid:pid|/dev/videoN>` chooses the camera. The default is automatic. A name or ID matching two colour cameras is an error, and greyscale IR nodes are never picked.
+- `--mode WxH@FPS` or `FORMAT:WxH@FPS` chooses the capture mode, for example `--mode 1920x1080@30` or `--mode NV12:1920x1080@60`. The default is `1920x1080@60`, any format. The closest mode the camera offers is used.
 
-- `--camera <name|vid:pid|/dev/videoN>` chooses the camera (default: automatic; a name or ID matching two colour cameras is an error, and greyscale IR nodes are never picked).
-- `--mode WxH@FPS` or `FORMAT:WxH@FPS`, for example `--mode 1920x1080@30` or `--mode NV12:1920x1080@60`, chooses the capture mode (default: `1920x1080@60`, any format; the closest mode the camera offers is used).
+### Check the repository
 
-Tests, including the manual check with OBS or Chrome, are described in [docs/testing.md](docs/testing.md).
+`scripts/check-all.sh` runs every check of the repository and stops at the first failure. It needs neither a GPU nor a camera. It runs:
 
-## Limitations and known issues
+- the format check, clippy and the workspace tests, with `--locked`;
+- the same three for the video and the audio example module, which are built outside the workspace as third-party modules would be;
+- clippy and the tests of `obc-pipeline` and `omarchy-broadcastd` with the PipeWire feature;
+- a check that the `pkgver=` of both PKGBUILDs matches the workspace version;
+- shellcheck over the shell scripts.
 
-- **One application streams from the virtual camera at a time.** From v4l2loopback 0.14 on, a loopback device lets one process stream from its capture side; a second application that tries to start streaming gets "device busy" (`EBUSY`), even for the same format, and no module option changes that. One application can still share the camera inside itself (Chrome and Chromium share one capture among their tabs). To run several applications at once, enable the PipeWire camera node (`[pipewire] enabled = true`, [docs/setup/daemon.md](docs/setup/daemon.md#the-pipewire-output)): Chrome and Chromium need the `WebRtcPipeWireCamera` flag (`chrome://flags`), OBS Studio has a "Video Capture Device (PipeWire)" source, and applications without PipeWire camera support, such as Zoom and Discord, keep using the loopback device ([docs/setup/loopback.md](docs/setup/loopback.md#one-application-at-a-time)).
-- **The PipeWire node and mixed formats.** Consumers of the PipeWire node that ask for different formats (one for YUY2, another that accepts only NV12) can stall it until every consumer has disconnected. The node is optional for that reason.
-- **PipeWire consumers do not reconnect after a daemon crash;** the loopback device survives it ([docs/setup/daemon.md](docs/setup/daemon.md#restarts-and-crashes)).
-- **TensorRT of the ONNX module after a Maxine effect.** The Maxine SDKs load their own TensorRT into the daemon. Once one of them has run, ONNX Runtime's TensorRT engine would call the wrong library, so the module refuses it and uses CUDA until the daemon restarts ([docs/setup/onnx.md](docs/setup/onnx.md#tensorrts-library-path)).
-- **OpenVINO needs the device to be there.** The Intel GPU engine needs an Intel GPU that is present in the running system (on a laptop with a GPU switch, not in discrete-only mode), and the NPU engine needs access to `/dev/accel/accel0`, normally through the `render` group ([docs/setup/onnx.md](docs/setup/onnx.md#8-troubleshooting)).
-- **Eye contact runs without the SDK's CUDA graphs,** which are the SDK's default: with them on, a capture on one thread could make another thread's CUDA call fail and abort the daemon ([docs/adr/0028-maxine-ar-module.md](docs/adr/0028-maxine-ar-module.md)).
+Besides the Rust toolchain and the packages listed in [docs/testing.md](docs/testing.md), it needs libpipewire, clang and pipewire for the PipeWire build, and either `shellcheck` or `uvx`, which fetches it. Tests, including the manual check with OBS or Chrome, are in [docs/testing.md](docs/testing.md).
 
 ## Documentation
 
-See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks, and [docs/modules.md](docs/modules.md) for writing and installing modules. The Omarchy bar widget is a separate project, the [omarchy-broadcast-plugin](https://github.com/rsd/omarchy-broadcast-plugin) repository, and is not installed by the package. It shows the virtual camera's state in the bar and opens a panel with a live preview, the effects, the camera's settings, the microphone and a Details view, and a setup dialog for the modules and the configuration. It is a client of the daemon through `omarchy-broadcast watch --json` and the commands of the client, and runs no `systemctl`: when the daemon is not running, its Start button runs `omarchy-broadcast start`. Its camera settings need omarchy-broadcast 0.22.0 or newer, the first release with the settings channel ([docs/adr/0023-settings-schema.md](docs/adr/0023-settings-schema.md)); its effect settings need 0.23.0 or newer; against an older daemon it keeps what the daemon supports and says what needs an update. For its live preview, the widget runs `omarchy-broadcast preview --json`, which holds a preview lease and prints a line per frame the daemon writes to a small JPEG file under `$XDG_RUNTIME_DIR` ([docs/cli-json.md](docs/cli-json.md#preview)); a preview counts as a user of the camera, so it starts it.
+[docs/README.md](docs/README.md) routes you to the right page by task. It also indexes the architecture, the decision records, the setup guides and the benchmarks. [docs/modules.md](docs/modules.md) covers writing and installing modules.
 
 ## Affiliation
 

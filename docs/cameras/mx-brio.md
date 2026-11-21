@@ -1,12 +1,12 @@
 # Logitech MX Brio (046d:0944) on Linux
 
-Reference for the Logitech MX Brio 4K (and the MX Brio 705 for Business, the same camera with a business bundle): what the plain Linux kernel gives you, the vendor extension units and what is known about them, what omarchy-broadcast adds, and what is missing and why.
+The Logitech MX Brio works on Linux with the standard `uvcvideo` driver: 4K30 and 1080p60 video, the standard controls, the field of view, Show Mode and the privacy shutter. omarchy-broadcast adds a few more settings and replaces the Logitech features that cannot run on Linux. This page is the reference for the camera (and the MX Brio 705 for Business, the same camera with a business bundle). It covers what the plain kernel gives you, the vendor extension units and what is known about them, what omarchy-broadcast adds, and what is missing and why.
 
-Date: 2026-11-14. Firmware 1.1.394, USB 3 (5000M). Logitech's own statement for Linux is "basic UVC webcam support only, with no Logitech software"; everything beyond UVC below is either measured on Linux, decoded from USB captures of Logitech's software, or marked as unverified.
+Measured on 2026-11-14, with firmware 1.1.394 on USB 3 (5000M). Logitech's own statement for Linux is "basic UVC webcam support only, with no Logitech software". Everything beyond UVC below is measured on Linux, decoded from USB captures of Logitech's software, or marked as unverified.
 
 ## Evidence levels
 
-Each claim in this page is one of three kinds. The tables repeat the level where it matters.
+Each claim on this page has one of four levels. The tables repeat the level where it matters.
 
 | Level | Meaning |
 |---|---|
@@ -17,9 +17,15 @@ Each claim in this page is one of three kinds. The tables repeat the level where
 
 ## Device topology
 
-Interfaces: 0 VideoControl, 1 VideoStreaming, audio (UAC input), 2 HID (`hid-generic`, no input device), 3 vendor-specific with no kernel driver (probably firmware and management traffic).
+Interfaces:
 
-The UVC descriptors list two standard units and eight Logitech extension units (XU). In every control request, `wIndex = unit << 8 | interface` (interface 0) and `wValue = selector << 8`. Unit IDs are specific to this camera and firmware; **match extension units by GUID, never by unit ID**. All eight GUIDs and their control counts below were confirmed on Linux from the USB descriptors that the kernel exposes in sysfs (`/sys/bus/usb/devices/<bus>-<port>/descriptors`, world-readable, no root needed).
+- 0: VideoControl
+- 1: VideoStreaming
+- audio (UAC input)
+- 2: HID (`hid-generic`, no input device)
+- 3: vendor-specific, with no kernel driver (probably firmware and management traffic)
+
+The UVC descriptors list two standard units and eight Logitech extension units (XU). In every control request, `wIndex = unit << 8 | interface` (interface 0) and `wValue = selector << 8`. Unit IDs are specific to this camera and firmware. **Match extension units by GUID, never by unit ID.** The USB descriptors that the kernel exposes in sysfs confirm all eight GUIDs and their control counts on Linux (`/sys/bus/usb/devices/<bus>-<port>/descriptors`, world-readable, no root needed).
 
 | Unit | Type | GUID | Controls | Used by Logi Tune for |
 |---|---|---|---|---|
@@ -82,15 +88,27 @@ The RightSight block (unit 22, selector `0x01`) answers `GET_MIN`, `GET_MAX`, `G
 
 ### The RightSight block
 
-Unit 22, selector `0x01`, 30 bytes. Logi Tune always writes the whole block. Byte 0 is constant `01`; bytes 1 to 3 are the settings above; byte 4 read back as `5a` and once as `50`, byte 5 as `01`, bytes 6 to 29 are zero. The meaning of bytes 0, 4 and 5 is unknown, so a writer must **read the block first and change only the documented byte**, never write a fixed block.
+Unit 22, selector `0x01`, 30 bytes. Logi Tune always writes the whole block.
 
-When RightSight is switched on, and after each distance change (not after a speed change), Logi Tune also writes two companion controls (unit 10 selector `0x06`, unit 11 selector `0x0c`). Read on Linux, these mirror the standard V4L2 `zoom_absolute` and `pan_absolute`/`tilt_absolute` controls exactly (same value, range and step), so the companion writes are the standard zoom, pan and tilt and need no extension-unit access. During 20 s of movement Logi Tune sent only three framing writes, so the companion writes look like a starting frame, sent occasionally.
+- Byte 0 is constant `01`.
+- Bytes 1 to 3 are the settings above.
+- Byte 4 read back as `5a`, and once as `50`.
+- Byte 5 read back as `01`.
+- Bytes 6 to 29 are zero.
 
-**Measured (2026-11-14): the block alone does not make the camera track.** On Linux, setting the block's on byte (byte 1), and also writing Logi Tune's centred starting frame through the standard zoom, pan and tilt controls, did not make the camera follow a moving subject: in two 30 s recordings the picture never followed. The likely explanation is that the block stores the RightSight *preference* (the camera's face button toggles the same byte), while Logi Tune does the face tracking on the PC and sends zoom and pan targets only now and then, which is what the three framing writes in 20 s of movement look like. omarchy-broadcast therefore does not expose the block or the companion controls as RightSight settings; the face-following stage of omarchy-broadcast replaces the feature (see [Support in omarchy-broadcast](#support-in-omarchy-broadcast)). The block stays documented here for reference. Interface revisions 24 to 26 of omarchy-broadcast did publish it as three settings, which revision 27 removed ([dbus-api.md](../dbus-api.md#logitech-extension-unit-settings-revision-24)).
+The meaning of bytes 0, 4 and 5 is unknown. A writer must therefore **read the block first and change only the documented byte**, never write a fixed block.
+
+When RightSight is switched on, and after each distance change (not after a speed change), Logi Tune also writes two companion controls (unit 10 selector `0x06`, unit 11 selector `0x0c`). Read on Linux, these mirror the standard V4L2 `zoom_absolute` and `pan_absolute`/`tilt_absolute` controls exactly (same value, range and step). The companion writes are therefore the standard zoom, pan and tilt, and need no extension-unit access. During 20 s of movement, Logi Tune sent only three framing writes. The companion writes look like a starting frame, sent occasionally.
+
+**Measured (2026-11-14): the block alone does not make the camera track.** On Linux, setting the block's on byte (byte 1) did not make the camera follow a moving subject. Writing Logi Tune's centred starting frame through the standard zoom, pan and tilt controls did not help either. In two 30 s recordings the picture never followed.
+
+The likely explanation is that the block stores the RightSight *preference* (the camera's face button toggles the same byte). Logi Tune does the face tracking on the PC and sends zoom and pan targets only now and then, which is what the three framing writes in 20 s of movement look like.
+
+omarchy-broadcast therefore does not expose the block or the companion controls as RightSight settings. Its face-following stage replaces the feature (see [Support in omarchy-broadcast](#support-in-omarchy-broadcast)). The block stays documented here for reference. Interface revisions 24 to 26 of omarchy-broadcast did publish it as three settings, which revision 27 removed ([dbus-api.md](../dbus-api.md#logitech-extension-unit-settings-revision-24)).
 
 ### Safety rule
 
-Other selectors on these units may include save-to-flash or firmware commands, and related Logitech cameras are known to hold a save-to-memory command in the same units. Therefore:
+Other selectors on these units may include save-to-flash or firmware commands. Related Logitech cameras are known to hold a save-to-memory command in the same units. Follow these rules:
 
 1. Write only selectors and values listed above and observed in captures.
 2. Read (`GET_CUR`, and `GET_LEN`) before writing, and keep every byte you do not own.
@@ -113,7 +131,9 @@ Extension-unit GUIDs and unit IDs (confirm they match the topology table before 
 sudo lsusb -v -d 046d:0944 | grep -B2 -A2 guidExtensionCode
 ```
 
-Extension-unit values go through the `uvcvideo` ioctl `UVCIOC_CTRL_QUERY`, which takes `struct uvc_xu_control_query` (`linux/uvcvideo.h`): unit ID, selector, query code, size, data pointer. The ioctl number is `_IOWR('u', 0x21, struct uvc_xu_control_query)`. Query codes: `SET_CUR 0x01`, `GET_CUR 0x81`, `GET_MIN 0x82`, `GET_MAX 0x83`, `GET_RES 0x84`, `GET_LEN 0x85`, `GET_INFO 0x86`, `GET_DEF 0x87`. The caller needs read/write access to `/dev/videoN` (the `video` group). Stop any program that rewrites stored camera values (including omarchy-broadcast's daemon) while testing.
+Extension-unit values go through the `uvcvideo` ioctl `UVCIOC_CTRL_QUERY`. It takes `struct uvc_xu_control_query` (`linux/uvcvideo.h`): unit ID, selector, query code, size, data pointer. The ioctl number is `_IOWR('u', 0x21, struct uvc_xu_control_query)`. Query codes: `SET_CUR 0x01`, `GET_CUR 0x81`, `GET_MIN 0x82`, `GET_MAX 0x83`, `GET_RES 0x84`, `GET_LEN 0x85`, `GET_INFO 0x86`, `GET_DEF 0x87`.
+
+The caller needs read/write access to `/dev/videoN` (the `video` group). While testing, stop any program that rewrites stored camera values, including omarchy-broadcast's daemon.
 
 A read-only query in Python (reads the length, then the current value; never writes):
 
@@ -146,7 +166,7 @@ for name, code in (("cur", GET_CUR), ("min", GET_MIN), ("max", GET_MAX),
 
 An alternative is `uvcdynctrl`-style mapping (`UVCIOC_CTRL_MAP`), which registers an XU selector as a V4L2 control so `v4l2-ctl` can read it; the direct query above avoids changing the driver's control list.
 
-Logi Tune never read `GET_MIN` or `GET_MAX`; the ranges, steps and defaults in the extension-unit table come from exactly these read-only queries (the sysfs `descriptors` file gives the GUIDs without root, so only the queries need access to `/dev/videoN`).
+Logi Tune never read `GET_MIN` or `GET_MAX`. The ranges, steps and defaults in the extension-unit table come from exactly these read-only queries. The sysfs `descriptors` file gives the GUIDs without root, so only the queries need access to `/dev/videoN`.
 
 ## What works on plain Linux
 
@@ -180,7 +200,7 @@ Wall-clock averages including about one second of stream start-up read about 49.
 - Turn HDR off to get 60 fps. The V4L2 default is 1 (on), but values set earlier persist in the camera, and this unit was already stored at 0.
 - `exposure_dynamic_framerate` made no difference in a lit room. Its effect in the dark, where the camera must lengthen exposure, was not tested.
 
-An earlier session in a dim room, with auto exposure, delivered **20 fps** at every size, including 4K MJPEG and 1080p60 NV12, with `exposure_dynamic_framerate` at 0 (17 fps with it at 1); with manual exposure it delivered 30 fps and never 60. `power_line_frequency` at 50 Hz gave 25 fps; disabled gave 30 fps. The HDR cap explains 30 fps but not 20: the camera's low-light compensation probably lowers the rate further as exposure lengthens, but this has not been tested with HDR off in the dark. To check:
+An earlier measurement in a dim room, with auto exposure, delivered **20 fps** at every size, including 4K MJPEG and 1080p60 NV12, with `exposure_dynamic_framerate` at 0 (17 fps with it at 1); with manual exposure it delivered 30 fps and never 60. `power_line_frequency` at 50 Hz gave 25 fps; disabled gave 30 fps. The HDR cap explains 30 fps but not 20: the camera's low-light compensation probably lowers the rate further as exposure lengthens, but this has not been tested with HDR off in the dark. To check:
 
 ```sh
 v4l2-ctl -d /dev/videoN -c backlight_compensation=0 -c exposure_dynamic_framerate=0
@@ -200,7 +220,7 @@ omarchy-broadcast reads the camera through `uvcvideo` and publishes a virtual ca
 - **Labels:** `backlight_compensation` is shown as "HDR", with a description that says it limits the camera to 30 fps, and `keep_framerate` has a description that names Logi Tune's "Low light compensation" and its opposite sense.
 - **Colour range:** the quirk that treated this camera's raw modes as full range was removed in 0.49.1 after the measurement above.
 - **Anti-flicker default** from the time zone when none is chosen.
-- **Replacements for Logitech features that cannot run on Linux:** RightSight is replaced by a face-following digital pan and zoom stage (needs an NVIDIA GPU and the Maxine AR SDK); the camera's AI microphone suppression by a virtual microphone with Maxine, DeepFilterNet or RNNoise processing; Logitech's apps by one settings tree used by the CLI and the bar panel.
+- **Replacements for Logitech features that cannot run on Linux:** RightSight is replaced by a face-following digital pan and zoom stage (needs an NVIDIA RTX GPU and the Maxine AR SDK); the camera's AI microphone suppression by a virtual microphone with Maxine, DeepFilterNet or RNNoise processing; Logitech's apps by one settings tree used by the CLI and the bar panel.
 - **Beyond the camera:** background blur and replacement, relighting, eye contact, video noise removal, an HDR look applied to the finished image (it cannot recover detail the sensor clipped).
 
 ## Support in omarchy-broadcast
@@ -229,11 +249,19 @@ The face-following pan and zoom stage described above is the replacement for Rig
 
 ### Camera status in omarchy-broadcast
 
-Two states of this camera reach the daemon through no standard control, and omarchy-broadcast reads both for this camera only (`046d:0944`); the camera's `CameraHealth` carries them as `shutter`, `show_mode` and `status` ([dbus-api.md](../dbus-api.md#camera-status-revision-26)).
+Two states of this camera reach the daemon through no standard control. omarchy-broadcast reads both, for this camera only (`046d:0944`). The camera's `CameraHealth` carries them as `shutter`, `show_mode` and `status` ([dbus-api.md](../dbus-api.md#camera-status-revision-26)).
 
-**Privacy shutter.** The shutter sends no signal, so the daemon looks at the picture: a sparse 16 x 9 grid of luma values, sampled at most every 250 ms from the raw frames (on the camera pad) or after the JPEG decoder (MJPEG). The shutter is reported closed after at least 1 s of perfectly flat black (raw: no spread at a mean of 15 to 17, the limited-range black measured above; decoded MJPEG: the same, or no spread at a mean of 1 or less, because the MJPEG black level is unmeasured) and open again at the first frame that is not. A dark room never matches: its frames carry sensor noise, so their luma is not flat. With an away image chosen the virtual camera shows it while the shutter is closed; with none, the camera's black passes through. A closed state is kept across a reopen or a restart of the stream on the same camera.
+**Privacy shutter.** The shutter sends no signal, so the daemon looks at the picture: a sparse 16 x 9 grid of luma values, sampled at most every 250 ms from the raw frames (on the camera pad) or after the JPEG decoder (MJPEG).
 
-**Show Mode status.** Not the Show Mode on/off setting above (`camera.focus.show_mode`, which switches the camera's automatic flip), but which way the camera faces now: HID input report `0x55` on the camera's own HID interface, byte 5, `01` facing the desk and `00` upright. The daemon finds the `hidraw` node of this camera's USB device by sysfs (the HID device whose report descriptor declares report `0x55`), and waits for the camera's reports, taking a value once it has held for 1.5 s because it bounces while the camera moves. The orientation is unknown until the camera's first report, which it sends when it is turned. It only reads the reports the camera sends: nothing is written to the HID interface and no request is made of it.
+- The shutter is reported closed after at least 1 s of perfectly flat black. For raw frames, that means no spread at a mean of 15 to 17, the limited-range black measured above. For decoded MJPEG, it means the same, or no spread at a mean of 1 or less, because the MJPEG black level is unmeasured.
+- It is reported open again at the first frame that is not flat.
+- A dark room never matches: its frames carry sensor noise, so their luma is not flat.
+- With an away image chosen, the virtual camera shows it while the shutter is closed. With none, the camera's black passes through.
+- A closed state is kept across a reopen or a restart of the stream on the same camera.
+
+**Show Mode status.** This is not the Show Mode on/off setting above (`camera.focus.show_mode`, which switches the camera's automatic flip). It is which way the camera faces now: HID input report `0x55` on the camera's own HID interface, byte 5, `01` facing the desk and `00` upright.
+
+The daemon finds the `hidraw` node of this camera's USB device by sysfs (the HID device whose report descriptor declares report `0x55`). It waits for the camera's reports and takes a value once it has held for 1.5 s, because the value bounces while the camera moves. The orientation is unknown until the camera's first report, which it sends when it is turned. The daemon only reads the reports the camera sends: nothing is written to the HID interface and no request is made of it.
 
 > **Warning: never send `GET_REPORT` for report `0x55`.** Asking the camera for the report's current value (`HIDIOCGINPUT` on the `hidraw` node, a USB `GET_REPORT` control request, 64-byte buffer) hangs its firmware. Measured: the first request returned 0 bytes, the next three timed out (`ETIMEDOUT`), the fifth failed with `EPROTO`, and the camera then stopped answering and dropped off USB (`device not responding to setup address`); in a full daemon run the same request coincided with the Thunderbolt xHCI host controller dying (`HC died`). Read the interrupt-IN reports only.
 
