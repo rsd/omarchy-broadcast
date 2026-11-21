@@ -10,6 +10,14 @@ This page covers installing the module, its runtime and its models, choosing the
 
 The module needs no NVIDIA GPU, and neither does the daemon's effect path. When the machine has no usable CUDA, the daemon keeps the video frames in system memory ([ADR-0033](../adr/0033-system-memory-pipeline.md)) and hands the module host frames. Install an ONNX Runtime build (`onnxruntime-cpu` or `onnxruntime-core` is enough; the omarchy-onnxruntime provider packages add the Intel and NVIDIA engines; section 2), the module and the models (section 3), and the blur and the replacement work.
 
+**No NVIDIA GPU: install `onnxruntime-cpu`.** From the AUR:
+
+```bash
+yay -S onnxruntime-cpu omarchy-broadcast-onnx-git
+```
+
+Install `onnxruntime-cpu` first, as above, or pick it when yay asks which provider of `onnxruntime` to install. The module depends on `onnxruntime>=1.29`, which several packages provide; the AUR's `onnxruntime-core` builds with CUDA, cuDNN, OpenVINO and TensorRT, a much larger build that a machine without an NVIDIA GPU does not need. `onnxruntime-cpu`, from the Arch repositories, is the CPU engine only.
+
 **What the daemon decides, and how to see it.** `[video] memory` in `config.toml` is `auto` by default: CUDA when the NVIDIA driver is loaded and lists a GPU, `libcuda.so.1` opens, `CUDA_VISIBLE_DEVICES` does not hide every GPU and GStreamer's CUDA elements are installed; otherwise system memory. The daemon logs the choice and the reason, once per change:
 
 ```bash
@@ -54,7 +62,7 @@ The privacy rules are the same as with CUDA: with privacy on (`[effect] privacy`
 | Item | Requirement |
 |---|---|
 | The module | Installed from the package `omarchy-broadcast-onnx-git` or by `scripts/install-user.sh` (section 3) |
-| ONNX Runtime | `libonnxruntime.so`, version 1.29 or newer. Recommended: `onnxruntime-core` plus the provider packages of the engines you use (CUDA, TensorRT, OpenVINO), from omarchy-onnxruntime. `onnxruntime-cpu` and `onnxruntime-opt-cuda` also work (section 2) |
+| ONNX Runtime | `libonnxruntime.so`, version 1.29 or newer. With no NVIDIA GPU: `onnxruntime-cpu` (see above). Otherwise recommended: `onnxruntime-core` plus the provider packages of the engines you use (CUDA, TensorRT, OpenVINO), from omarchy-onnxruntime. `onnxruntime-cpu` and `onnxruntime-opt-cuda` also work (section 2) |
 | The models | One package per model, `omarchy-onnx-model-<id>`, or the `.onnx` files in one of the directories of section 3. A single file is enough to use that model |
 | An NVIDIA GPU | Not needed: the CPU engine runs the model, and the daemon runs the effect path in system memory when it finds no usable CUDA (see above). An NVIDIA GPU adds the TensorRT and CUDA engines, and an Intel CPU, GPU or NPU the OpenVINO engines (with a runtime that has them) |
 
@@ -84,7 +92,7 @@ Each provider is a library of its own beside `libonnxruntime.so` and is loaded o
 
 The repository's [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/engines.md) describes each engine and what it needs, and its [docs/results.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/results.md) has raw-model figures of four models on six targets.
 
-**Alternatives.** Any other package that provides `onnxruntime` 1.29 or newer works with the module:
+**Alternatives.** Any other package that provides `onnxruntime` 1.29 or newer works with the module. With no NVIDIA GPU, take `onnxruntime-cpu` (`yay -S onnxruntime-cpu omarchy-broadcast-onnx-git`, [above](#using-it-on-a-machine-without-an-nvidia-gpu)):
 
 ```bash
 sudo pacman -S onnxruntime-opt-cuda   # an NVIDIA GPU: the CPU and the CUDA engines
@@ -121,7 +129,7 @@ The `-` makes a missing file no error. The setting applies to the daemon's unit 
 
 ## 3. Install the module and the models
 
-**From the Arch package.** The module is one package of the split build of `packaging/arch/PKGBUILD`, `omarchy-broadcast-onnx-git`, built with the core `omarchy-broadcast-git` and the other module packages. It depends on the module ABI that the core provides (`omarchy-broadcast-module-abi>=1.6` and `<2`, [../modules.md](../modules.md#packaging-a-module)), on `onnxruntime>=1.29`, which any variant of section 2 satisfies, and on the package of the default model, `omarchy-onnx-model-mediapipe-landscape`. It installs the library and the manifest under `/usr/lib/omarchy-broadcast/`. It is a separate package because the ONNX Runtime variants conflict with one another: the core must not pull one in. Its optional dependencies are the other model packages and the engines, as the virtual names `onnxruntime-provider-cuda`, `onnxruntime-provider-tensorrt` and `onnxruntime-provider-openvino` (section 2).
+**From the AUR or the Arch package.** With an AUR helper, `yay -S omarchy-broadcast-onnx-git` (with no NVIDIA GPU, `yay -S onnxruntime-cpu omarchy-broadcast-onnx-git`, [above](#using-it-on-a-machine-without-an-nvidia-gpu)). The module is one package of the split build of `packaging/arch/PKGBUILD`, `omarchy-broadcast-onnx-git`, built with the core `omarchy-broadcast-git` and the other module packages. It depends on the module ABI that the core provides (`omarchy-broadcast-module-abi>=1.6` and `<2`, [../modules.md](../modules.md#packaging-a-module)), on `onnxruntime>=1.29`, which any variant of section 2 satisfies, and on the package of the default model, `omarchy-onnx-model-mediapipe-landscape`. It installs the library and the manifest under `/usr/lib/omarchy-broadcast/`. It is a separate package because the ONNX Runtime variants conflict with one another: the core must not pull one in. Its optional dependencies are the other model packages and the engines, as the virtual names `onnxruntime-provider-cuda`, `onnxruntime-provider-tensorrt` and `onnxruntime-provider-openvino` (section 2).
 
 **The models are packages of their own**, one per model, from the [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models) repository (`packaging/arch/PKGBUILD` there). The name is `omarchy-onnx-model-<id>`, with the model's id from the table below, and the version is that of the repository's release (1.0.0, the `v1.0.0` release assets, each checked against the release's SHA-256 at build time). Each installs its one `.onnx` file in `/usr/share/omarchy-onnx-models/`, with that model's licence and notice in `/usr/share/licenses/omarchy-onnx-model-<id>/`. They are kept apart from the module for two reasons: the four files are about 70 MB, which a `-git` rebuild of the module would otherwise download again each time, and each model has its own licence terms. The default model's package is a dependency of the module; install the others when you want to choose them:
 
