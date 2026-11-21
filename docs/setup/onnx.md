@@ -161,7 +161,7 @@ The omarchy-onnxruntime repository, <https://github.com/rsd/omarchy-onnxruntime>
 
 Each provider is a library of its own beside `libonnxruntime.so`, loaded only when it is asked for. A provider that is not installed, or whose vendor runtime is missing, disables that engine and nothing else.
 
-Install `onnxruntime-core` and the providers for the hardware you have (a subset is fine) together in one `pacman -U`, after the vendor runtimes of those engines. The repository's [docs/install.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/install.md) gives the procedure and the order of the steps.
+Install `onnxruntime-core` and the providers for the hardware you have (a subset is fine) together in one `pacman -U`, after the vendor runtimes of those engines. The repository's [INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md) gives the procedure and the order of the steps.
 
 AMD GPUs have no engine at present. ONNX Runtime removed the ROCm provider in 1.23, and a MIGraphX provider package (`onnxruntime-provider-migraphx`) is planned.
 
