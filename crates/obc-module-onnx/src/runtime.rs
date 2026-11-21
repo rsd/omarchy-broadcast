@@ -210,6 +210,10 @@ fn open(source: &LibrarySource) -> Result<Runtime, String> {
                 // level; only warnings and errors are wanted.
                 set_env_log_level(&env);
                 let version = version_string(&path).unwrap_or_else(|| "unknown".into());
+                // A bare name (the system path) is not a place: the
+                // provider libraries are looked for beside the file the
+                // loader found, as ONNX Runtime itself does.
+                let path = resolved_library(&path);
                 let providers = available_providers().map_err(|e| {
                     format!("ONNX Runtime ({}) lists no providers: {e}", path.display())
                 })?;
@@ -317,6 +321,72 @@ fn version_string(path: &Path) -> Option<String> {
             return None;
         }
         Some(CStr::from_ptr(v).to_string_lossy().into_owned())
+    }
+}
+
+/// The file of the loaded library `opened` (a path, or a bare name the
+/// loader searched for): where ONNX Runtime looks for its provider
+/// libraries. A path is kept as given (ONNX Runtime does not resolve
+/// symbolic links either); a bare name is the file the loader mapped, by
+/// `dladdr` of `OrtGetApiBase`, else the first of the loader's
+/// directories that has it, else the name itself.
+pub fn resolved_library(opened: &Path) -> PathBuf {
+    if opened.components().count() > 1 {
+        return opened.to_path_buf();
+    }
+    let name = opened.to_string_lossy();
+    loaded_file(&name, "OrtGetApiBase")
+        .or_else(|| {
+            loader_dirs()
+                .into_iter()
+                .map(|d| d.join(opened))
+                .find(|p| p.is_file())
+        })
+        .unwrap_or_else(|| opened.to_path_buf())
+}
+
+/// glibc's `Dl_info`, as `dladdr` fills it.
+#[repr(C)]
+struct DlInfo {
+    fname: *const c_char,
+    fbase: *mut std::ffi::c_void,
+    sname: *const c_char,
+    saddr: *mut std::ffi::c_void,
+}
+
+unsafe extern "C" {
+    fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> c_int;
+}
+
+/// The absolute path of the file the already-loaded library `name` was
+/// mapped from: `dladdr` of its `symbol`. `None` when it is not loaded,
+/// has no such symbol, or the loader gives no absolute path.
+pub fn loaded_file(name: &str, symbol: &str) -> Option<PathBuf> {
+    // SAFETY: opens only a library already loaded (its initialisers have
+    // run) and takes another reference to it, dropped at the end; the
+    // symbol's address is only passed to `dladdr`, never called.
+    unsafe {
+        let lib = libloading::os::unix::Library::open(
+            Some(name),
+            libloading::os::unix::RTLD_LAZY | RTLD_NOLOAD,
+        )
+        .ok()?;
+        let sym: libloading::os::unix::Symbol<*const std::ffi::c_void> =
+            lib.get(symbol.as_bytes()).ok()?;
+        let mut info = DlInfo {
+            fname: std::ptr::null(),
+            fbase: std::ptr::null_mut(),
+            sname: std::ptr::null(),
+            saddr: std::ptr::null_mut(),
+        };
+        if dladdr(*sym, &mut info) == 0 || info.fname.is_null() {
+            return None;
+        }
+        let path = PathBuf::from(
+            std::ffi::OsStr::from_encoded_bytes_unchecked(CStr::from_ptr(info.fname).to_bytes())
+                .to_os_string(),
+        );
+        path.is_absolute().then_some(path)
     }
 }
 
@@ -685,6 +755,65 @@ mod tests {
             ]
         );
         assert!(builder_resources_reachable("11.5.0", &dirs).is_empty());
+    }
+
+    #[test]
+    fn a_bare_name_resolves_to_the_file_the_loader_mapped() {
+        // libc is loaded in every test process, by its soname.
+        let libc = loaded_file("libc.so.6", "malloc").expect("libc is loaded");
+        assert!(libc.is_absolute() && libc.is_file(), "{}", libc.display());
+        assert!(
+            libc.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("libc"),
+            "{}",
+            libc.display()
+        );
+        assert_eq!(loaded_file("libobc-no-such-library.so.0", "malloc"), None);
+        assert_eq!(loaded_file("libc.so.6", "obc_no_such_symbol"), None);
+    }
+
+    #[test]
+    fn a_path_is_kept_and_an_unknown_bare_name_stays_a_name() {
+        let p = Path::new("/opt/ort/lib/libonnxruntime.so.1");
+        assert_eq!(resolved_library(p), p);
+        let n = Path::new("libobc-no-such-library.so.0");
+        assert_eq!(resolved_library(n), n);
+    }
+
+    /// The no-`ORT_DYLIB_PATH` case: the system's ONNX Runtime opened by
+    /// its soname, as `open` does, resolves to its directory, where the
+    /// engines' check finds the provider libraries.
+    #[test]
+    fn the_system_runtime_by_soname_resolves_to_its_directory() {
+        let name = SYSTEM_NAMES[0];
+        // SAFETY: ONNX Runtime's initialisers have no preconditions; it
+        // stays loaded for the test process, as it would for the daemon.
+        let Ok(lib) = (unsafe { libloading::Library::new(name) }) else {
+            eprintln!("no {name} on the library path: not checked");
+            return;
+        };
+        std::mem::forget(lib);
+        let found = resolved_library(Path::new(name));
+        assert!(
+            found.is_absolute() && found.is_file(),
+            "{}",
+            found.display()
+        );
+        let dir = found.parent().unwrap();
+        for provider in ["tensorrt", "cuda", "openvino"] {
+            let p = dir.join(format!("libonnxruntime_providers_{provider}.so"));
+            if p.is_file() {
+                assert!(
+                    !crate::engine::static_reasons(&found, true)
+                        .iter()
+                        .any(|(_, r)| r
+                            .contains(&format!("no libonnxruntime_providers_{provider}.so"))),
+                    "{provider}"
+                );
+            }
+        }
     }
 
     #[test]
