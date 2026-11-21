@@ -494,7 +494,9 @@ fn tensorrt_cache(req: &Request<'_>) -> Option<PathBuf> {
 
 /// Why `engine` cannot start for `req`, known without trying it: a reason
 /// of [`static_reasons`] that refuses ([`ruled_out_by`]), or for TensorRT,
-/// that its libraries cannot be loaded ([`tensorrt_libraries`]).
+/// that another TensorRT is in the process's global scope
+/// ([`foreign_tensorrt`]) or that its libraries cannot be loaded
+/// ([`tensorrt_libraries`]).
 fn ruled_out(req: &Request<'_>, engine: Engine) -> Option<String> {
     let library = &req.runtime.library;
     ruled_out_by(
@@ -505,29 +507,71 @@ fn ruled_out(req: &Request<'_>, engine: Engine) -> Option<String> {
                 .has_provider(engine.provider().expect("a concrete engine"))
         },
         || {
-            tensorrt_libraries(
-                || {
-                    let dir = library.parent().unwrap_or(Path::new("/"));
-                    crate::runtime::tensorrt_names_linked(
-                        &dir.join("libonnxruntime_providers_tensorrt.so"),
-                    )
-                },
-                crate::runtime::tensorrt_version(library).as_deref(),
-                || crate::cuda::device_identity().map(|(_, cc)| cc),
-                |version| {
-                    crate::runtime::builder_resources_reachable(
-                        version,
-                        &crate::runtime::loader_dirs(),
-                    )
-                },
-                // SAFETY: only TensorRT's builder resource libraries are
-                // opened here ([`crate::runtime::tensorrt_builder_resource_names`]):
-                // they hold data, their initialisers have no preconditions,
-                // and `libnvinfer` would load them for the process anyway.
-                |name| unsafe { crate::runtime::load_kept(name) },
+            let version = crate::runtime::tensorrt_version(library);
+            foreign_tensorrt(
+                || crate::runtime::tensorrt_provider_bound(library),
+                version.as_deref(),
+                crate::runtime::global_tensorrt,
             )
+            .or_else(|| {
+                tensorrt_libraries(
+                    || {
+                        let dir = library.parent().unwrap_or(Path::new("/"));
+                        crate::runtime::tensorrt_names_linked(
+                            &dir.join("libonnxruntime_providers_tensorrt.so"),
+                        )
+                    },
+                    version.as_deref(),
+                    || crate::cuda::device_identity().map(|(_, cc)| cc),
+                    |version| {
+                        crate::runtime::builder_resources_reachable(
+                            version,
+                            &crate::runtime::loader_dirs(),
+                        )
+                    },
+                    // SAFETY: only TensorRT's builder resource libraries are
+                    // opened here ([`crate::runtime::tensorrt_builder_resource_names`]):
+                    // they hold data, their initialisers have no preconditions,
+                    // and `libnvinfer` would load them for the process anyway.
+                    |name| unsafe { crate::runtime::load_kept(name) },
+                )
+            })
         },
     )
+}
+
+/// The reason TensorRT cannot start because another TensorRT is in the
+/// process's global scope, if one is: `global` gives its version and file
+/// ([`crate::runtime::global_tensorrt`]), `ours` is the version of the
+/// TensorRT the provider uses ([`crate::runtime::tensorrt_version`]; none
+/// leaves the reason to [`tensorrt_libraries`]), and `provider_bound`
+/// whether ONNX Runtime's TensorRT provider is loaded already with its
+/// symbols bound at load ([`crate::runtime::tensorrt_provider_bound`];
+/// asked first).
+///
+/// ONNX Runtime's TensorRT provider binds TensorRT's entry points, which
+/// are unversioned, to the first definition the global scope has. When
+/// that is another TensorRT (the Maxine SDK's 10.9 beside a provider built
+/// for 11), the provider calls it, gets no builder and crashes the process
+/// (`SIGSEGV`). A provider loaded and bound already is bound to its own
+/// TensorRT and starts whatever has entered the global scope since. A global TensorRT
+/// of the provider's own version is the one it uses (its soname matches).
+fn foreign_tensorrt(
+    provider_bound: impl FnOnce() -> bool,
+    ours: Option<&str>,
+    global: impl FnOnce() -> Option<(String, PathBuf)>,
+) -> Option<String> {
+    if provider_bound() {
+        return None;
+    }
+    let ours = ours?;
+    let (theirs, file) = global()?;
+    (theirs != ours).then(|| {
+        format!(
+            "TensorRT not available: TensorRT {theirs} ({}), loaded in the daemon by another effect, is not the one ONNX Runtime's TensorRT provider uses ({ours}), and the provider would crash on it; TensorRT is used again after the daemon restarts with the cut-out selected",
+            file.display()
+        )
+    })
 }
 
 /// [`ruled_out`]'s decision, with what it reads passed in so that it is
@@ -1502,6 +1546,80 @@ mod tests {
         assert_eq!(
             fallback_notice(Engine::TensorRt, engine, &reasons).unwrap(),
             format!("NVIDIA TensorRT was chosen and cannot run: {WHY}; using NVIDIA CUDA")
+        );
+    }
+
+    const MAXINE_TRT: &str =
+        "/opt/nvidia/maxine/videofx/external/tensorrt/lib/libnvinfer.so.10.9.0";
+
+    fn maxine_trt() -> Option<(String, PathBuf)> {
+        Some(("10.9.0".to_string(), PathBuf::from(MAXINE_TRT)))
+    }
+
+    #[test]
+    fn another_tensorrt_in_the_global_scope_rules_tensorrt_out() {
+        let r = foreign_tensorrt(|| false, Some("11.4.0"), maxine_trt).unwrap();
+        assert_eq!(
+            r,
+            format!(
+                "TensorRT not available: TensorRT 10.9.0 ({MAXINE_TRT}), loaded in the daemon by another effect, is not the one ONNX Runtime's TensorRT provider uses (11.4.0), and the provider would crash on it; TensorRT is used again after the daemon restarts with the cut-out selected"
+            )
+        );
+        // A global TensorRT of the provider's own major is not refused:
+        // `tensorrt_version` then reads that very library (the provider's
+        // soname matches it, and the provider would load it as its own),
+        // so `ours` is its version.
+        assert_eq!(foreign_tensorrt(|| false, Some("10.9.0"), maxine_trt), None);
+    }
+
+    #[test]
+    fn a_loaded_provider_starts_whatever_tensorrt_came_after_it() {
+        let mut asked_global = false;
+        let r = foreign_tensorrt(
+            || true,
+            Some("11.4.0"),
+            || {
+                asked_global = true;
+                maxine_trt()
+            },
+        );
+        assert_eq!(r, None);
+        assert!(
+            !asked_global,
+            "a loaded provider looked at the global scope"
+        );
+    }
+
+    #[test]
+    fn no_global_tensorrt_or_the_providers_own_does_not_rule_out() {
+        assert_eq!(foreign_tensorrt(|| false, Some("11.4.0"), || None), None);
+        let own = || {
+            Some((
+                "11.4.0".to_string(),
+                PathBuf::from("/opt/nvidia/tensorrt/lib/libnvinfer.so.11"),
+            ))
+        };
+        assert_eq!(foreign_tensorrt(|| false, Some("11.4.0"), own), None);
+        // Without the provider's TensorRT, the library check gives the
+        // reason (its libraries are not found).
+        assert_eq!(foreign_tensorrt(|| false, None, maxine_trt), None);
+    }
+
+    #[test]
+    fn tensorrt_ruled_out_for_another_tensorrt_falls_to_cuda_with_the_reason() {
+        let why = foreign_tensorrt(|| false, Some("11.4.0"), maxine_trt).unwrap();
+        let (tried, r) = choose_ruling_out(
+            Engine::TensorRt,
+            true,
+            Some(Engine::Cuda),
+            &[(Engine::TensorRt, why.as_str())],
+        );
+        // TensorRT is never tried: trying it is the crash.
+        assert_eq!(tried, [Engine::Cuda]);
+        let (engine, reasons) = r.unwrap();
+        assert_eq!(
+            fallback_notice(Engine::TensorRt, engine, &reasons).unwrap(),
+            format!("NVIDIA TensorRT was chosen and cannot run: {why}; using NVIDIA CUDA")
         );
     }
 
