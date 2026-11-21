@@ -1,16 +1,46 @@
 # Running omarchy-broadcastd as a user service
 
-`omarchy-broadcastd` is the headless daemon behind the virtual camera. It runs as a systemd user service, owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus, and starts the camera and the GPU pipeline only while an application is using the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)). Nothing is installed by the build. There are three ways to install it: the Arch package, a per-user install with `scripts/install-user.sh`, and a manual install. The last two need no root.
+`omarchy-broadcastd` is the headless daemon behind the virtual camera. It runs as a systemd user service, owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus, and starts the camera and the GPU pipeline only while an application is using the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)). Nothing is installed by the build. There are four ways to install it: the AUR, the Arch package built from a checkout, a per-user install with `scripts/install-user.sh`, and a manual install. The last two need no root.
 
 ## Prerequisites
 
 - The v4l2loopback device with the label "Omarchy Broadcast" and `exclusive_caps=1`, as described in [loopback.md](loopback.md). The daemon finds the device by its label. Without it the daemon runs in the state `error` and retries every 2 s.
-- The GPU prerequisites of the pipeline (README, "Requirements"): the NVIDIA driver, CUDA and GStreamer with the `nvcodec` plugin.
+- Optional, for the GPU path and the Maxine modules: the NVIDIA driver (`nvidia-utils`), CUDA (`cuda`, for NVRTC) and GStreamer's `nvcodec` plugin (README, "Requirements"). Without an NVIDIA GPU nothing extra is needed: the daemon runs the video in system memory ([onnx.md](onnx.md#using-it-on-a-machine-without-an-nvidia-gpu)). On a machine with an NVIDIA GPU, install `cuda` as well as `nvidia-utils`: under the default `[video] memory = "auto"` the daemon takes the CUDA path whenever the driver lists a GPU, and GStreamer's CUDA converters need NVRTC from `cuda`. To run without CUDA on such a machine, set `[video] memory = "system"`.
 - A systemd user session with a D-Bus session bus (the normal state of a desktop login).
 
 ## Install
 
-### Arch package
+### From the AUR
+
+The AUR has the same split package as `packaging/arch/PKGBUILD` (pkgbase `omarchy-broadcast-git`), built from this repository on GitHub. With an AUR helper such as `yay`, install the core and the open-model cut-out module:
+
+```sh
+yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git
+```
+
+On a machine with an NVIDIA GPU, add `cuda` (NVRTC, needed by the CUDA video path; `nvidia-utils` comes with the NVIDIA driver):
+
+```sh
+yay -S cuda omarchy-broadcast-git omarchy-broadcast-onnx-git
+```
+
+On a machine without an NVIDIA GPU, install the CPU build of ONNX Runtime with them, or pick `onnxruntime-cpu` when yay asks which provider of `onnxruntime` to install:
+
+```sh
+yay -S onnxruntime-cpu omarchy-broadcast-onnx-git
+```
+
+The other providers build a much larger runtime (the AUR's `onnxruntime-core` builds with CUDA, cuDNN, OpenVINO and TensorRT); [onnx.md](onnx.md#2-install-onnx-runtime) lists them. On an NVIDIA GPU, the Maxine modules are `omarchy-broadcast-maxine-vfx-git`, `omarchy-broadcast-maxine-ar-git` and `omarchy-broadcast-maxine-afx-git`. Each depends on an SDK package that you build yourself from your own download of the NVIDIA SDK, as in [maxine.md](maxine.md); install that SDK package first.
+
+Then configure the v4l2loopback device as in [loopback.md](loopback.md) (needs root, once; the package ships the `modprobe.d` line as `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`), and start the daemon:
+
+```sh
+systemctl --user enable --now omarchy-broadcastd
+```
+
+The package prints these steps after it is installed.
+
+### Arch package from a checkout
 
 `packaging/arch/PKGBUILD` builds, from the committed HEAD of the local checkout (uncommitted changes are not included), one split package of five: the core `omarchy-broadcast-git` and a package per loadable module (see the table in the README, "Install"). Build from `packaging/arch`, then install the core, and the module packages you want from the same build:
 
@@ -28,25 +58,26 @@ The core package, `omarchy-broadcast-git`, installs:
 - the directories modules are found in, `/usr/lib/omarchy-broadcast/modules` (libraries) and `/usr/lib/omarchy-broadcast/modules.d` (manifests), with the CPU voice module in them; the other modules are packages of their own built from the same `PKGBUILD` (`omarchy-broadcast-maxine-vfx-git`, `-maxine-ar-git`, `-maxine-afx-git` and `-onnx-git`; [maxine.md](maxine.md#the-maxine-module), [onnx.md](onnx.md), [../modules.md](../modules.md)), each depending on the module ABI that the core provides (`omarchy-broadcast-module-abi`, a range: [../modules.md](../modules.md#packaging-a-module)); and the C header of the module interface, `/usr/include/omarchy-broadcast/omarchy_broadcast_module.h`;
 - the udev rule for the MX Brio, `/usr/lib/udev/rules.d/70-omarchy-broadcast-mx-brio.rules`, which lets the daemon read the camera's Show Mode ([below](#the-udev-rule-for-the-mx-brio));
 - the licences and this documentation, in `/usr/share/doc/omarchy-broadcast/`;
-- the optional WirePlumber drop-in as an inactive example in `/usr/share/doc/omarchy-broadcast/examples/systemd/wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire". The Maxine SDKs need no drop-in: the daemon applies the SDK package's environment to itself at start ([maxine.md](maxine.md#3-the-sdk-environment)).
+- the optional WirePlumber drop-in as an inactive example in `/usr/share/doc/omarchy-broadcast/examples/systemd/wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire".
+- the loopback's `modprobe.d` line of [loopback.md](loopback.md) as an inactive example, `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`, to copy into `/etc/modprobe.d`. It is not installed in `/usr/lib/modprobe.d`: only one `options v4l2loopback` line takes effect, and it would collide with one of your own. The Maxine SDKs need no drop-in: the daemon applies the SDK package's environment to itself at start ([maxine.md](maxine.md#3-the-sdk-environment)).
 
-Nothing is enabled. Each user runs:
+Nothing is enabled; after an install, pacman prints the next steps (the install scriptlet `packaging/arch/omarchy-broadcast.install`, which changes nothing). Each user runs:
 
 ```sh
 systemctl --user enable --now omarchy-broadcastd
 ```
 
-The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). `ffmpeg` is an optional dependency (`optdepends`): the daemon runs it, at low priority, to convert an animated GIF, WebP or APNG at import and to make the poster of an imported video. On a machine without an NVIDIA GPU it is also the program of the command that converts a video the CPU cannot play ([Playing a video without an NVIDIA GPU](#playing-a-video-without-an-nvidia-gpu)); the daemon never runs that command. The bundled video loops need none of it, and with an NVIDIA GPU a video plays as it is ([../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md)). The NVIDIA Maxine SDKs are never part of the packages: each Maxine module package depends on the SDK package of its own (`maxine-vfx-sdk-local`, `maxine-ar-sdk-local` or `maxine-afx-sdk-local`), which you build yourself from the omarchy-nvidia-sdks repository and install as in [maxine.md](maxine.md).
+The runtime dependencies include `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The NVIDIA driver userspace (`nvidia-utils`) and `cuda` (NVRTC, used by GStreamer's CUDA converters) are optional dependencies, for the GPU path and the Maxine modules: the daemon opens them at run time. Without an NVIDIA GPU neither is needed and the daemon runs the video in system memory ([onnx.md](onnx.md#using-it-on-a-machine-without-an-nvidia-gpu)); with one, install both, or set `[video] memory = "system"`, since under `auto` the daemon takes the CUDA path when the driver lists a GPU and the CUDA converters then need NVRTC. The Maxine video and AR module packages depend on `cuda`, and the Maxine SDK packages on `nvidia-utils`. The loopback device must still be configured as in [loopback.md](loopback.md). `ffmpeg` is an optional dependency (`optdepends`): the daemon runs it, at low priority, to convert an animated GIF, WebP or APNG at import and to make the poster of an imported video. On a machine without an NVIDIA GPU it is also the program of the command that converts a video the CPU cannot play ([Playing a video without an NVIDIA GPU](#playing-a-video-without-an-nvidia-gpu)); the daemon never runs that command. The bundled video loops need none of it, and with an NVIDIA GPU a video plays as it is ([../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md)). The NVIDIA Maxine SDKs are never part of the packages: each Maxine module package depends on the SDK package of its own (`maxine-vfx-sdk-local`, `maxine-ar-sdk-local` or `maxine-afx-sdk-local`), which you build yourself from the omarchy-nvidia-sdks repository and install as in [maxine.md](maxine.md).
 
 ### Publishing to the AUR
 
-The recipe for the AUR is the same split package under the pkgbase `omarchy-broadcast-git`; once it is published there, it can be installed from the AUR. The AUR copy of `packaging/arch/PKGBUILD` differs from it only in where it builds from: it clones `https://github.com/rsd/omarchy-broadcast.git` instead of the local checkout, and its header comment says so. `scripts/aur.sh` makes that copy: it replaces exactly the local-checkout header paragraph, the build hint and the `source=` line, and fails when one of them is not in the PKGBUILD exactly once (a change to one of those lines is made in the script too). It generates the `.SRCINFO` with `LC_ALL=C makepkg --printsrcinfo` on the copy, alone in an empty directory, in an environment holding only `PATH` and an empty `HOME`. The AUR repository holds exactly `PKGBUILD`, `.SRCINFO` and `LICENSE` (0BSD, written by the script too); `--aur` and `--check` refuse any other file in it.
+The recipe for the AUR is the same split package under the pkgbase `omarchy-broadcast-git` ([From the AUR](#from-the-aur)). The AUR copy of `packaging/arch/PKGBUILD` differs from it only in where it builds from: it clones `https://github.com/rsd/omarchy-broadcast.git` instead of the local checkout, and its header comment says so. `scripts/aur.sh` makes that copy: it replaces exactly the local-checkout header paragraph, the build hint and the `source=` line, and fails when one of them is not in the PKGBUILD exactly once (a change to one of those lines is made in the script too). It generates the `.SRCINFO` with `LC_ALL=C makepkg --printsrcinfo` on the copy, alone in an empty directory, in an environment holding only `PATH` and an empty `HOME`. The install scriptlet, `packaging/arch/omarchy-broadcast.install`, is copied unchanged, and lies beside the copy when the `.SRCINFO` is generated (makepkg checks that it exists). The AUR repository holds exactly `PKGBUILD`, `.SRCINFO`, `omarchy-broadcast.install` and `LICENSE` (0BSD, written by the script too); `--aur` and `--check` refuse any other file in it.
 
 ```sh
 scripts/aur.sh                  # prints the AUR PKGBUILD
 scripts/aur.sh --srcinfo        # prints its .SRCINFO
 scripts/aur.sh --check DIR      # fails, with a diff, when DIR's files are stale or DIR holds another file
-scripts/aur.sh --aur DIR        # writes PKGBUILD, .SRCINFO and LICENSE into DIR
+scripts/aur.sh --aur DIR        # writes PKGBUILD, .SRCINFO, omarchy-broadcast.install and LICENSE into DIR
 ```
 
 `DIR` must be the top of a git clone of the AUR repository; the script commits nothing. The clone is kept in `aur/omarchy-broadcast-git`, which this repository ignores. To publish, after the release commit is pushed to GitHub:
@@ -56,7 +87,7 @@ git clone ssh://aur@aur.archlinux.org/omarchy-broadcast-git.git aur/omarchy-broa
 scripts/aur.sh --aur aur/omarchy-broadcast-git
 cd aur/omarchy-broadcast-git
 git diff                        # review
-git add PKGBUILD .SRCINFO LICENSE
+git add PKGBUILD .SRCINFO omarchy-broadcast.install LICENSE
 git commit -m '0.55.0-1'
 git push
 ```

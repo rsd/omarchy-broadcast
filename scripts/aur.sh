@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # aur.sh — make the AUR copy of packaging/arch/PKGBUILD (pkgbase
-# omarchy-broadcast-git) and its .SRCINFO.
+# omarchy-broadcast-git) and its .SRCINFO, with the install scriptlet
+# packaging/arch/omarchy-broadcast.install, copied unchanged.
 #
 # The PKGBUILD in this repository builds from the local checkout that holds
 # it (source=git+file://...), for development. The AUR copy is the same file
@@ -14,16 +15,19 @@
 #   scripts/aur.sh               # prints the AUR PKGBUILD
 #   scripts/aur.sh --srcinfo     # prints its .SRCINFO
 #   scripts/aur.sh --check DIR   # fails, with a diff, when DIR's PKGBUILD,
-#                                # .SRCINFO or LICENSE is not the generated one,
-#                                # or when DIR holds any other file
-#   scripts/aur.sh --aur DIR     # writes PKGBUILD, .SRCINFO and LICENSE (0BSD)
+#                                # .SRCINFO, omarchy-broadcast.install or
+#                                # LICENSE is not the generated one, or when
+#                                # DIR holds any other file
+#   scripts/aur.sh --aur DIR     # writes PKGBUILD, .SRCINFO,
+#                                # omarchy-broadcast.install and LICENSE (0BSD)
 #                                # into DIR, the top of a git clone of the AUR
 #                                # repository
 #                                # (ssh://aur@aur.archlinux.org/omarchy-broadcast-git.git);
 #                                # refuses when DIR holds any other file
 #
 # The .SRCINFO is made by `LC_ALL=C makepkg --printsrcinfo` on the AUR copy,
-# alone in an empty directory under mktemp, in an environment holding only
+# with the install scriptlet beside it (makepkg checks that the install=
+# file exists) in an empty directory under mktemp, in an environment holding only
 # PATH and an empty HOME (no user makepkg.conf is read). --aur commits
 # nothing: DIR's git index is left to the maintainer.
 #
@@ -34,6 +38,7 @@ set -euo pipefail
 prog=${0##*/}
 top=$(cd "$(dirname "$0")/.." && pwd)
 pkgbuild=$top/packaging/arch/PKGBUILD
+install_file=omarchy-broadcast.install
 pkgbase=omarchy-broadcast-git
 url=https://github.com/rsd/omarchy-broadcast.git
 
@@ -116,11 +121,18 @@ aur_pkgbuild() {
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# generate: writes $tmp/out/PKGBUILD and $tmp/out/.SRCINFO.
+# generate: writes $tmp/out/PKGBUILD, $tmp/out/.SRCINFO, the install
+# scriptlet and $tmp/out/LICENSE.
 generate() {
     command -v makepkg >/dev/null 2>&1 || { echo "$prog: makepkg not found" >&2; return 2; }
     mkdir -p "$tmp/out" "$tmp/home"
     aur_pkgbuild "$tmp/out/PKGBUILD" || return
+    # shellcheck disable=SC2016 # the PKGBUILD's text, expanded by makepkg
+    if ! grep -qxF '  install=$_pkgname.install' "$tmp/out/PKGBUILD"; then
+        echo "$prog: the PKGBUILD does not set install=\$_pkgname.install ($install_file)" >&2
+        return 2
+    fi
+    cp -- "${pkgbuild%/*}/$install_file" "$tmp/out/$install_file" || return 2
     if ! (cd "$tmp/out" && env -i PATH="$PATH" HOME="$tmp/home" LC_ALL=C makepkg --printsrcinfo >.SRCINFO); then
         echo "$prog: makepkg --printsrcinfo failed" >&2
         return 2
@@ -141,7 +153,7 @@ PERFORMANCE OF THIS SOFTWARE.
 EOF
 }
 
-files=(PKGBUILD .SRCINFO LICENSE)
+files=(PKGBUILD .SRCINFO "$install_file" LICENSE)
 
 # extra <dir>: fails when <dir> holds anything but .git and the files: an AUR
 # repository holds exactly what is pushed.
@@ -149,7 +161,7 @@ extra() {
     local f found=0
     while IFS= read -r -d '' f; do
         f=${f##*/}
-        case $f in .git | PKGBUILD | .SRCINFO | LICENSE) continue ;; esac
+        case $f in .git | PKGBUILD | .SRCINFO | "$install_file" | LICENSE) continue ;; esac
         echo "$prog: $1/$f is not part of the AUR package" >&2
         found=1
     done < <(find "$1" -mindepth 1 -maxdepth 1 -print0)
