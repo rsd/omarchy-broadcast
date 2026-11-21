@@ -590,6 +590,18 @@ impl MediaStore {
         items
     }
 
+    /// The background chosen for a user who chose none: the first bundled
+    /// background in the gallery's order ([`MediaStore::list`]: `SOURCES.toml`
+    /// order, then by name), a still image before a video. `None` when the
+    /// bundled directory holds no background.
+    pub fn default_background(&self) -> Option<PathBuf> {
+        let items = self.list_bundled(MediaKind::Background);
+        let first = |t: MediaType| items.iter().find(|i| i.media_type == t);
+        first(MediaType::Image)
+            .or_else(|| first(MediaType::Video))
+            .map(|i| i.path.clone())
+    }
+
     /// The video files of `kind` in the bundled and every user directory
     /// (by their name: no check, no read), for a prune.
     pub(crate) fn video_paths(&self, kind: MediaKind) -> Vec<PathBuf> {
