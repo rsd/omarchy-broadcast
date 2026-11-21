@@ -12,25 +12,33 @@
 
 ### From the AUR
 
-The AUR has the same split package as `packaging/arch/PKGBUILD` (pkgbase `omarchy-broadcast-git`), built from this repository on GitHub. With an AUR helper such as `yay`, install the core and the open-model cut-out module:
+The AUR has the split package of `packaging/arch/PKGBUILD` in two forms. Install one of them: they conflict with each other, and the modules of one kind work with the core of the other.
+
+- `omarchy-broadcast-bin` (pkgbase) is prebuilt and quick to install. Its files come from the GitHub release of the same version, are checked against a sha256 in the recipe, and need no build tools. Its packages are `omarchy-broadcast-bin`, `omarchy-broadcast-onnx-bin`, `omarchy-broadcast-maxine-vfx-bin`, `omarchy-broadcast-maxine-ar-bin` and `omarchy-broadcast-maxine-afx-bin`.
+- `omarchy-broadcast-git` (pkgbase) builds from the latest source of this repository on GitHub, and needs the build tools of `packaging/arch/PKGBUILD`. Its packages have the same names with `-git` in place of `-bin`.
+
+Each `-bin` package installs exactly the files of its `-git` twin, provides the plain name (`omarchy-broadcast`, `omarchy-broadcast-onnx`, and so on) and conflicts with the plain name and with the twin. With an AUR helper such as `yay`, install the core and the open-model cut-out module:
 
 ```sh
-yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git
+yay -S omarchy-broadcast-bin omarchy-broadcast-onnx-bin   # prebuilt
+yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git   # built from source
 ```
 
 On a machine with an NVIDIA GPU, add `cuda` (NVRTC, needed by the CUDA video path; `nvidia-utils` comes with the NVIDIA driver):
 
 ```sh
-yay -S cuda omarchy-broadcast-git omarchy-broadcast-onnx-git
+yay -S cuda omarchy-broadcast-bin omarchy-broadcast-onnx-bin
 ```
 
 On a machine without an NVIDIA GPU, install the CPU build of ONNX Runtime with them, or pick `onnxruntime-cpu` when yay asks which provider of `onnxruntime` to install:
 
 ```sh
-yay -S onnxruntime-cpu omarchy-broadcast-onnx-git
+yay -S onnxruntime-cpu omarchy-broadcast-onnx-bin
 ```
 
-The other providers build a much larger runtime (the AUR's `onnxruntime-core` builds with CUDA, cuDNN, OpenVINO and TensorRT); [onnx.md](onnx.md#2-install-onnx-runtime) lists them. On an NVIDIA GPU, the Maxine modules are `omarchy-broadcast-maxine-vfx-git`, `omarchy-broadcast-maxine-ar-git` and `omarchy-broadcast-maxine-afx-git`. Each depends on an SDK package that you build yourself from your own download of the NVIDIA SDK, as in [maxine.md](maxine.md); install that SDK package first.
+The other providers build a much larger runtime (the AUR's `onnxruntime-core` builds with CUDA, cuDNN, OpenVINO and TensorRT); [onnx.md](onnx.md#2-install-onnx-runtime) lists them. On an NVIDIA GPU, the Maxine modules are `omarchy-broadcast-maxine-vfx-bin`, `omarchy-broadcast-maxine-ar-bin` and `omarchy-broadcast-maxine-afx-bin` (`-git` in place of `-bin` for the source build). Each depends on an SDK package that you build yourself from your own download of the NVIDIA SDK, as in [maxine.md](maxine.md); install that SDK package first.
+
+The prebuilt packages do not contain the NVIDIA SDKs or ONNX Runtime, which are licensed separately. The Maxine and ONNX modules hold no code of either: they load the SDK or the runtime when the daemon runs. So the `-bin` modules need the SDK packages and an `onnxruntime` package exactly as the `-git` ones do.
 
 Then configure the v4l2loopback device as in [loopback.md](loopback.md) (needs root, once; the package ships the `modprobe.d` line as `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`), and start the daemon:
 
@@ -71,7 +79,7 @@ The runtime dependencies include `gst-plugins-good`, `gst-plugins-bad-libs` and 
 
 ### Publishing to the AUR
 
-The recipe for the AUR is the same split package under the pkgbase `omarchy-broadcast-git` ([From the AUR](#from-the-aur)). The AUR copy of `packaging/arch/PKGBUILD` differs from it only in where it builds from: it clones `https://github.com/rsd/omarchy-broadcast.git` instead of the local checkout, and its header comment says so. `scripts/aur.sh` makes that copy: it replaces exactly the local-checkout header paragraph, the build hint and the `source=` line, and fails when one of them is not in the PKGBUILD exactly once (a change to one of those lines is made in the script too). It generates the `.SRCINFO` with `LC_ALL=C makepkg --printsrcinfo` on the copy, alone in an empty directory, in an environment holding only `PATH` and an empty `HOME`. The install scriptlet, `packaging/arch/omarchy-broadcast.install`, is copied unchanged, and lies beside the copy when the `.SRCINFO` is generated (makepkg checks that it exists). The AUR repository holds exactly `PKGBUILD`, `.SRCINFO`, `omarchy-broadcast.install` and `LICENSE` (0BSD, written by the script too); `--aur` and `--check` refuse any other file in it.
+The AUR holds two recipes of the split package ([From the AUR](#from-the-aur)): the source one, pkgbase `omarchy-broadcast-git`, and the prebuilt one, pkgbase `omarchy-broadcast-bin` ([below](#the-prebuilt-packages-omarchy-broadcast-bin)). This part is about the source one. The AUR copy of `packaging/arch/PKGBUILD` differs from it only in where it builds from: it clones `https://github.com/rsd/omarchy-broadcast.git` instead of the local checkout, and its header comment says so. `scripts/aur.sh` makes that copy: it replaces exactly the local-checkout header paragraph, the build hint and the `source=` line, and fails when one of them is not in the PKGBUILD exactly once (a change to one of those lines is made in the script too). It generates the `.SRCINFO` with `LC_ALL=C makepkg --printsrcinfo` on the copy, alone in an empty directory, in an environment holding only `PATH` and an empty `HOME`. The install scriptlet, `packaging/arch/omarchy-broadcast.install`, is copied unchanged, and lies beside the copy when the `.SRCINFO` is generated (makepkg checks that it exists). The AUR repository holds exactly `PKGBUILD`, `.SRCINFO`, `omarchy-broadcast.install` and `LICENSE` (0BSD, written by the script too); `--aur` and `--check` refuse any other file in it.
 
 ```sh
 scripts/aur.sh                  # prints the AUR PKGBUILD
@@ -93,6 +101,37 @@ git push
 ```
 
 The committed `pkgver=` is the release version; makepkg replaces it with the output of `pkgver()` (`<version>.r<commits>.g<hash>`), which sorts after it. A new AUR commit is needed only when the PKGBUILD changes (a dependency, a file installed, a new version in `pkgver=`), not for every commit of the repository.
+
+#### The prebuilt packages (`omarchy-broadcast-bin`)
+
+The `-bin` recipe installs the files of a GitHub release, so the release is made and published first. Each package of the split package has one asset, `<name>-<version>-x86_64.tar.zst`, which is the `usr/` tree of the `-git` package as it is, with its licence directory named `<name>-bin`. The recipe pins every asset by the sha256 in the release's `SHA256SUMS`. It has no `build()` and no build dependencies.
+
+`scripts/release-bin.sh [--nocheck] [--out DIR]` makes the assets:
+
+- It releases the commit `HEAD` names when it starts, and the workspace version of that commit. It refuses when the `pkgver=` of that commit's `packaging/arch/PKGBUILD` is another, and it warns that uncommitted changes are not built.
+- It builds the five `-git` packages of that commit with `makepkg` in a scratch directory, without installing anything and without `-s`, so the build dependencies must be installed. `--nocheck` skips `check()`, the workspace test suite.
+- It writes the assets, `SHA256SUMS` and, in `pkg/`, the `-git` packages they were made of into the directory `--out` names, which must not exist or be empty (the script has a default, and prints the path when it is done). It writes into a temporary directory beside it and moves it into place only when the release is complete, so a failure leaves nothing behind.
+
+Before any asset is kept, the script runs a gate that keeps the NVIDIA SDKs and ONNX Runtime out of the release. Every ELF file of an asset must be one that the package is expected to hold. Each must need only the libraries on its own allowlist (the modules and the LADSPA plugin, only the C runtime) and define only its own dynamic symbols (a module, `obc_module_abi_version` and `obc_module_entry`). The libraries must hold none of the strings that only SDK code linked in statically carries. Every file must be one the package is expected to hold, with no other shared library, no model or engine file and no `models/` directory. A Maxine module that fails the gate is left out of the release, and the script says so; if the core or the ONNX module fails it, the script fails.
+
+The script does not publish anything. It prints, and does not run, the commands for the rest: tag the commit and push the tag, then `gh release create` with the assets and `SHA256SUMS`, then the update of the AUR repository. Run them in this order. The assets must be on the GitHub release before the push to the AUR, because the `-bin` sources download from it:
+
+1. Push the release commit to GitHub, then tag and push the tag.
+2. Create the release `v<version>` on GitHub with the assets and `SHA256SUMS`.
+3. Make the AUR recipe from the release directory, and review it:
+
+```sh
+git clone ssh://aur@aur.archlinux.org/omarchy-broadcast-bin.git aur/omarchy-broadcast-bin   # once
+scripts/aur.sh --bin RELEASE_DIR --aur aur/omarchy-broadcast-bin
+scripts/aur.sh --bin RELEASE_DIR --check aur/omarchy-broadcast-bin
+cd aur/omarchy-broadcast-bin
+git diff                        # review
+git add PKGBUILD .SRCINFO omarchy-broadcast.install LICENSE
+git commit -m 'Update to <version>'
+git push origin HEAD:master
+```
+
+`scripts/aur.sh --bin RELEASE_DIR` has no package data of its own: the description, licences, dependencies, optional dependencies, provides and conflicts come from the `.PKGINFO` of each `-git` package in `RELEASE_DIR/pkg`. Before it writes anything, it checks that every asset matches `SHA256SUMS` and holds the `usr/` tree of its `-git` package unchanged, apart from the licence directory name. The packages of the recipe are those of the assets `SHA256SUMS` lists, so a Maxine module left out of the release is left out of the recipe. `--srcinfo` prints the `.SRCINFO`, and `--check` and `--aur` behave as for the `-git` recipe. The AUR repository holds the same four files, and a new AUR commit is needed for every release, since `pkgver=` is the release version.
 
 ### Per-user install from a checkout
 
@@ -398,7 +437,7 @@ systemctl --user disable --now omarchy-broadcastd
 
 Then, depending on how it was installed:
 
-- Arch package: `sudo pacman -R omarchy-broadcast-git` (after any module package, which depends on it), which removes the udev rule too. Remove any drop-in you copied from the examples (the WirePlumber one; a Maxine drop-in copied for an earlier version is not needed any more, see [maxine.md](maxine.md#3-the-sdk-environment)). The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
+- Arch package: `sudo pacman -R omarchy-broadcast-git`, or `sudo pacman -R omarchy-broadcast-bin` for the prebuilt package (after any module package, which depends on it), which removes the udev rule too. Remove any drop-in you copied from the examples (the WirePlumber one; a Maxine drop-in copied for an earlier version is not needed any more, see [maxine.md](maxine.md#3-the-sdk-environment)). The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
 - Per-user install: `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed, the Maxine module's library and manifest among them, and refuses while the unit is still enabled, hence the command above comes first. A hand-made Maxine manifest stops it too; remove the files named in [maxine.md](maxine.md#8-uninstall) first.
 - Manual install:
 
