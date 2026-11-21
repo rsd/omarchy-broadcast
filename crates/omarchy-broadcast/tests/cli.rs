@@ -3559,6 +3559,56 @@ fn daemon_not_running_has_its_own_exit_code_and_reads_never_activate() {
 }
 
 #[test]
+fn start_with_the_daemon_running_prints_the_status_and_changes_nothing() {
+    let bus = Bus::start();
+    let _mock = MockDaemon::start(&bus);
+
+    let status = bus.run(&["status"]);
+    let out = bus.run(&["start"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, status.stdout);
+    assert_eq!(out.stderr, "");
+
+    let status = bus.run(&["status", "--json"]);
+    let out = bus.run(&["start", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout.lines().count(), 1, "{}", out.stdout);
+    assert_eq!(json_line(&out.stdout), json_line(&status.stdout));
+    assert_eq!(json_line(&out.stdout)["type"], "snapshot");
+    assert!(
+        !bus.activation_attempted(),
+        "a running daemon needs no activation"
+    );
+}
+
+#[test]
+fn start_reports_a_daemon_that_activation_cannot_start() {
+    let bus = Bus::start();
+
+    let out = bus.run(&["start"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("D-Bus could not start it"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr
+            .contains("systemctl --user enable --now omarchy-broadcastd"),
+        "{}",
+        out.stderr
+    );
+    assert!(bus.activation_attempted(), "`start` must activate");
+
+    let out = bus.run(&["start", "--json"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["code"], "daemon-not-running");
+}
+
+#[test]
 fn no_session_bus_is_daemon_not_running() {
     let bus = Bus::start();
     let missing = bus.socket_dir.0.join("no-such-bus");

@@ -186,7 +186,7 @@ systemctl --user enable --now omarchy-broadcastd
        > ~/.config/systemd/user/omarchy-broadcastd.service
    ```
 
-3. Optional, D-Bus activation: with this file, a command such as `omarchy-broadcast on` starts the service if it is not running. Reads (`omarchy-broadcast status`, `watch`) never start it. See [dbus-api.md](../dbus-api.md#service-presence-and-activation).
+3. Optional, D-Bus activation: with this file, a command such as `omarchy-broadcast on` starts the service if it is not running. Reads (`omarchy-broadcast status`, `watch`) never start it; `omarchy-broadcast start` starts it through this file now and prints the status, without changing any state. See [dbus-api.md](../dbus-api.md#service-presence-and-activation).
 
    ```sh
    install -Dm644 dist/dbus-1/services/br.com.dias.OmarchyBroadcast.service \
