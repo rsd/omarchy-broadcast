@@ -416,7 +416,10 @@ pub struct World {
     /// More modules, each with what opening it gives.
     pub modules: Vec<(ModuleEntry, Result<OpenedModule, String>)>,
     /// The modules of the directories are discovered and opened for real
-    /// (`obc-module-host`), after the fake ones.
+    /// (`obc-module-host`), after the fake ones. Only the test's own
+    /// directories (the config's `[modules] dirs`) are scanned: the system
+    /// and user `modules.d` and `OBC_MODULE_PATH` of the machine that runs
+    /// the tests are skipped, so an installed module stays out of them.
     pub real_modules: bool,
     /// Every module opened, with its configuration, in order.
     pub module_opens: Vec<(String, serde_json::Value)>,
@@ -1598,7 +1601,13 @@ impl MediaBackend for FakeBackend {
         }
         entries.extend(w.modules.iter().map(|(e, _)| e.clone()));
         if w.real_modules {
-            entries.extend(obc_module_host::scan(dirs).entries);
+            let machine = obc_module_host::default_dirs(&[]);
+            let own: Vec<PathBuf> = dirs
+                .iter()
+                .filter(|d| !machine.contains(d))
+                .cloned()
+                .collect();
+            entries.extend(obc_module_host::scan(&own).entries);
         }
         entries
     }
