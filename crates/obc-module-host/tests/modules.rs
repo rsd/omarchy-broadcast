@@ -19,7 +19,6 @@ use obc_backend::{
     ColourSpec, DeviceNv12, EffectKind, FrameKind, FrameParams, GpuContext, HostBgr, HostNv12,
     HostNv12View, LoadRequest, Params, StageChainFactory, StageId, StageList, Value,
 };
-use obc_module_host::discovery::dirs_from;
 use obc_module_host::manifest::{REASON_AUDIO_IN_WORKER, REASON_VIDEO_IN_DAEMON};
 use obc_module_host::{
     AudioBlock, AudioSpec, LoadKinds, LogLevel, LogSink, Manifest, Module, ModuleBackendFactory,
@@ -360,7 +359,7 @@ fn hello_is_discovered_loads_probes_describes_and_tints_a_host_frame() {
     assert_ne!(shipped, installed, "the example's library line moved");
     std::fs::write(modules_d.path().join("hello.toml"), installed).unwrap();
 
-    let dirs = dirs_from(None, None, &[], Some(modules_d.path().as_os_str()));
+    let dirs = vec![modules_d.path().to_path_buf()];
     let discovery = scan(&dirs);
     let mut registry = Registry::new(discovery);
     let (sink, _lines) = capture();
