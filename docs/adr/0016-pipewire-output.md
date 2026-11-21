@@ -61,6 +61,7 @@ Once WirePlumber has probed the loopback while the writer streams, PipeWire also
 - The build gains an optional dependency (libpipewire, clang). The default build and its checks are unchanged; `scripts/check-all.sh` builds, lints and tests with the feature as a separate step, and the Arch package is built with it.
 - Tests: [../testing.md](../testing.md#the-pipewire-output).
 - Not supported: a PipeWire-only mode without v4l2loopback; a colour range or matrix announced to consumers.
+- **Known limitation: mixed formats.** The node has one port with one negotiated format. A consumer that asks for a format the node does offer, but another than the one a running consumer negotiated, is not handled while streaming: in a measurement, one consumer on YUY2 and a second that accepted only NV12 left the first without frames from the moment the second connected, until every consumer had disconnected. The statement above that a consumer's refusal "fails its own link only" holds for a format the node does not offer at all. Not fixed; the output stays optional. User documentation: [../setup/daemon.md](../setup/daemon.md#the-pipewire-output).
 
 ## Notes
 - **Format order (2026-11-09).** The node offers YUY2 first, then NV12 and I420, whatever the contract's format. OBS Studio 32.2's PipeWire camera source computes NV12 row size as 2 bytes per pixel and reads past the buffer; offering YUY2 first avoids this. A consumer that asks for NV12 or I420 explicitly still negotiates it, and the buffer layout and stride the node announces are unchanged.

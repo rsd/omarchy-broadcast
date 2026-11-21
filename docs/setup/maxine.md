@@ -330,7 +330,7 @@ What the effects do, the settings in the Mic tab, studio voice's exclusion of no
 ```bash
 # the module package first (it depends on the SDK package), then the SDK package,
 # only if nothing else uses it
-sudo pacman -R omarchy-broadcast-maxine-vfx-git
+sudo pacman -R omarchy-broadcast-maxine-vfx-git     # or omarchy-broadcast-maxine-vfx-bin, if you installed the prebuilt one
 sudo pacman -R maxine-vfx-sdk-local
 systemctl --user restart omarchy-broadcastd.service
 ```

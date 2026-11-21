@@ -37,6 +37,17 @@ options v4l2loopback devices=2 video_nr=10,11 card_label="First Device,Omarchy B
 
 `max_buffers` is a single global value, not a per-device array.
 
+## One application at a time
+
+A v4l2loopback device from version 0.14 on lets only one process stream from its capture side at a time. A second application that opens the same device can read its format and list its controls, but its attempt to start streaming (`VIDIOC_S_FMT` or `VIDIOC_REQBUFS`, or a plain `read()`) fails with `EBUSY`, even when it asks for exactly the format the device already has. The driver gives the right to stream to the first process and keeps it until that process lets go. No module option changes this (`max_openers` limits how many processes may open the device, not how many may stream, and `keep_format` only locks the format), and the daemon's writer has no part in it. Version 0.13.x let several processes read at once, but it has bugs that 0.14 fixed, so downgrading is not a remedy.
+
+What this means in practice:
+
+- **One application can share the camera internally.** Chrome and Chromium open the device once and share the capture between their tabs, so several tabs of the same browser can show the camera at the same time.
+- **A second application gets "device busy"** (or no camera, or an error about the format) while the first one streams. It works once the first one releases the camera. The daemon's `status` shows `Consumers` for the applications that hold the device.
+- **For several applications at once, use the PipeWire camera node.** The daemon can register the camera as a native PipeWire video source next to the loopback, and PipeWire serves any number of consumers from it. Enable it with `[pipewire] enabled = true` in the configuration ([daemon.md](daemon.md#the-pipewire-output)). Applications that use PipeWire cameras then share it: Chrome and Chromium need the `WebRtcPipeWireCamera` flag (`chrome://flags`, "PipeWire Camera support"), OBS Studio has a "Video Capture Device (PipeWire)" source, and Firefox uses the camera portal. Applications that cannot use a PipeWire camera, such as Zoom and Discord, keep using the loopback device, which serves one of them at a time.
+- **Known limitation of the PipeWire node.** It offers one format at a time to all its consumers. When consumers ask for different formats (one for YUY2, another that accepts only NV12), the second connection can stall the node until every consumer has disconnected. It is offered as an option for that reason, and the loopback stays the default. If one application stops receiving frames after another one starts, close both and start them again, or make the second one use the loopback.
+
 ## Why `exclusive_caps=1`
 
 With `exclusive_caps=1` the device advertises only the CAPTURE capability while a producer is writing to it. It therefore appears as a camera in OBS or a browser only while `omarchy-broadcast` is streaming, and does not show up as a dead, black camera otherwise. Chrome requires this: it lists only devices that expose capture capability and not output capability. Keep it enabled.
