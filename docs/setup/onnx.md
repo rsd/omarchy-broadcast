@@ -173,7 +173,7 @@ The omarchy-onnxruntime repository, <https://github.com/rsd/omarchy-onnxruntime>
 | Package | Engine |
 |---|---|
 | `onnxruntime-core` | `libonnxruntime.so` with the CPU engine. It works on its own. Replaces and conflicts with the earlier single package `onnxruntime-full` |
-| `onnxruntime-provider-cuda13-<preset>` (preset `sm120`, `rtx`, `all` or a list of architectures) | The CUDA engine. Needs `cuda`, `cudnn` and `nvidia-utils` |
+| `onnxruntime-provider-cuda13-<preset>` (preset `rtx`, the default, for Turing to Blackwell; or `sm120`, `all` or a list of architectures) | The CUDA engine. Needs `cuda`, `cudnn` and `nvidia-utils` |
 | `onnxruntime-provider-tensorrt-cuda13` | The TensorRT engine. Needs the CUDA provider and `tensorrt` |
 | `onnxruntime-provider-openvino` | The OpenVINO engines (Intel CPU, GPU and NPU). Needs `openvino` |
 | `python-onnxruntime-core` | The Python module (the module does not use it) |
