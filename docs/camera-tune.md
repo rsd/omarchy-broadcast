@@ -158,7 +158,7 @@ A run drives a real device, so the tool is conservative:
 - **Error frames**, the buffers the driver flagged `V4L2_BUF_FLAG_ERROR`.
 - **Luma range**: the minimum and maximum of Y and the share of samples outside 16-235, over the last 24 usable frames of the capture (not the whole capture). A frame is usable when it is full size and not flagged as an error. The daemon drops the others, so the analysis does too. The tool matches each frame in the capture file to its `v4l2-ctl --verbose` record:
   - by the running sum of the recorded sizes, when they add up to the file;
-  - otherwise, when the file is a whole number of full frames, by aligning the records to the frames from the end (v4l2-ctl can log one dequeue more than it writes, such as a first buffer flagged as an error on a UVC camera).
+  - otherwise, when the file is a whole number of full frames, by aligning the records to the frames from the end (v4l2-ctl can log one dequeue more than it writes, such as a first buffer flagged as an error on a camera that follows USB Video Class (UVC), the standard protocol USB and built-in webcams use).
 
   A frame whose matched record is flagged or short is left out. A file that is neither is not analysed, and the mode line says why.
 - **Temporal noise**, the per-pixel standard deviation over those frames. The figure used is the median over the mid-tones (pixels whose mean lies between 60 and 190, where clipping hides nothing), in code values. A scene with no mid-tone pixel at all falls back to the 25th percentile of the per-pixel spread over the whole picture, which is not comparable with the mid-tone figure. The output still prints one number then, so a flat dark or blown-out scene is a reason to retake it.

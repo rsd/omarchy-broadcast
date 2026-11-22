@@ -6,7 +6,8 @@ Find the page for your task below. The setup guides get a virtual camera or micr
 
 | I want to... | Read |
 |---|---|
-| Install omarchy-broadcast | [INSTALL.md](../INSTALL.md) |
+| Install omarchy-broadcast, on Arch, Omarchy or another distribution | [INSTALL.md](../INSTALL.md) |
+| Find out what omarchy-broadcast cannot do, and what to do about it | [LIMITATIONS.md](../LIMITATIONS.md) |
 | Run, configure and troubleshoot the daemon as a service | [setup/daemon.md](setup/daemon.md) |
 | Create the "Omarchy Broadcast" virtual camera device | [setup/loopback.md](setup/loopback.md) |
 | Change the virtual camera's size or frame rate | [setup/loopback.md](setup/loopback.md#changing-the-output-size-and-rate) |
@@ -28,7 +29,8 @@ Find the page for your task below. The setup guides get a virtual camera or micr
 
 | Page | What it covers |
 |---|---|
-| [INSTALL.md](../INSTALL.md) | Installing omarchy-broadcast: choosing the prebuilt `-bin` or source `-git` packages and the modules, creating the virtual camera device, starting the daemon, checking it, the bar plugin, the virtual microphone, building from source (Arch package from a checkout, per-user install, `cargo install`) and uninstalling |
+| [INSTALL.md](../INSTALL.md) | Installing omarchy-broadcast: the requirements, choosing the prebuilt `-bin` or source `-git` packages and the modules (Arch and Omarchy), installing on other distributions from a checkout, creating the virtual camera device, starting the daemon, checking it, the bar plugin, the virtual microphone, building from source (Arch package from a checkout, per-user install, `cargo install`) and uninstalling |
+| [LIMITATIONS.md](../LIMITATIONS.md) | What omarchy-broadcast cannot do: one application at a time on the virtual camera, cameras that are not standard webcams, the PipeWire node's mixed formats, a daemon crash, the TensorRT, OpenVINO and eye contact limits, unpublished Maxine figures and the project's status. Each has its cause and a workaround. The developer's limits are in [architecture.md](architecture.md#known-limitations--future-work) |
 | [setup/loopback.md](setup/loopback.md) | Creating the "Omarchy Broadcast" v4l2loopback virtual camera: `modprobe` options, reload and why `exclusive_caps=1`. The one-application-at-a-time limit of the device, and the PipeWire node that serves several. Changing the output size and rate: deferral while applications hold the camera, retries, the fallback order and known limits |
 | [setup/daemon.md](setup/daemon.md) | Running and configuring `omarchy-broadcastd` as a systemd user service (installing it is in [INSTALL.md](../INSTALL.md)). The unit, starting and checking the daemon, troubleshooting, the udev rule, the WirePlumber drop-in, configuration and state files, reload and logs, and how the AUR packages are published. The optional PipeWire camera output: build feature, configuration, checks, application settings and hiding the duplicate camera |
 | [setup/onnx.md](setup/onnx.md) | The open-model cut-out module (`br.com.dias.onnx-cutout`). What ONNX and ONNX Runtime are, installing ONNX Runtime (`onnxruntime-opt-cuda` or `onnxruntime-cpu`), the module and its four models (the package `omarchy-broadcast-onnx-git`, one `omarchy-onnx-model-<id>` package per model, or `scripts/install-user.sh` with `OBC_ONNX_MODELS_DIR`), the model search order, choosing the model and the engine, the engine order under `auto` and the reasons an engine is not used, the TensorRT first-use build, using the module without an NVIDIA GPU (system memory, what is unavailable, the CPU cost), troubleshooting and uninstall |

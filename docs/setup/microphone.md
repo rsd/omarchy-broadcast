@@ -1,6 +1,12 @@
 # Set up the Omarchy Broadcast Mic
 
-"Omarchy Broadcast Mic" is an optional virtual microphone: your microphone with the background noise removed. Any application can select it like a hardware microphone. Turn it on with `omarchy-broadcast mic on`. The default CPU module needs no GPU and no vendor SDK.
+"Omarchy Broadcast Mic" is an optional virtual microphone: your microphone with the background noise removed. Any application can select it like a hardware microphone. Turn it on with:
+
+```sh
+omarchy-broadcast mic on
+```
+
+The default CPU module needs no GPU and no vendor SDK.
 
 Audio modules do the processing, loadable like the video effects ([modules.md](../modules.md#audio-modules)). The default module runs on the CPU with two engines: DeepFilterNet (the default) and RNNoise. A second module, for NVIDIA GPUs, runs the NVIDIA Maxine Audio Effects. It needs the SDK, which you obtain yourself ([On an NVIDIA GPU](#on-an-nvidia-gpu-maxine-audio-effects)). Other engines can be installed as further modules. They appear as further providers of the same stages, with no change to this setup.
 
@@ -43,7 +49,13 @@ Building the package fetches the DeepFilterNet source from its upstream reposito
 
 ### With `scripts/install-user.sh --audio`
 
-From the repository root, `scripts/install-user.sh --audio` ([INSTALL.md](../../INSTALL.md#per-user-install-from-a-checkout)) builds and installs the same parts without root, under `~/.local`:
+From the repository root, run:
+
+```sh
+scripts/install-user.sh --audio
+```
+
+It builds and installs the same parts without root, under `~/.local` ([INSTALL.md](../../INSTALL.md#per-user-install-from-a-checkout)):
 
 - the worker in `${XDG_BIN_HOME:-~/.local/bin}`;
 - the plugin, the mic host's configuration (with the plugin's absolute path), and the library and manifest of the CPU module and of the Maxine audio effects module (which loads without the SDK), under `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/`;
@@ -63,8 +75,17 @@ omarchy-broadcast mic on
 
 This enables and starts `omarchy-broadcast-mic.service`. The source "Omarchy Broadcast Mic" now exists, and it comes back at every login until you turn it off.
 
-- The command needs the daemon and starts it by D-Bus activation. Without the daemon, run `systemctl --user enable --now omarchy-broadcast-mic.service`.
-- If a filter-chain unit is running, `mic on` refuses and names it. Stop it first with `systemctl --user disable --now omarchy-broadcast-mic@rnnoise.service` (or `@deepfilter`).
+- The command needs the daemon and starts it by D-Bus activation. Without the daemon, run:
+
+  ```sh
+  systemctl --user enable --now omarchy-broadcast-mic.service
+  ```
+
+- If a filter-chain unit is running, `mic on` refuses and names it. Stop it first (use `@deepfilter` for that engine):
+
+  ```sh
+  systemctl --user disable --now omarchy-broadcast-mic@rnnoise.service
+  ```
 
 ## Check that it works
 
@@ -203,7 +224,11 @@ DeepFilterNet is the default because it keeps the voice and removes noise from u
 
 ### Configuration
 
-The `[mic]` keys are in [config.example.toml](../config.example.toml). The panel and `omarchy-broadcast config set mic.<key> VALUE` change all but `force_conflicts`.
+The `[mic]` keys are in [config.example.toml](../config.example.toml). The panel and the `config set` command change all but `force_conflicts`:
+
+```sh
+omarchy-broadcast config set mic.<key> VALUE
+```
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -216,7 +241,13 @@ The `[mic]` keys are in [config.example.toml](../config.example.toml). The panel
 | `hardware_gain_db` | unset | The capture gain of a USB microphone, in dB. Unset never touches the device's gain ([above](#hardware-gain-of-a-usb-microphone)) |
 | `force_conflicts` | `false` | Run effects that their modules declare as excluding each other, together (studio voice with noise or room echo removal, [below](#studio-voice-excludes-noise-and-echo-removal)). For testing; set in a file |
 
-Which module provides a stage is chosen as for video: by rank, by the backend profile and by pin. `omarchy-broadcast modules profile battery` prefers a CPU module over a GPU one. `omarchy-broadcast modules pin mic-denoise MODULE` pins a module. `omarchy-broadcast modules` lists the audio modules with their stages next to the video ones.
+Which module provides a stage is chosen as for video: by rank, by the backend profile and by pin:
+
+```sh
+omarchy-broadcast modules profile battery           # prefer a CPU module over a GPU one
+omarchy-broadcast modules pin mic-denoise MODULE    # pin a module
+omarchy-broadcast modules                           # list the audio modules, with their stages, next to the video ones
+```
 
 ## On an NVIDIA GPU (Maxine audio effects)
 
@@ -268,7 +299,12 @@ NVIDIA does not support running its SDK on a distribution it does not list. The 
 
 The module requires `LD_LIBRARY_PATH` to lead to the feature libraries. Without the SDK's environment, the Maxine stages are unavailable, with a reason that names the package, and the microphone uses the CPU module.
 
-**A drop-in from an earlier version.** `maxine-afx.conf` in `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/` still works, because a shim it preloads counts as in place. You no longer need it. Remove it, then run `systemctl --user daemon-reload`.
+**A drop-in from an earlier version.** `maxine-afx.conf` in `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/` still works, because a shim it preloads counts as in place. You no longer need it. Remove it, then reload systemd:
+
+```sh
+rm ~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf
+systemctl --user daemon-reload
+```
 
 #### An SDK tree without the package
 
@@ -284,9 +320,19 @@ For an SDK unpacked by hand:
    ```
 
 2. Set the root in `config.toml` (`sdk_root` under `[module."br.com.dias.maxine-afx"]`) or with `MAXINE_AFX_ROOT`.
-3. Run `systemctl --user daemon-reload`.
+3. Reload systemd:
 
-The `LD_LIBRARY_PATH` line is the required one. Add `features/speaker_focus/lib` and `features/superres/lib` when you installed those features. The shim and the replacement `os-release` come from the omarchy-nvidia-sdks repository. In a checkout of it, build the shim with `make -C tools/os-release-shim` and take `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-afx/`. The worker sees a library named `os-release-shim.so` loaded in its own process, from whatever directory, and applies nothing from a package.
+   ```sh
+   systemctl --user daemon-reload
+   ```
+
+The `LD_LIBRARY_PATH` line is the required one. Add `features/speaker_focus/lib` and `features/superres/lib` when you installed those features. The shim and the replacement `os-release` come from the omarchy-nvidia-sdks repository. In a checkout of it, build the shim:
+
+```sh
+make -C tools/os-release-shim
+```
+
+Take `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-afx/`. The worker sees a library named `os-release-shim.so` loaded in its own process, from whatever directory, and applies nothing from a package.
 
 ### Where the SDK is
 
@@ -346,7 +392,11 @@ To install them:
    systemctl --user try-restart omarchy-broadcast-audiod.service
    ```
 
-The layout above follows NVIDIA's download and has not yet been verified against a real installation. If a switch stays greyed after the steps, `omarchy-broadcast modules` shows the stage's current reason.
+The layout above follows NVIDIA's download and has not yet been verified against a real installation. If a switch stays greyed after the steps, this command shows the stage's current reason:
+
+```sh
+omarchy-broadcast modules
+```
 
 ### Studio voice excludes noise and echo removal
 
@@ -365,8 +415,17 @@ The combination is not tuned and adds the delay of each effect. The override app
 
 The GPU module ranks above the CPU one, so it provides noise removal whenever it can run it, subject to `[mic] gpu_policy`.
 
-- The `battery` profile picks the CPU module instead: `omarchy-broadcast modules profile battery` (back with `quality`).
-- To use the CPU module for noise removal while keeping the GPU for room echo removal or studio voice, pin it: `omarchy-broadcast modules pin mic-denoise br.com.dias.voice-cpu`.
+- The `battery` profile picks the CPU module instead (back with `quality`):
+
+  ```sh
+  omarchy-broadcast modules profile battery
+  ```
+
+- To use the CPU module for noise removal while keeping the GPU for room echo removal or studio voice, pin it:
+
+  ```sh
+  omarchy-broadcast modules pin mic-denoise br.com.dias.voice-cpu
+  ```
 - A stage the GPU module does not provide runs on the CPU module, or not at all. The Mic tab says why.
 
 ### What it does with the GPU
@@ -445,8 +504,17 @@ systemctl --user disable --now omarchy-broadcast-mic.service
 
 Then remove the files according to the route:
 
-- Arch package: `sudo pacman -R omarchy-broadcast-git` (`omarchy-broadcast-bin` for the prebuilt package) removes the daemon too. You cannot remove the microphone files alone. Leaving the unit disabled is enough.
-- `install-user.sh --audio`: `scripts/install-user.sh --uninstall`.
+- Arch package: removing it removes the daemon too (`omarchy-broadcast-bin` for the prebuilt package). You cannot remove the microphone files alone. Leaving the unit disabled is enough.
+
+  ```sh
+  sudo pacman -R omarchy-broadcast-git
+  ```
+
+- `install-user.sh --audio`:
+
+  ```sh
+  scripts/install-user.sh --uninstall
+  ```
 
 Remove the Maxine module package and then the SDK package with the command below, only if nothing else uses the SDK. The worker then starts without it.
 
@@ -454,7 +522,12 @@ Remove the Maxine module package and then the SDK package with the command below
 sudo pacman -R omarchy-broadcast-maxine-afx-git maxine-afx-sdk-local
 ```
 
-A drop-in copied for an earlier version, `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf`, is not needed any more. `rm` it and run `systemctl --user daemon-reload`.
+A drop-in copied for an earlier version, `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf`, is not needed any more. Remove it and reload systemd:
+
+```sh
+rm ~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf
+systemctl --user daemon-reload
+```
 
 ## How it works
 
@@ -538,7 +611,13 @@ The package enables nothing. Install the plugin package (above), then follow [En
 
 ### With `scripts/install-user.sh --mic`
 
-From the repository root, `scripts/install-user.sh --mic` (see [INSTALL.md](../../INSTALL.md#per-user-install-from-a-checkout)) also installs, without root:
+From the repository root, run:
+
+```sh
+scripts/install-user.sh --mic
+```
+
+It also installs, without root (see [INSTALL.md](../../INSTALL.md#per-user-install-from-a-checkout)):
 
 - the configurations in `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/pipewire/`;
 - the unit as `${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-mic@.service`, with `ExecStart=` pointing at that absolute configuration path.
@@ -676,8 +755,18 @@ systemctl --user disable --now omarchy-broadcast-mic@rnnoise.service omarchy-bro
 
 Then remove the files, according to the route:
 
-- Arch package: `sudo pacman -R omarchy-broadcast-git` removes the daemon too. You cannot remove the microphone files alone. Leaving the instances disabled is enough.
-- `install-user.sh --mic`: `scripts/install-user.sh --uninstall`.
+- Arch package: removing it removes the daemon too. You cannot remove the microphone files alone. Leaving the instances disabled is enough.
+
+  ```sh
+  sudo pacman -R omarchy-broadcast-git
+  ```
+
+- `install-user.sh --mic`:
+
+  ```sh
+  scripts/install-user.sh --uninstall
+  ```
+
 - Manual install:
 
 ```sh
@@ -685,7 +774,11 @@ rm ~/.config/systemd/user/omarchy-broadcast-mic@.service ~/.config/pipewire/omar
 systemctl --user daemon-reload
 ```
 
-Remove a drop-in made with `systemctl --user edit` with `systemctl --user revert omarchy-broadcast-mic@.service`.
+Remove a drop-in made with `systemctl --user edit`:
+
+```sh
+systemctl --user revert omarchy-broadcast-mic@.service
+```
 
 ## Troubleshoot the units
 

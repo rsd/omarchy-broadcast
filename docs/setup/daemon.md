@@ -8,7 +8,7 @@ The daemon owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus
 
 - The v4l2loopback device with the label "Omarchy Broadcast" and `exclusive_caps=1`, set up as in [loopback.md](loopback.md). The daemon finds the device by its label. Without it the daemon runs in the state `error` and retries every 2 s.
 - A systemd user session with a D-Bus session bus. This is the normal state of a desktop login.
-- Optional, for the GPU path and the Maxine modules: an NVIDIA GPU, the NVIDIA driver (`nvidia-utils`), CUDA (`cuda`, for NVRTC) and GStreamer's `nvcodec` plugin ([README, Requirements](../../README.md#requirements)). See [Without CUDA or without an NVIDIA GPU](#without-cuda-or-without-an-nvidia-gpu).
+- Optional, for the GPU path and the Maxine modules: an NVIDIA GPU, the NVIDIA driver (`nvidia-utils`), CUDA (`cuda`, for NVRTC) and GStreamer's `nvcodec` plugin ([INSTALL.md, Requirements](../../INSTALL.md#requirements)). See [Without CUDA or without an NVIDIA GPU](#without-cuda-or-without-an-nvidia-gpu).
 
 ### Without CUDA or without an NVIDIA GPU
 
@@ -26,7 +26,11 @@ The install steps, the package choices and the install routes are in [INSTALL.md
 
 ## Start the daemon
 
-`systemctl --user enable --now omarchy-broadcastd` starts the daemon now and at every login. Each install route in [INSTALL.md](../../INSTALL.md) ends with it.
+This command starts the daemon now and at every login. Each install route in [INSTALL.md](../../INSTALL.md) ends with it.
+
+```sh
+systemctl --user enable --now omarchy-broadcastd
+```
 
 To start the daemon now without enabling it, use D-Bus activation:
 
@@ -65,7 +69,7 @@ If `status` shows an `Error:` line, see Troubleshooting.
 | The daemon runs the video in system memory on an NVIDIA machine | `cuda` (NVRTC) is not installed | Install `cuda`, or set `[video] memory = "system"` on purpose ([Without CUDA or without an NVIDIA GPU](#without-cuda-or-without-an-nvidia-gpu)) |
 | A rebuilt module does not take effect | The daemon never reloads a module library | Run `systemctl --user restart omarchy-broadcastd` |
 | Applications that list cameras through PipeWire do not show the virtual camera | WirePlumber probed the loopback before the daemon wrote to it | See [Discovery by PipeWire](#discovery-by-pipewire) |
-| A second application gets `EBUSY` or no camera | A v4l2loopback device serves one capture stream at a time | See [loopback.md](loopback.md#one-application-at-a-time) |
+| A second application gets `EBUSY` or no camera | A v4l2loopback device serves one capture stream at a time | See [LIMITATIONS.md](../../LIMITATIONS.md#one-application-streams-from-the-virtual-camera-at-a-time) and [loopback.md](loopback.md#one-application-at-a-time) |
 | A PipeWire consumer does not return after a daemon crash | The PipeWire node lives in the daemon process | Use the loopback device in that application ([Restarts and crashes](#restarts-and-crashes)) |
 | OBS Studio crashes when you pick NV12 for the PipeWire source | A bug in OBS | See [Known issue: OBS Studio and NV12](#known-issue-obs-studio-and-nv12) |
 | The MX Brio's Show Mode stays unknown | The `hidraw` node belongs to root | Install the udev rule ([The udev rule for the MX Brio](#the-udev-rule-for-the-mx-brio)) |
@@ -79,7 +83,13 @@ systemd searches the user unit directories in this order and uses the first matc
 2. `~/.local/share/systemd/user`
 3. `/usr/lib/systemd/user`
 
-A copy of the unit in a directory earlier in the list shadows the others. For example, an older manual copy in `~/.config/systemd/user` keeps starting `~/.cargo/bin/omarchy-broadcastd` after you install the package. Remove it and run `systemctl --user daemon-reload` to use the packaged unit. To see which file is in force:
+A copy of the unit in a directory earlier in the list shadows the others. For example, an older manual copy in `~/.config/systemd/user` keeps starting `~/.cargo/bin/omarchy-broadcastd` after you install the package. Remove it and reload the units to use the packaged unit:
+
+```sh
+systemctl --user daemon-reload
+```
+
+To see which file is in force:
 
 ```sh
 systemctl --user cat omarchy-broadcastd
@@ -121,7 +131,12 @@ Keep the `70-` prefix: the file name must sort before `73-seat-late.rules`, wher
 
 WirePlumber probes video devices when it starts. A loopback device that has no writer at that moment is recorded as output-only and not probed again. Applications that list cameras through PipeWire (the camera portal, OBS's PipeWire source, browsers using PipeWire) then do not show it. Two remedies:
 
-- Install the drop-in ([Manual install](../../INSTALL.md#manual-install), step 4). It starts WirePlumber after the daemon is ready. Run `systemctl --user daemon-reload` after installing it, and restart WirePlumber once for the current session.
+- Install the drop-in ([Manual install](../../INSTALL.md#manual-install), step 4). It starts WirePlumber after the daemon is ready. After installing it, reload the units and restart WirePlumber once for the current session:
+
+  ```sh
+  systemctl --user daemon-reload
+  systemctl --user restart wireplumber
+  ```
 - Without the drop-in, or after you restarted the daemon by hand, restart WirePlumber while the daemon runs:
 
   ```sh
@@ -132,7 +147,7 @@ Applications that open `/dev/video*` directly are not affected. Meanwhile, `gst-
 
 The daemon can also register its own PipeWire source, which needs none of this: see [The PipeWire output](#the-pipewire-output).
 
-A v4l2loopback device serves one capture stream at a time: a second application that opens the same device gets `EBUSY` at `VIDIOC_S_FMT` or `VIDIOC_REQBUFS`. Applications that need the camera at the same moment should use the PipeWire node, which serves several consumers (with the limitation under [The PipeWire output](#the-pipewire-output)). Or give the loopback more devices. [loopback.md](loopback.md#one-application-at-a-time) explains why the limit exists and which applications share the camera by themselves.
+A second application that opens the same loopback device gets `EBUSY` at `VIDIOC_S_FMT` or `VIDIOC_REQBUFS` ([LIMITATIONS.md](../../LIMITATIONS.md#one-application-streams-from-the-virtual-camera-at-a-time)). Applications that need the camera at the same moment should use the PipeWire node, which serves several consumers (with the limitation under [The PipeWire output](#the-pipewire-output)). Or give the loopback more devices. [loopback.md](loopback.md#one-application-at-a-time) explains why the limit exists and which applications share the camera by themselves.
 
 ### The PipeWire output
 
@@ -209,7 +224,7 @@ offer_nv12 = false
 
 A reload that changes it rebuilds the node, like enabling or disabling it: at once if no application is linked to the node, otherwise when the last one leaves. The loopback is not touched.
 
-**Known limitation: consumers that ask for different formats.** The node has one port and one negotiated format. While one consumer streams a format (YUY2, say), a second one that accepts only another (NV12, say) fails to link. The first one can stop receiving frames from the moment the second connects. The stream recovers once every consumer has disconnected. Consumers that ask for the same format run together.
+**Known limitation: consumers that ask for different formats.** The node has one port and one negotiated format. While one consumer streams a format (YUY2, say), a second one that accepts only another (NV12, say) fails to link. The first one can stop receiving frames from the moment the second connects. The stream recovers once every consumer has disconnected. Consumers that ask for the same format run together. The general statement is in [LIMITATIONS.md](../../LIMITATIONS.md#the-pipewire-node-and-mixed-formats).
 
 This is one reason the PipeWire output is optional and off by default. Where applications that ask for different formats must run at the same time, let one of them use the loopback device instead.
 
@@ -278,7 +293,7 @@ systemctl --user reset-failed omarchy-broadcastd
 systemctl --user start omarchy-broadcastd
 ```
 
-**PipeWire consumers do not reconnect after a crash.** The PipeWire node lives in the daemon process. When the daemon dies, WirePlumber destroys the consumer's stream, and the consumer does not come back by itself. An application that has to survive a crash should use the loopback device.
+**PipeWire consumers do not reconnect after a crash.** The PipeWire node lives in the daemon process. When the daemon dies, WirePlumber destroys the consumer's stream, and the consumer does not come back by itself. An application that has to survive a crash should use the loopback device ([LIMITATIONS.md](../../LIMITATIONS.md#a-daemon-crash)).
 
 ### Where your backgrounds are
 
@@ -366,7 +381,11 @@ The choices of modules (which are enabled, the stage order, the backend profile 
 
 **Cache.** What the daemon has learnt about the GPU is kept in `~/.cache/omarchy-broadcast/compute-capability` (`$XDG_CACHE_HOME/omarchy-broadcast/compute-capability`). It is the CUDA compute capability, which picks the models made for it and lets the daemon tell which SDK features are installed without waking the GPU. It is a cache, not a setting: delete it and the daemon learns it again at its next session.
 
-**Crash ledger.** The crash ledger of the modules ([../modules.md](../modules.md#the-crash-ledger)) is a small file, `modules-crash.json`, next to the state file. It records which module's code was running when the daemon last went down. It disables a module that did so twice in a row until you run `omarchy-broadcast modules enable ID`. Deleting the file forgives every module.
+**Crash ledger.** The crash ledger of the modules ([../modules.md](../modules.md#the-crash-ledger)) is a small file, `modules-crash.json`, next to the state file. It records which module's code was running when the daemon last went down. It disables a module that did so twice in a row until you enable it again. Deleting the file forgives every module.
+
+```sh
+omarchy-broadcast modules enable ID
+```
 
 **Maxine SDK root.** You can set it in the configuration (`sdk_root` in `[module."br.com.dias.maxine-vfx"]`, or its alias `[effect] maxine_root`) or with `MAXINE_VFX_ROOT`. The Maxine module loads the SDK's libraries from it itself, and `LD_LIBRARY_PATH` is not needed ([maxine.md](maxine.md#4-the-sdk-root-and-the-environment)). The first effect or noise removal the daemon starts loads the SDK first. A different root then takes a daemon restart; a reload that changes the key says so in the log.
 

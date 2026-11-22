@@ -61,7 +61,7 @@ Background notes on the NVIDIA Maxine SDKs relevant to this project: distributio
   - **VFX 1.3.0.0 bundles its runtime**, verified by installing it: CUDA 12.8, cuDNN 9.7.1 and TensorRT 10.9 under `external/`, with only `libcuda.so.1` taken from the driver.
   - **AFX is explicit:** it bundles its libs (CUDA 12.8.1, TensorRT 10.9.0.34, cuDNN 9.7.1, "All libraries that are required to use the SDK are in the package"). Driver 570.26+. https://docs.nvidia.com/maxine/afx/latest/LinuxAFXSDK/GetStartedOnLinux.html
 - **No system CUDA toolkit is required for the SDK:** `NvVFX_CudaStreamCreate` is documented as a wrapper for `cudaStreamCreate()` "so you can avoid linking the CUDA Toolkit libraries", and the bundled runtime works without a system CUDA install (verified). https://docs.nvidia.com/maxine/vfx/latest/API/Reference/VideoEffectsFunctions.html
-- **Arch Linux reports:** none found for VFX / AR / AFX (searches for Arch / Manjaro / NixOS / Fedora returned nothing relevant). In practice the SDK loads on Arch with one workaround for its distribution check ([../setup/maxine.md](../setup/maxine.md), step 7).
+- **Arch Linux reports:** none found for VFX / AR / AFX (searches for Arch / Manjaro / NixOS / Fedora returned nothing relevant). In practice the SDK loads on Arch with one workaround for its distribution check ([../setup/maxine.md](../setup/maxine.md#the-os-release-shim)).
   - The only Arch-adjacent items are the AUR `obs-streamfx-unstable` mirrors of the old GitHub source (forum thread above) and `nvbroadcast-bin` (AUR page blocked by Anubis; see section 6).
   - Blucast avoids the distro problem by running the SDK in an Ubuntu 20.04 container with the NVIDIA Container Toolkit. NVIDIA's own docs have a "Run SDK in a Container" page that builds on Ubuntu 20.04. https://docs.nvidia.com/maxine/vfx/latest/LinuxVFXSDK/RunSDKinaContainer.html
   - A container is the safe fallback where the SDK does not load.
@@ -73,7 +73,11 @@ Background notes on the NVIDIA Maxine SDKs relevant to this project: distributio
 - **Consumer-Blackwell risk:**
   - The AR Linux install page lists GPU arches for the model downloader as a40, l40, l4, a30, b200, a2, h100, a10, t4, b100, a16, a100, b40. These are server parts, with no GeForce / sm_120.
   - The `install_feature.sh -g` option takes a GPU architecture and defaults to auto-detect, and R14 says models are downloaded "per feature and per GPU".
-  - Consumer Blackwell (sm_120) model packages do exist for VFX 1.3.0.0 on Linux (`sm75` to `sm120` are published for AIGS) and were verified on an RTX 5080 Laptop. Check availability for other GPUs with `ngc registry model list` ([../setup/maxine.md](../setup/maxine.md), step 5).
+  - Consumer Blackwell (sm_120) model packages do exist for VFX 1.3.0.0 on Linux (`sm75` to `sm120` are published for AIGS) and were verified on an RTX 5080 Laptop. Check availability for other GPUs ([../setup/maxine.md](../setup/maxine.md#1-requirements)):
+
+    ```sh
+    ngc registry model list
+    ```
   - The VFX Linux performance page only benchmarks T4, A40, L40 and B40. https://docs.nvidia.com/maxine/vfx/latest/LinuxVFXSDK/PerformanceReference.html
   - No public report of a Linux RTX 50-series run was found before the verification above.
 

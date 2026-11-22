@@ -139,7 +139,7 @@ OBC_TEST_CAMERA=046d:0944 OBC_TEST_SINK=/dev/video11 \
 
 `gpu_a_switch_holds_the_last_frame_until_the_new_source` switches to a test source that delivers its first frame 1 s after it starts: every tick in between is a repeat of the previous source's (white) frame, none is a placeholder. `gpu_a_failed_switch_is_recorded_with_its_error` runs with a 1 s hold: the failed switch repeats the last frame for the hold, then sends placeholders. `gpu_a_slow_sink_never_queues_more_than_the_bound` puts the real output (CUDA frames, download included) in front of a `fakesink` that takes 100 ms per frame: the `appsrc` queue level never exceeds 3, the drops are counted, the clock skips nothing, and no frame reaches the sink more than about 300 ms after its emission.
 
-The switching test asserts that the output never stalls (the longest interval without a frame, at the loopback sink and at an in-process consumer, stays within two output periods plus 20 ms), that the sink negotiates caps exactly once for the whole test, that the consumer sees no renegotiation, and that the UVC control is restored across a switch. A failed assertion still restores the camera's original `exposure_dynamic_framerate`.
+The switching test asserts that the output never stalls (the longest interval without a frame, at the loopback sink and at an in-process consumer, stays within two output periods plus 20 ms), that the sink negotiates caps exactly once for the whole test, that the consumer sees no renegotiation, and that the USB Video Class (UVC) control is restored across a switch. A failed assertion still restores the camera's original `exposure_dynamic_framerate`.
 
 `the_writer_alone_is_a_capture_device_with_black_frames` asserts that the device is not a capture device before the writer starts and is one (`VIDIOC_QUERYCAP`) once it streams; that a consumer in another process receives at least 60 black frames with one caps negotiation (NV12 1920x1080 30/1); that the writer's sink sees one caps event and placeholders only; that the device is no capture device again after the writer stops; and that the `nvcodec` plugin was not loaded by the writer. It also checks the crash cover: the cover is ready with `timeout` 250 ms, the device's `timeout` control reads 250, and no timeout-image mode is left pending (a pending one is taken back, and the test presses the button once to check that the clearing works). The test restores `keep_format`, `sustain_framerate` and `timeout` to their earlier values when it ends, also when it fails.
 
@@ -243,8 +243,17 @@ These figures were measured by hand on the stated machine; no test asserts them.
 Applications that open `/dev/video*` directly find the virtual camera whenever the daemon runs. Applications that discover cameras through PipeWire (the camera portal, OBS's PipeWire source, browsers using PipeWire) depend on WirePlumber:
 - WirePlumber probes video nodes when it starts. A v4l2loopback device into which no writer is streaming at that moment is recorded as output-only (`device.capabilities = ":video_output:"`). The device sends no udev event when a writer starts, so WirePlumber never probes it again and PipeWire lists no camera for it.
 - The daemon requests its bus name only after its loopback writer has started, so a `Type=dbus` unit is ready when the device is already a capture device. The optional drop-in `dist/systemd/wireplumber.service.d/omarchy-broadcast.conf` orders WirePlumber after the daemon ([setup/daemon.md](setup/daemon.md)).
-- Without the drop-in, or after the daemon was restarted by hand, restart WirePlumber once the daemon runs: `systemctl --user restart wireplumber`.
-- Meanwhile `gst-device-monitor-1.0 -i Video/Source` (with `-i`, the hidden providers, including the plain v4l2 one) lists "Omarchy Broadcast" at its `/dev/videoN` path, while the default PipeWire provider does not.
+- Without the drop-in, or after the daemon was restarted by hand, restart WirePlumber once the daemon runs:
+
+  ```sh
+  systemctl --user restart wireplumber
+  ```
+
+- Meanwhile this command (with `-i`, the hidden providers, including the plain v4l2 one) lists "Omarchy Broadcast" at its `/dev/videoN` path, while the default PipeWire provider does not:
+
+  ```sh
+  gst-device-monitor-1.0 -i Video/Source
+  ```
 
 ### The PipeWire output
 
@@ -604,7 +613,13 @@ These are the tests of the stackable stages (noise removal, enhancement and reli
 - **Controller** (`controller/tests.rs`, fake backend): `set_setting_on_a_global_id_is_the_effect_method_it_stands_for`, `global_writes_refuse_as_the_methods_do_in_the_order_of_the_checks`, `a_global_write_clears_a_fault_as_the_methods_do`, `the_effect_methods_and_a_reload_announce_the_global_settings`, `a_global_reset_puts_the_configurations_value_back_and_camera_reset_leaves_it`, `a_global_reset_cannot_bring_back_a_background_effect_nothing_runs`, `global_settings_are_there_without_a_camera_and_work`, `a_global_write_the_state_file_cannot_take_fails_as_the_setter_does`; the enhancement method and the chair: `the_enhance_method_reaches_the_ingest_and_a_change_reopens_the_camera`, `an_enhance_method_that_failed_is_tried_again_by_its_setting` and `the_chair_reaches_the_background_stage_and_a_change_reloads_the_effect_only`; availability: `noise_removal_not_installed_is_never_requested_and_raises_no_error`, `unknown_availability_requests_noise_removal_as_before`, `the_compute_capability_is_read_once_with_a_session_never_at_idle`, `the_compute_capability_is_cached_across_restarts_and_refreshed_by_a_session`, `a_change_of_what_is_installed_never_requests_an_effect_the_session_started_without`, `a_session_start_that_learns_what_is_installed_sends_one_settings_changed`; enhancement: `enhance_toggled_while_streaming_reopens_the_camera_once_and_keeps_active`, `enhance_set_while_the_camera_is_closed_applies_at_the_next_open`, `enhance_not_installed_is_never_requested_and_raises_no_error`, `enhance_is_not_requested_for_a_camera_at_full_resolution_and_follows_a_switch`, `enhance_is_not_requested_for_a_camera_in_a_format_it_cannot_read`, `enhance_applies_only_where_it_pays`, `an_enhance_failure_keeps_streaming_and_shows_in_error_after_noise_removal`, `an_enhance_failure_is_cleared_by_the_setting_a_reload_a_switch_and_the_end`, `reopens_before_the_first_frame_keep_the_start_deadline`; relighting: `each_relighting_setting_is_saved_applied_live_and_announced_once`, `relighting_settings_at_idle_are_only_stored`, `relighting_not_installed_is_never_requested_and_raises_no_error`, `a_relighting_failure_keeps_streaming_and_is_cleared_like_noise_removals`, `a_relighting_failure_text_is_sanitised_and_bounded`, `a_whole_chain_failure_is_the_effects_not_relightings`, `a_relighting_failure_sits_between_noise_removal_and_enhancement`, `a_damaged_relighting_value_in_the_state_file_fails_closed`; and `stage_failures_never_overwrite_a_higher_cause_in_error` (the `Error` precedence).
 - **IPC, JSON lines and the CLI**: `a_global_tree_without_a_camera_round_trips` (`obc-ipc`); `global_groups_follow_the_cameras_and_show_without_a_camera` (the `scope` key, the groups after the camera's, `camera` `""`, and `scope` bounded like the other strings, in the worst-case line test) and the human `global_settings_follow_the_cameras_under_their_own_heading` (`All cameras:`); in `tests/cli.rs` `settings_show_the_global_settings_after_the_cameras_and_without_one`, `settings_set_and_reset_take_global_ids`, `watch_json_carries_the_global_groups_in_the_set_and_their_deltas`, `global_ids_ignore_the_camera_option_and_need_no_camera`, `settings_show_and_set_the_enhance_switch`, `settings_show_the_lighting_group_and_set_a_negative_direction`, against a mock daemon that holds the global groups.
 
-**GPU tests with the fake backend** (an NVIDIA GPU, no SDK, no camera), the same command as above (`cargo test -p gst-obc -p obc-pipeline -- --ignored gpu_ --test-threads=1`): in `crates/gst-obc/tests/hardware.rs` `gpu_none_with_relight_passes_through_until_loaded_then_relights`, `gpu_relight_toggles_and_new_lights_are_switches_on_the_loaded_chain`, `gpu_a_stage_change_loads_or_releases_that_stage_alone`, `gpu_a_relight_load_failure_runs_the_chain_without_it`, `gpu_a_relight_frame_failure_drops_the_stage_and_keeps_the_rest`, `gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so`, `gpu_a_new_source_rebuilds_the_relight_stage_before_it_relights_again` (a second source never shows the first one's relighting) and `gpu_frame_parameters_after_a_failure_load_nothing`; in `crates/obc-pipeline/src/ingest.rs` `gpu_enhance_that_cannot_load_passes_the_camera_frames_through` (one frame dropped, then the camera frames at the output contract with the crop in force) and `gpu_enhance_is_left_out_for_formats_it_cannot_read` (NV21 and YV12 stream without the stage).
+**GPU tests with the fake backend** (an NVIDIA GPU, no SDK, no camera), run with the same command as above:
+
+```sh
+cargo test -p gst-obc -p obc-pipeline -- --ignored gpu_ --test-threads=1
+```
+
+The tests are, in `crates/gst-obc/tests/hardware.rs`, `gpu_none_with_relight_passes_through_until_loaded_then_relights`, `gpu_relight_toggles_and_new_lights_are_switches_on_the_loaded_chain`, `gpu_a_stage_change_loads_or_releases_that_stage_alone`, `gpu_a_relight_load_failure_runs_the_chain_without_it`, `gpu_a_relight_frame_failure_drops_the_stage_and_keeps_the_rest`, `gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so`, `gpu_a_new_source_rebuilds_the_relight_stage_before_it_relights_again` (a second source never shows the first one's relighting) and `gpu_frame_parameters_after_a_failure_load_nothing`; in `crates/obc-pipeline/src/ingest.rs` `gpu_enhance_that_cannot_load_passes_the_camera_frames_through` (one frame dropped, then the camera frames at the output contract with the crop in force) and `gpu_enhance_is_left_out_for_formats_it_cannot_read` (NV21 and YV12 stream without the stage).
 
 **Maxine hardware tests, relighting** (the SDK with the relighting and green-screen features and their models for the GPU; the environment of [Maxine hardware tests](#maxine-hardware-tests)):
 
@@ -666,7 +681,13 @@ Default suite, no GPU:
 
 - `obc-backend-maxine`, `src/matte.rs`: the table's exact entries (`the_fixed_ramp_has_the_documented_entries`), that it is monotone and equals a floating-point reference for all 256 values, that a ramp that does not rise is refused, and the host reference `apply_lut` on pitched and odd-sized planes (padding untouched).
 - `obc-gpu`, `src/kernel.rs`: `the_embedded_ptx_is_pinned_to_isa_7_0_and_sm_75`, which fails if the PTX is regenerated with a newer nvcc (a newer `.version` would silently raise the driver floor), the single NUL-terminated string, the seven-parameter entry point, the block size, and that the load errors for CUDA codes 222 and 221 say what to fix.
-  The mask kernel ships as committed PTX text pinned to ISA 7.0 and sm_75, so the build needs no `nvcc` and the driver floor (570.26) and GPU floor (compute capability 7.5) do not rise. To regenerate it after editing `lut8.cu`, run `nvcc -arch=compute_75 -ptx`, set the `.version` line to 7.0, and check that `ptxas` accepts it for sm_75 and sm_120 (`cargo test -p obc-gpu -- --ignored ptxas`). The exact commands are in the header of `crates/obc-gpu/src/kernels/lut8.cu`.
+  The mask kernel ships as committed PTX text pinned to ISA 7.0 and sm_75, so the build needs no `nvcc` and the driver floor (570.26) and GPU floor (compute capability 7.5) do not rise. To regenerate it after editing `lut8.cu`, run `nvcc -arch=compute_75 -ptx`, set the `.version` line to 7.0, and check that `ptxas` accepts it for sm_75 and sm_120:
+
+  ```sh
+  cargo test -p obc-gpu -- --ignored ptxas
+  ```
+
+  The exact commands are in the header of `crates/obc-gpu/src/kernels/lut8.cu`.
 - `obc-backend-maxine`, `src/lib.rs`: the fault switch is off unless armed from Rust, and a kernel setup failure fails the load.
 
 ```sh
@@ -806,27 +827,54 @@ The first command builds two modules itself: the host's tests run `cargo build -
 - **The host** (`crates/obc-module-host`: 74 unit tests and 21 in `tests/modules.rs`). The unit tests are over the pure parts: the manifest (a full manifest, unknown keys refused, another ABI major version parsed but not loadable, field rules), discovery (directory order, override by id, a malformed or unreadable manifest as an entry with its reason, `OBC_MODULE_PATH`), the library checks (a file that is not a library, a library without the symbols, a missing library, the ABI version rules, a vtable read up to its `struct_size`), the settings model (a valid description, invalid settings dropped alone, limits), the registry (statuses and their reasons; providers by the `quality` and `battery` profiles, ties, pins that win and pins that cannot be honoured; the default order; order validation with the offending stages; a stored order that no longer fits; module and stage conflicts, module requirements and the force, listed under the next bullets), the crash ledger (two strikes in a row, a clean stop resets, a damaged file counts as empty) and the adapters (parameter checks against the description, error kinds). `tests/modules.rs` loads real libraries with `dlopen` as the daemon does: the hello example (discovered, loaded, probed, described, and a host frame tinted), and the fixture, which exports a library of another major version, of a newer minor version, and one that refuses the host (cargo features of the fixture), so that broken modules are unavailable with their reasons and the process lives; a panic in `instance_process` is an error and the process survives; a stage failure crosses as a stage error; matte stages never fail open; a failed switch keeps the previous chain processing; a library opened twice is shared; the effect, enhance and chain factories carry their stages through the ABI.
 - **The Maxine module** (`crates/obc-module-maxine`: 19 unit tests, 15 in `src/lib.rs` and 4 in `src/framegen.rs`; 3 in `tests/module.rs`; and 6 hardware tests below, plus 1 in `src/gpu_tests.rs`). They need no SDK: the manifest is valid and declares its stages in the revision-8 order, the HDR look after relighting and before frame generation, on CUDA NV12 frames and with no cut-out needed (`the_manifest_is_valid_and_declares_the_maxine_stages`, `the_registry_offers_the_stages_in_the_rev8_order`); the library builds, loads and passes the ABI checks on a machine without the SDK and describes its settings (the `cutout`, `video` and `lighting` groups, with the enhancement method and the chair as parameters of the `enhance` and `background` stages), which pass the host's validation unchanged; the enhancement method is read from the stage's parameter and an unknown value is refused, a requested `ai` runs `fast` instead when only the upscale is installed while a requested `fast` is never replaced by `ai`, and the chair reaches the backend and the effect's `mode` does not; the probe reads a temporary SDK tree (a library and the models for the GPU make a stage available; relighting is unavailable whenever the cut-out is; the HDR look needs its TrueHDR library alone, whatever the GPU; with no root nothing can be known and every stage is offered); the configuration takes `sdk_root` and the reserved `_host` keys, and the configured root reaches the backend. Three tests of `obc-pipeline` that belonged to the Maxine default (that the default backend is Maxine, that a root that points nowhere makes it unavailable, that the configured root reaches it) are gone with it: the pipeline has no default backend and no root, and the root is the module's, tested here and in `obc-backend-maxine` (`src/ffi.rs`: the pin, and a different root refused once the SDK is loaded).
 - **The `obcmodule` element** (`crates/gst-obc/tests/module.rs`: 27 tests, 22 in the default run and 5 `gpu_`). With a fake chain (`tests/support/fake_chain.rs`): registration and caps in system and CUDA memory; frames pass through until the chain is loaded and then every stage runs; every stage off is passthrough with no copy and no chain call; live parameters apply on the next frame without a load; a load-time parameter reloads the chain; a stage that fails to load or on a frame is dropped and the others run (and a frame it failed on runs again from the restored input, never from partly processed data); a chain that fails as a whole outputs the untouched input; a CUDA-only chain on system memory is refused with the reason; the new-source flag resets temporal state and a dropped stage is loaded again; stopping unloads and a restart loads again; without a factory every stage fails with the reason.
-- **The daemon** (`crates/omarchy-broadcastd`, against the fake backend, with modules described without a library): `cargo test -p omarchy-broadcastd --lib module` runs the controller tests of the modules (the Maxine module offers the groups and stages of revision 8; with no module the camera passes through and no effect group is shown; a module from a `modules.d` directory shows its group and a write reaches its stage; broken, missing and mismatched modules are listed with their reasons; disabling a module is kept and applies at the next start; a module that crashed the daemon twice in a row is disabled until enabled; a plain video session marks no module in the ledger; a reload reopens only the modules that changed; the profile and pins are reported; the `sdk_root` alias and the module table reach the module; a background effect with no module to run it follows `on_failure`, below) and `dbus::tests::the_module_members_over_the_bus`. The pure model of the global settings is in `settings/effects/tests.rs`.
+- **The daemon** (`crates/omarchy-broadcastd`, against the fake backend, with modules described without a library): this command runs the controller tests of the modules (the Maxine module offers the groups and stages of revision 8; with no module the camera passes through and no effect group is shown; a module from a `modules.d` directory shows its group and a write reaches its stage; broken, missing and mismatched modules are listed with their reasons; disabling a module is kept and applies at the next start; a module that crashed the daemon twice in a row is disabled until enabled; a plain video session marks no module in the ledger; a reload reopens only the modules that changed; the profile and pins are reported; the `sdk_root` alias and the module table reach the module; a background effect with no module to run it follows `on_failure`, below) and `dbus::tests::the_module_members_over_the_bus`:
+
+  ```sh
+  cargo test -p omarchy-broadcastd --lib module
+  ```
+
+  The pure model of the global settings is in `settings/effects/tests.rs`.
 - **Conflicts, requirements and the override** (D-Bus revision 14). In `obc-module-host`, `manifest.rs`: `module_conflicts_and_required_modules_parse_and_are_checked` (the lists are module ids, each once, never the module's own, deduplicated in order). In `registry.rs`: `a_module_that_declares_a_conflict_with_an_enabled_one_is_refused`, `a_mutual_module_conflict_refuses_only_the_higher_id`, `the_cut_out_module_never_loses_a_module_conflict` (the other side is refused, with the lower id or none declared), `a_conflict_reason_bounds_the_name`, `a_conflict_between_two_modules_is_either_way_and_lifted_by_a_force`, `a_forced_side_lifts_a_module_conflict_and_is_reported`, `a_forced_conflict_is_reported_only_while_both_run`, `only_a_module_of_a_kind_the_host_loads_is_listed_forced`, `a_refused_module_is_never_opened` (with `tried_and_probed_tell_what_opening_gave`), `a_module_that_needs_a_module_not_enabled_is_refused_even_forced`, `a_module_that_needs_one_refused_by_a_conflict_is_not_refused_for_it` (the requirement is not transitive), `a_provider_whose_required_stage_or_slot_has_no_provider_cannot_run_it` (`Needs <stage>`, `Needs a <slot> stage`), `a_matte_or_post_matte_stage_runs_only_from_the_cut_out_module` and `a_stage_conflict_turns_off_the_loser` (the declarer wins, the earlier loses when both declare, `background` never loses, a force lifts it). In `obc-core`: `the_forced_table_is_read_and_checked` (`src/modules.rs`), `the_forced_table_merges_across_files_and_takes_writes` (`config_d/tests.rs`) and `the_module_rows_come_from_the_registry` (`config_schema/tests.rs`: a `modules.forced.<id>` row for each video module and none for an audio module). In `obc-ipc`: the `forced` key of the module model, read as `false` when missing or of another type (`forced_is_false_when_missing`), and the revision in `tests/mock_server.rs`. In the daemon (`controller/tests.rs`, `conflict_module` and `cutout_module` describe the modules): `a_module_in_conflict_with_an_enabled_one_is_listed_refused_and_never_opened`, `a_module_whose_required_module_is_not_enabled_is_refused`, `a_module_conflict_never_refuses_the_cut_out_module`, `a_module_conflict_that_leaves_no_cut_out_follows_on_failure`, `of_two_conflicting_stages_on_the_loser_is_dropped_and_the_feed_kept`, `a_stage_in_conflict_with_the_background_is_dropped_and_the_effect_kept`, `a_forced_module_runs_both_conflicting_stages_and_the_warning_says_so`, `a_module_refused_mid_session_drops_its_stage_and_keeps_the_feed_and_the_effect`, `a_refusal_mid_session_never_turns_the_background_effect_into_the_raw_picture` (the module that runs the effect is kept until the session ends, with the `unavailable from the next start` clause), `a_pin_or_profile_change_mid_session_keeps_the_held_module_until_the_next_start`, `a_failed_start_releases_the_hold`, `a_reload_reopens_the_held_module_when_it_changed` and `a_module_that_failed_to_open_is_not_opened_again_by_another_change`. In the CLI: `a_forced_module_says_so_in_text_and_json` (`modules.rs`) and `modules_force_is_shown_set_cleared_and_refused` (`tests/cli.rs`: `enable --force` writes the force first, a plain `enable` clears it, an audio module and an older daemon are refused).
 - **The background effect is never left raw** (D-Bus revision 14). The element drops and takes back its backend (`gst-obc`, `src/effect/imp.rs`, no GPU): `a_revoked_backend_fails_the_effect_at_once`, `a_revocation_without_a_factory_does_nothing`, `a_factory_set_after_a_revocation_starts_a_new_request`, `a_factory_set_without_a_revocation_starts_no_request`, `a_revocation_under_none_fails_the_stages_alone_and_passes_through`, `a_rearm_forgets_the_stage_failures_of_the_revocation`, `a_rearm_fails_what_its_factory_refuses_of_the_settings_applied_meanwhile` and `a_job_built_before_a_revocation_publishes_nothing_loaded`; through the output (`obc-pipeline`, `src/output.rs`): `a_revoked_effect_backend_fails_at_once_and_a_new_one_rearms`; and, with a GPU and the fake backend (`gst-obc`, `tests/hardware.rs`, `gpu_` prefix): `gpu_a_revoked_backend_is_black_at_once_and_a_new_factory_loads_again`. In the daemon (`controller/tests.rs`, against the fake backend, which records the revocations and what is shown): `a_background_effect_with_no_module_to_run_it_follows_on_failure`, `a_session_with_no_module_keeps_its_backendless_element_and_needs_no_bare_start`, `a_session_started_with_its_effect_module_disabled_follows_on_failure_and_restarts_once_enabled`, `an_effect_whose_module_the_crash_ledger_disabled_follows_on_failure_not_a_fault`, `a_background_effect_whose_module_failed_to_open_follows_on_failure`, and, for the loss of the module of a running session, `a_session_that_loses_its_background_module_shows_black_or_the_image_at_once` (disabled, failed re-probe and failed reopen, each under `black` and `image`), `a_session_that_loses_its_background_module_under_none_shows_the_camera_image`, `a_session_whose_element_cannot_revoke_drops_the_effect_of_a_lost_module`, `an_effect_turned_off_and_on_while_its_module_is_lost_stays_hidden_and_comes_back`, `a_lost_background_stage_with_the_effect_off_keeps_the_stages_of_its_module` and `a_restored_backend_reads_as_loading_not_as_missing`.
 - **The other crates.** `obc-core` (the `[modules]` and `[module."<id>"]` keys, the state file's `[modules]` and `[settings]` tables, the state over the config, the revision-8 typed keys read and written), `obc-ipc` (the `GetModules` model and its tolerant reading, and the six members and two properties against a mock server) and the CLI (`modules.rs` unit tests for the text and the bounded JSON lines; `tests/cli.rs`: `modules_and_order_list_change_and_refuse` and `modules_against_an_older_daemon_say_they_are_unsupported`).
-- **Status values** (module ABI 1.3, D-Bus revision 16). No SDK, GPU or camera. `cargo test -p obc-module-abi -p obc-module-sdk -p obc-module-host -p obc-module-maxine-ar -p gst-obc -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast` runs all of them.
+- **Status values** (module ABI 1.3, D-Bus revision 16). No SDK, GPU or camera. This command runs all of them:
+
+  ```sh
+  cargo test -p obc-module-abi -p obc-module-sdk -p obc-module-host -p obc-module-maxine-ar -p gst-obc -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
+  ```
+
   - *The ABI.* `obc-module-abi`: the size, alignment and offsets of `obc_status_value` (32 bytes, 8-byte aligned) and of the appended vtable entry (offset 152, 19 entries), and the header test, which regenerates the header and compiles it as C and C++ with the new structure's layout checked. `obc-module-sdk` (`tests/vtable.rs`): `instance_status_values` through the exported vtable (none before the first frame, a repeat does not move the value, null outputs are refused with `OBC_ERR_INVALID`).
   - *The host, from a well-behaved module.* `status_values_cross_from_a_module_of_abi_1_3_and_none_from_one_of_1_2` in `obc-module-host` (`tests/modules.rs`): a fixture of ABI 1.3 reports through the adapter, one built as ABI 1.2 (the fixture feature `abi-1-2`, a vtable of 1.2's size) reports none, and so does an unloaded chain. In `library.rs`, a 1.2-sized vtable has no entry and a 1.3-sized one has it; ABI 1.3 loads, 1.7 is refused naming both versions.
   - *The host's bounds.* `status_values_from_a_misbehaving_module_are_bounded_and_filtered` runs the fixture with the feature `raw-status-values`, which answers each call with the next of six shapes, as a hostile or broken module would: a failing status that still wrote an entry, a null list with a count, a misaligned list, 65 entries (ignored whole), 64 entries (all read), and one list of mixed entries (a name of 80 bytes cut, a name of 63 bytes and a two-byte character cut at the character boundary, and an empty name, a null name, a null stage, an invalid stage id, a `NaN` and an infinity left out). The unit test `reported_lists_and_names_are_bounded` in `module.rs` covers the shared helpers, which also bound `instance_timings`.
   - *The elements.* `gst-obc` (`tests/module.rs`, `tests/element.rs`, `src/effect/imp.rs`): the elements keep the values of the stages that ran on the last frame and are ready, leave out a stage that was switched off or never loaded (the fake backend reports a value of a stray stage on purpose), clear them when the element stops, and keep the last ones when a frame's figures were skipped because the engine lock was busy (`stage_values_follow_the_loaded_chain_and_survive_a_skipped_frame`).
   - *Auto-frame.* `obc-module-maxine-ar`: `the_zoom_is_the_frame_height_over_the_crop_height` (1.0 at the full frame, the cap for a small face, in between while it eases back, 1.0 after a reset) and `auto_frame_reports_its_zoom` (also at 1.0, and none without the stage).
-- **The per-frame background** (module ABI 1.4, D-Bus revision 18). No SDK, GPU or camera. `cargo test -p obc-module-abi -p obc-module-sdk -p obc-module-host -p obc-backend -p obc-module-maxine -p obc-module-onnx` runs them.
+- **The per-frame background** (module ABI 1.4, D-Bus revision 18). No SDK, GPU or camera. This command runs them:
+
+  ```sh
+  cargo test -p obc-module-abi -p obc-module-sdk -p obc-module-host -p obc-backend -p obc-module-maxine -p obc-module-onnx
+  ```
+
   - *The ABI.* `obc-module-abi`: the vtable of 20 entries and `instance_set_background` at offset 160, version 1.4 (`0x0001_0004`), and the header test, which regenerates the header and compiles it as C and C++. `obc-module-sdk` (`tests/vtable.rs`): `a_per_frame_background_is_checked_and_replaces_the_previous` (a frame of another size, format or kind is refused with `OBC_ERR_INVALID` before the module runs, a null frame returns to the load-time image) and `the_default_takes_no_per_frame_background` (with `LIVE_BACKGROUND` left `false` the entry is null).
   - *The host.* `obc-module-host` (`tests/modules.rs`): `a_per_frame_background_reaches_a_module_of_abi_1_4`, `a_per_frame_background_reaches_a_module_on_host_frames` and `a_module_of_abi_1_3_is_never_handed_a_per_frame_background` (the fixture feature `abi-1-3` is a module that declares 1.3 with a vtable as large as 1.4's and the entry set; the host must never call it). In `library.rs`, `the_per_frame_background_is_masked_by_abi_version`.
   - *The seam and the modules.* `obc-backend`: `background_frames_are_checked` (a short plane, a narrow stride, an odd size, a null device pointer) and the defaults (no live background, `Unavailable`). `obc-module-maxine` (`tests/module.rs`: `the_library_takes_a_per_frame_background`) and `obc-module-onnx` (`tests/module.rs`: `the_module_takes_a_per_frame_background`, which also checks that a frame of no chain's size is refused before the module sees it; `tests/runtime.rs` composites over a per-frame background and needs an ONNX Runtime and the models, as before).
   - *The daemon.* `omarchy-broadcastd` (`controller/tests.rs`): `stage_values_are_published_on_a_change_at_most_every_250_ms` on the controller's clock: a change of the set or a move of 0.01 or more is published, one inside the 250 ms period waits and is published by a later poll, a smaller move is not, and the end of the session clears them at once. `dbus/tests.rs`: `stage_values_are_a_property_and_their_changes_are_announced`, the property over the bus, its `PropertiesChanged`, empty again when the camera goes idle; the interface revision is 16.
   - *The client crates.* `obc-ipc`: `stage_values_are_read_and_empty_before_revision_16` (the type signatures `(ssd)` and `a(ssd)`, the snapshot, a daemon without the property, a value of the wrong type) and the mock server. The CLI (`omarchy-broadcast`): `stage_values_are_in_the_snapshot_and_state_lines_bounded` (8 entries, 48 bytes per string, a non-finite value left out, the `changed` name), `the_stage_values_read_for_people` (`Auto-frame zoom: 1.24x`, `stage values: none`, the same bounds as the JSON), and in `tests/cli.rs` `status_and_watch_show_the_stage_values` and `a_revision_15_daemon_has_no_stage_values` against a mock daemon of revision 15 (`stage_values` is `[]` and `status` prints no line).
-- **The load's notice** (module ABI 1.5, daemon 0.47.0, D-Bus revision unchanged). No SDK, GPU or camera. `cargo test -p obc-module-abi -p obc-module-sdk -p obc-module-host -p obc-module-onnx -p gst-obc -p omarchy-broadcastd` runs them.
+- **The load's notice** (module ABI 1.5, daemon 0.47.0, D-Bus revision unchanged). No SDK, GPU or camera. This command runs them:
+
+  ```sh
+  cargo test -p obc-module-abi -p obc-module-sdk -p obc-module-host -p obc-module-onnx -p gst-obc -p omarchy-broadcastd
+  ```
+
   - *The ABI and the SDK.* `obc-module-abi`: the offset of `notice` in `obc_load_report` and version 1.5, and the header test. `obc-module-sdk` (`tests/vtable.rs`): `a_notice_is_written_only_when_the_report_has_room_for_it` (a report whose `struct_size` does not cover the field is left alone).
   - *The host.* `obc-module-host` (`tests/modules.rs`): `a_load_notice_crosses_from_a_module_of_abi_1_5_and_none_from_one_of_1_4` (the notice of a module of 1.5 is read, and none from a module that declares 1.4; it reaches the effect seam of `obc-backend` and is empty again on a load with none).
   - *The element and the daemon.* `gst-obc` (`tests/element.rs`): `host_a_load_notice_is_reported_while_its_chain_runs`, and, for the refused switches on system-memory frames, `host_a_panicking_load_on_the_second_instance_is_a_refusal`, `host_a_switch_without_room_for_a_second_instance_loads_on_the_loaded_one`, `host_two_refused_settings_are_both_remembered`, `host_setting_a_background_video_does_not_retry_a_refused_switch` and `host_a_chain_lost_before_any_frame_failed_is_never_reported_as_the_refusal`. `omarchy-broadcastd` (`controller/tests.rs`): `the_elements_load_notice_is_a_warning_clause_while_it_holds` (the clause, that `State`, `Error` and the stored setting are unchanged, and that the whole `Warning` stays within its bound).
-- **The freeze release** (module ABI 1.6, daemon 0.55.0, D-Bus revision unchanged). No SDK, GPU or camera. `cargo test -p obc-module-abi -p obc-module-sdk -p obc-module-host` runs them. The header test regenerates the header (base sizes, the `#error` guards for the data model, the names of the `background` parameters and of the namespaces) and compiles it as C and C++.
+- **The freeze release** (module ABI 1.6, daemon 0.55.0, D-Bus revision unchanged). No SDK, GPU or camera. This command runs them:
+
+  ```sh
+  cargo test -p obc-module-abi -p obc-module-sdk -p obc-module-host
+  ```
+
+  The header test regenerates the header (base sizes, the `#error` guards for the data model, the names of the `background` parameters and of the namespaces) and compiles it as C and C++.
   - *Gating.* `obc-module-host`: the tables of `gating.rs` (one line per thing a minor version adds: flag bits, constants, structure sizes, setting types, the appended entries and the reserved ones that no host calls) are tested for each minor, and `tests/modules.rs` loads the fixture as a module of each older minor (features `abi-1-0` to `abi-1-5`) and checks that it is handed nothing newer. `reserved_names_are_passed_to_a_module_of_abi_1_5_with_a_warning` and `ids_outside_the_namespaces_are_warned_about_and_reserved_names_kept_from_modules` cover the namespaces; `the_manifest_abi_minor_is_checked_against_the_library_and_the_host` the manifest's `abi_minor` (a library of a lower minor than its manifest is refused, a manifest of a newer minor is listed with the version it needs).
   - *Settings.* `an_action_setting_is_dropped_with_its_reason` in `settings.rs`: a module's `action` is dropped with its reason and the module loads.
   - *The C example.* `the_c_example_built_from_the_header_alone_loads_and_tints_a_host_frame` builds `examples/module-hello-c` with `cc -std=c11 -Wall -Wextra -Werror` against the header and loads it as the daemon does.
@@ -1023,7 +1071,13 @@ The pipeline in system memory is checked on a machine that has an NVIDIA GPU by 
 
 1. The log says `video memory: system (auto: CUDA_VISIBLE_DEVICES hides every GPU)`, and `omarchy-broadcast config show` describes `video.memory` as "Now: system memory, CUDA_VISIBLE_DEVICES hides every GPU. Applies at the next camera start."
 2. `omarchy-broadcast modules` lists every Maxine stage unavailable with "Needs an NVIDIA GPU (CUDA)" and `background` provided by the ONNX module; the settings tree greys eye contact, auto-framing, noise removal, enhancement, the HDR look and relighting with that reason; `output.mode` offers no "(generated)" rate. With the ONNX module disabled as well, `background` is unavailable and the background group is greyed with the same reason: `omarchy-broadcast settings set effect.background.mode blur` is refused with it, `none` is accepted, and a reset that would bring back a configured `blur` is refused.
-3. With an application (or `gst-launch-1.0 v4l2src device=/dev/video11 ! fpsdisplaysink video-sink=fakesink`) reading the virtual camera: the camera at its rate, then `effect blur`, `replace`, `none`. The daemon's `/proc/<pid>/maps` has no `libcuda`, `libgstcuda`, `nvcodec`, `libnvinfer` or `libcudart`, before and after a session, and `/proc/<pid>/fd` has no `/dev/nvidia*`. The ONNX module logs TensorRT and CUDA as unavailable with "CUDA is off: the video pipeline runs in system memory".
+3. With an application reading the virtual camera, or with this pipeline:
+
+   ```sh
+   gst-launch-1.0 v4l2src device=/dev/video11 ! fpsdisplaysink video-sink=fakesink
+   ```
+
+   the camera runs at its rate, then `effect blur`, `replace`, `none`. The daemon's `/proc/<pid>/maps` has no `libcuda`, `libgstcuda`, `nvcodec`, `libnvinfer` or `libcudart`, before and after a session, and `/proc/<pid>/fd` has no `/dev/nvidia*`. The ONNX module logs TensorRT and CUDA as unavailable with "CUDA is off: the video pipeline runs in system memory".
 4. The privacy checks, with frame dumps of the virtual camera and no person in front of the camera: blur requested at the camera start shows black and then the blurred picture, never the sharp one; turning blur on mid-stream shows the sharp picture and then the blurred one with no black frame between; with the model file missing and privacy on with the mode `black` (`on_failure = "black"`) every frame is black, exactly Y=16 and UV=128; disabling the module mid-session gives black from the next frame; `on_failure = "image"` (privacy on, `away`) shows the image; `on_failure = "none"` (privacy off) shows the camera.
 
 With CUDA visible, `[video] memory = "system"` in a file of `config.d/` gives the same without the hiding: expect `video memory: system (set in the configuration)`, the Maxine stages reading "Needs CUDA; the video pipeline is set to system memory", no `/dev/nvidia*` descriptor and no `libcuda` map during or after a blur session, and the GPU missing from `/proc/driver/nvidia-uvm/gpus` for the process.
@@ -1053,7 +1107,14 @@ The last one is the ignored test that needs the system bus (see below). By area 
 
 **The ignored test on the real system bus.** `the_watcher_reads_the_profile_off_the_system_bus` (in `omarchy-broadcastd`, `src/power.rs`) connects to the system bus, reads power-profiles-daemon's `ActiveProfile` as the daemon does (the current bus name, else the older one), runs the watcher and checks that its cache agrees with the read, and prints the profile, the service name and what the machine's supplies say. It needs a machine with a system bus and power-profiles-daemon running; it is not part of the default run, because a build machine may have neither. Run it as in the commands above (`-- --ignored --nocapture` shows the values). Where the service is not running the read fails and the test fails with it; that is the case it is there to show.
 
-**By hand, on a laptop** (a development daemon, as in [The daemon with CUDA hidden](#the-daemon-with-cuda-hidden-manual), with the GPU visible): with the charger out and `battery_saver` at its default (`auto`) or `on_battery`, the next camera start logs `video memory: system (auto: battery saver, on battery)`, `omarchy-broadcast config show` describes the row "Now: active, on battery.", the daemon holds no `/dev/nvidia*` descriptor, and `modules` lists the Maxine stages unavailable with "Needs CUDA; battery saver runs the video pipeline in system memory". Plugging the charger in while the camera runs leaves the session as it is and the row says "Applies when the camera restarts"; the next start is in CUDA memory. With `auto` or `power_profile`: `powerprofilesctl set power-saver` makes the saver active at once (idle), on AC power too under `auto`, and `balanced` makes it inactive; with the service stopped the row reads "power-profiles-daemon is not running: following the battery instead".
+**By hand, on a laptop** (a development daemon, as in [The daemon with CUDA hidden](#the-daemon-with-cuda-hidden-manual), with the GPU visible): with the charger out and `battery_saver` at its default (`auto`) or `on_battery`, the next camera start logs `video memory: system (auto: battery saver, on battery)`, `omarchy-broadcast config show` describes the row "Now: active, on battery.", the daemon holds no `/dev/nvidia*` descriptor, and `modules` lists the Maxine stages unavailable with "Needs CUDA; battery saver runs the video pipeline in system memory". Plugging the charger in while the camera runs leaves the session as it is and the row says "Applies when the camera restarts"; the next start is in CUDA memory. With `auto` or `power_profile`, the first command below makes the saver active at once (idle), on AC power too under `auto`, and the second makes it inactive:
+
+```sh
+powerprofilesctl set power-saver
+powerprofilesctl set balanced
+```
+
+With the service stopped the row reads "power-profiles-daemon is not running: following the battery instead".
 
 ### Measured on the reference machine
 
@@ -1099,7 +1160,19 @@ By area (test names are in the files named; counts change with every release and
   ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so.1 OBC_ONNX_MODEL_DIR=/usr/share/omarchy-onnx-models \
     cargo test --manifest-path crates/obc-module-onnx/Cargo.toml --test hardware_foreign_tensorrt --test hardware_tensorrt_before_foreign -- --ignored --nocapture
   ```
-- **Manual, on a GPU, with a real camera** (the camera is in use, so run it when nothing else needs it): with `replace` selected, set a gallery loop (`omarchy-broadcast effect replace --image /usr/share/omarchy-broadcast/media/backgrounds/slow-aurora.webm`) and an H.264 MP4; the video loops behind the person with no gap, a change from a still to a video and back shows no black frame and never the room, and with the camera off the GPU is released as before (`nvidia-smi` lists no process). With `[video] memory = "system"` (or `CUDA_VISIBLE_DEVICES=""`, [The daemon with CUDA hidden](#the-daemon-with-cuda-hidden-manual)), the same loop plays on the CPU, and the MP4 shows its poster, a still, with the `Warning` `The video background is shown as a still: it can't play without an NVIDIA GPU; run omarchy-broadcast media convert-command '<path>' for the conversion command`. Run `omarchy-broadcast media convert-command <path>`, paste its output in a terminal, and the `<name>-cpu.webm` appears in the Videos folder's `omarchy-broadcast`; choosing it plays on the CPU with no restart. With the gallery of an earlier version in `~/.local/share/omarchy-broadcast/media` (copy a few files there by hand with the daemon stopped, or keep one from before the upgrade), start the daemon and check that the files are in `~/Pictures/omarchy-broadcast` (videos in `~/Videos/omarchy-broadcast`) and the old directory is gone. The results of these runs (daemon CPU, cadence of the output, and the absence of a black frame on a switch), measured on the development laptop with synthetic content at 1080p30, are not asserted in a test.
+- **Manual, on a GPU, with a real camera** (the camera is in use, so run it when nothing else needs it): with `replace` selected, set a gallery loop and an H.264 MP4; the loop is set with:
+
+  ```sh
+  omarchy-broadcast effect replace --image /usr/share/omarchy-broadcast/media/backgrounds/slow-aurora.webm
+  ```
+
+  The video loops behind the person with no gap, a change from a still to a video and back shows no black frame and never the room, and with the camera off the GPU is released as before (`nvidia-smi` lists no process). With `[video] memory = "system"` (or `CUDA_VISIBLE_DEVICES=""`, [The daemon with CUDA hidden](#the-daemon-with-cuda-hidden-manual)), the same loop plays on the CPU, and the MP4 shows its poster, a still, with the `Warning` `The video background is shown as a still: it can't play without an NVIDIA GPU; run omarchy-broadcast media convert-command '<path>' for the conversion command`. Run this command, paste its output in a terminal, and the `<name>-cpu.webm` appears in the Videos folder's `omarchy-broadcast`:
+
+  ```sh
+  omarchy-broadcast media convert-command <path>
+  ```
+
+  Choosing it plays on the CPU with no restart. With the gallery of an earlier version in `~/.local/share/omarchy-broadcast/media` (copy a few files there by hand with the daemon stopped, or keep one from before the upgrade), start the daemon and check that the files are in `~/Pictures/omarchy-broadcast` (videos in `~/Videos/omarchy-broadcast`) and the old directory is gone. The results of these runs (daemon CPU, cadence of the output, and the absence of a black frame on a switch), measured on the development laptop with synthetic content at 1080p30, are not asserted in a test.
 
 ## Manual test
 
@@ -1136,7 +1209,13 @@ By area (test names are in the files named; counts change with every release and
    - OBS: add a "Video Capture Device (V4L2)" source and choose "Omarchy Broadcast".
    - Chrome: open the camera settings or a camera test page and choose "Omarchy Broadcast".
 4. Stop with Ctrl-C (SIGTERM works too). When the producer stops, v4l2loopback keeps the last frame, so consumers such as OBS show a frozen image until they reopen the device. This is expected.
-5. Check that the camera controls were restored. If `--camera-fixed-framerate` was used, `v4l2-ctl -d /dev/videoN --get-ctrl=exposure_dynamic_framerate` must show, for every camera used, the value it had before the run. Controls are also restored on every source switch; they are not restored if the process is killed with SIGKILL or SIGQUIT.
+5. Check that the camera controls were restored. If `--camera-fixed-framerate` was used, this command must show, for every camera used, the value it had before the run:
+
+   ```sh
+   v4l2-ctl -d /dev/videoN --get-ctrl=exposure_dynamic_framerate
+   ```
+
+   Controls are also restored on every source switch; they are not restored if the process is killed with SIGKILL or SIGQUIT.
 
 ### What happens when a consumer holds the device in another format
 
@@ -1167,7 +1246,11 @@ This checks what the stream promises to a real application: the virtual camera k
    - No black frame appears at a switch. Black appears only if the new camera takes longer than the hold timeout (`--hold-timeout`, default 3 s) to deliver, or if a camera stops without a switch (after 500 ms, `--input-gap-ms`).
    - The console prints one line per switch, with the measured gap, how long the last frame was held, and the repeats and placeholders sent during it, and a status line every 5 s with output fps at 30.0.
 4. Send `pkill -USR1 obc-bench`: the stream switches to the next camera immediately, without waiting for the 10 s timer, with the same behaviour as above.
-5. Stop `obc-bench` with Ctrl-C and again verify that the control was restored on both cameras (`v4l2-ctl -d /dev/videoN --get-ctrl=exposure_dynamic_framerate`; relevant when `--camera-fixed-framerate` was added to the command).
+5. Stop `obc-bench` with Ctrl-C and again verify that the control was restored on both cameras, with the command below (relevant when `--camera-fixed-framerate` was added to the command):
+
+   ```sh
+   v4l2-ctl -d /dev/videoN --get-ctrl=exposure_dynamic_framerate
+   ```
 6. Aspect check: restart with a 4:3 camera mode and `--aspect letterbox`, for example `--camera 046d:0944 --mode NV12:640x480@30 --aspect letterbox`. OBS shows the 4:3 image with black pillars on both sides in a 1920x1080 frame; with the default `--aspect crop` the image fills the frame, with the top and bottom cropped.
 7. Held-format check: with OBS still showing "Omarchy Broadcast", stop the stream and start it again with another contract, for example `--output 1280x720@30`. If OBS still holds the device, the start fails with the "now accepts only ..." message above, before any frame is sent. Close the OBS source (or remove the source) and the start succeeds.
 
@@ -1179,10 +1262,56 @@ Prerequisites: the loopback of [setup/loopback.md](setup/loopback.md) and the bu
 cargo run --release -p omarchy-broadcastd -- -v
 ```
 
-1. **Idle.** In a second terminal (`omarchy-broadcast` is the installed CLI, or `cargo run --release -p omarchy-broadcast --`): `omarchy-broadcast status` shows `State: idle`; `v4l2-ctl -d /dev/video11 --all` shows a capture device with NV12 1920x1080; `fuser /dev/video0` shows no process holding the camera (the camera LED is off); `nvidia-smi` lists no process of the daemon.
-2. **Follow it.** `omarchy-broadcast watch` prints the changes; `busctl --user monitor --match "type='signal',path='/br/com/dias/OmarchyBroadcast'"` shows the raw signals.
-3. **Consumer.** Open the virtual camera in OBS or Chrome, or run `gst-launch-1.0 v4l2src device=/dev/video11 ! fakesink`. `watch` shows `consumers: 1`, `state: starting`, `state: active` (about 2.5 s) and one `stats:` line per second. The application shows the camera.
-4. **Controls.** `omarchy-broadcast cameras`, `omarchy-broadcast camera next` and `omarchy-broadcast camera "Brio"` switch the camera under the open application, which keeps one stream with no black frame; `omarchy-broadcast off` closes the camera (LED off, application shows black) and `omarchy-broadcast on` restores it. The same through `busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1 SetEnabled b false` ([dbus-api.md](dbus-api.md)).
+1. **Idle.** In a second terminal (`omarchy-broadcast` is the installed CLI, or `cargo run --release -p omarchy-broadcast --`), run:
+
+   ```sh
+   omarchy-broadcast status
+   v4l2-ctl -d /dev/video11 --all
+   fuser /dev/video0
+   nvidia-smi
+   ```
+
+   `status` shows `State: idle`; `v4l2-ctl` shows a capture device with NV12 1920x1080; `fuser` shows no process holding the camera (the camera LED is off); `nvidia-smi` lists no process of the daemon.
+2. **Follow it.** The first command prints the changes; the second shows the raw signals:
+
+   ```sh
+   omarchy-broadcast watch
+   busctl --user monitor --match "type='signal',path='/br/com/dias/OmarchyBroadcast'"
+   ```
+3. **Consumer.** Open the virtual camera in OBS or Chrome, or run this pipeline:
+
+   ```sh
+   gst-launch-1.0 v4l2src device=/dev/video11 ! fakesink
+   ```
+
+   `watch` shows `consumers: 1`, `state: starting`, `state: active` (about 2.5 s) and one `stats:` line per second. The application shows the camera.
+4. **Controls.** Run these in turn:
+
+   ```sh
+   omarchy-broadcast cameras
+   omarchy-broadcast camera next
+   omarchy-broadcast camera "Brio"
+   omarchy-broadcast off
+   omarchy-broadcast on
+   ```
+
+   `cameras`, `camera next` and `camera "Brio"` switch the camera under the open application, which keeps one stream with no black frame; `off` closes the camera (LED off, application shows black) and `on` restores it. The same through `busctl` ([dbus-api.md](dbus-api.md)):
+
+   ```sh
+   busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1 SetEnabled b false
+   ```
 5. **Close the consumer.** After the grace period (5 s) `state: idle` is printed, the camera is released and `nvidia-smi` lists no process.
-6. **Reload.** Change `idle_grace_s` in `~/.config/omarchy-broadcast/config.toml` and send `kill -HUP $(pidof omarchy-broadcastd)` (or `busctl ... ReloadConfig`); a typo in a key is rejected with `InvalidConfig` and the old value stays.
-7. **Exit.** Ctrl-C stops the daemon; `omarchy-broadcast status` then exits with status 3 and says the daemon is not running.
+6. **Reload.** Change `idle_grace_s` in `~/.config/omarchy-broadcast/config.toml` and send SIGHUP to the daemon (or call `ReloadConfig` with `busctl`):
+
+   ```sh
+   kill -HUP $(pidof omarchy-broadcastd)
+   ```
+
+   A typo in a key is rejected with `InvalidConfig` and the old value stays.
+7. **Exit.** Ctrl-C stops the daemon. Then run:
+
+   ```sh
+   omarchy-broadcast status
+   ```
+
+   It exits with status 3 and says the daemon is not running.

@@ -179,7 +179,7 @@ The repository's [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/bl
 
 ### Alternatives
 
-Any other package that provides `onnxruntime` 1.29 or newer works with the module. With no NVIDIA GPU, take `onnxruntime-cpu` (`yay -S onnxruntime-cpu omarchy-broadcast-onnx-git`, [above](#using-it-on-a-machine-without-an-nvidia-gpu)):
+Any other package that provides `onnxruntime` 1.29 or newer works with the module. With no NVIDIA GPU, take `onnxruntime-cpu`, which the install command [above](#using-it-on-a-machine-without-an-nvidia-gpu) also uses:
 
 ```bash
 sudo pacman -S onnxruntime-opt-cuda   # an NVIDIA GPU: the CPU and the CUDA engines
@@ -240,13 +240,21 @@ The module checks for this before it starts TensorRT. When another TensorRT is a
 - An explicit `tensorrt` runs on CUDA, with the notice in `Warning`.
 - A cut-out that ran on TensorRT before the Maxine effects runs on TensorRT again afterwards, because the provider is bound to its own TensorRT once loaded.
 
-To get TensorRT back after a switch from Maxine, restart the daemon (`systemctl --user restart omarchy-broadcastd`) with the cut-out selected.
+To get TensorRT back after a switch from Maxine, restart the daemon with the cut-out selected:
+
+```bash
+systemctl --user restart omarchy-broadcastd
+```
 
 ## 3. Install the module and the models
 
 ### From the AUR or the Arch package
 
-With an AUR helper, install `omarchy-broadcast-onnx-git`, or `omarchy-broadcast-onnx-bin`, the prebuilt package with the same files. Either works with the core of either kind ([INSTALL.md](../../INSTALL.md#prebuilt-or-built-from-source)). With no NVIDIA GPU, use `yay -S onnxruntime-cpu omarchy-broadcast-onnx-git` ([above](#using-it-on-a-machine-without-an-nvidia-gpu)).
+With an AUR helper, install `omarchy-broadcast-onnx-git`, or `omarchy-broadcast-onnx-bin`, the prebuilt package with the same files. Either works with the core of either kind ([INSTALL.md](../../INSTALL.md#prebuilt-or-built-from-source)). With no NVIDIA GPU, install it together with the CPU runtime ([above](#using-it-on-a-machine-without-an-nvidia-gpu)):
+
+```bash
+yay -S onnxruntime-cpu omarchy-broadcast-onnx-git
+```
 
 The module is one package of the split build of `packaging/arch/PKGBUILD`, built with the core `omarchy-broadcast-git` and the other module packages. It depends on:
 
@@ -516,6 +524,17 @@ sudo pacman -R omarchy-onnx-model-<id>      # for each model package you install
 ```
 
 - For the prebuilt module, remove `omarchy-broadcast-onnx-bin` instead.
-- The module package leaves the default model's package installed, as a dependency that nothing else needs. `pacman -Rs` removes it with the module.
-- For a checkout, `scripts/install-user.sh --uninstall` removes what the script installed, the module's library, manifest and models included.
+- The module package leaves the default model's package installed, as a dependency that nothing else needs. To remove it with the module:
+
+  ```bash
+  sudo pacman -Rs omarchy-broadcast-onnx-git
+  # or, for the prebuilt module:
+  sudo pacman -Rs omarchy-broadcast-onnx-bin
+  ```
+
+- For a checkout, this removes what the script installed, the module's library, manifest and models included:
+
+  ```bash
+  scripts/install-user.sh --uninstall
+  ```
 - The TensorRT engine cache is under `$XDG_CACHE_HOME/omarchy-broadcast/` (by default `~/.cache/omarchy-broadcast/`). You can delete it at any time. It is rebuilt on the next use.

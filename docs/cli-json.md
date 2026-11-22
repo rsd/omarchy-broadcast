@@ -209,7 +209,11 @@ Suggest:    Noise removal — This camera's picture is grainy: noise removal mak
 - **`Delivers:`** only while the camera delivers below 95 % of its capture mode's rate (`delivered of nominal fps`); otherwise nothing.
 - **`Damaged:`** only when at least one damaged frame was dropped since the camera last opened (`1 frame dropped`, `12 frames dropped`).
 - **`Status:`** one line per status line of the camera (interface revision 26): `Shutter closed`, `Show Mode: desk view` or `Show Mode: normal`, in the daemon's order; none while there is nothing to say. They come after `Damaged:` and before the warnings, and at most 4 are shown. `Show Mode` appears only while the camera streams and the daemon can read its HID node ([dbus-api.md](dbus-api.md#camera-status-revision-26)).
-- **`Warning:`** one line per warning of the camera (the daemon's own `Warning:` line, about the stream, comes before them). **`Suggest:`** one line per suggestion: the label of the setting as the settings tree gives it (the setting's id when the tree cannot be read), a dash, and the reason. Turn a suggestion on with `omarchy-broadcast settings set effect.video.denoise on`. At most 4 warnings and 4 suggestions are shown. The lines are for the active camera only, and none appears with no camera or from an older daemon.
+- **`Warning:`** one line per warning of the camera (the daemon's own `Warning:` line, about the stream, comes before them). **`Suggest:`** one line per suggestion: the label of the setting as the settings tree gives it (the setting's id when the tree cannot be read), a dash, and the reason. At most 4 warnings and 4 suggestions are shown. The lines are for the active camera only, and none appears with no camera or from an older daemon. Turn a suggestion on with its setting, for example:
+
+  ```sh
+  omarchy-broadcast settings set effect.video.denoise on
+  ```
 
 ```text
 omarchy-broadcast recommended
@@ -241,10 +245,20 @@ Latency:    50.0 ms
 The `Provider:` line appears when a stage runs, `Latency:` while the microphone is not `off`, and `Error:` when there is one; with the microphone off the output is `Microphone: off` and `Consumers:  0`. `mic status` is the same as `mic`, and `mic --json` is `mic status --json`.
 
 - **`on` and `off`.** `on` enables and starts the unit `omarchy-broadcast-mic.service`; the microphone then comes back at every login until `off`. It refuses, with status `1` and a message that names the unit, while a PipeWire filter-chain unit (`omarchy-broadcast-mic@rnnoise.service` or `@deepfilter.service`) is running: they create the same source, so stop it first. `off` restores the previous default microphone first, when the Omarchy Broadcast Mic is the default, so that applications move to a live microphone as it goes.
-- **`device NAME`.** `default`, or a PipeWire `node.name` that `pw-cli list-objects Node` shows (the settings tree lists the microphones, with `pw-` tokens as option values; `device` takes either). While the microphone is on, the capture side is pinned to it at once, whether or not the Omarchy Broadcast Mic is the default; with `default` it is pinned to nothing while the Omarchy Broadcast Mic is not the default.
+- **`device NAME`.** `default`, or a PipeWire `node.name`, which this command shows:
+
+  ```sh
+  pw-cli list-objects Node
+  ```
+
+  The settings tree lists the microphones, with `pw-` tokens as option values; `device` takes either. While the microphone is on, the capture side is pinned to it at once, whether or not the Omarchy Broadcast Mic is the default; with `default` it is pinned to nothing while the Omarchy Broadcast Mic is not the default.
 - **`default`, `restore-default`.** The first makes the Omarchy Broadcast Mic the system's default microphone and remembers the configured default and the microphone in use at that moment (`default.audio.source`); its capture side stays pinned to the microphone chosen with `mic device`, else to the microphone in use before, else to the configured default when it is connected, else to the one WirePlumber chooses. The second puts the configured default back; when that is unplugged, the microphone that was in use before `default` comes back, else another connected hardware microphone (never the Omarchy Broadcast Mic). Running `default` again never replaces what was remembered while the Omarchy Broadcast Mic is the configured default. `default` is refused with `Turn the microphone on first` while the microphone is off; `restore-default` with `The Omarchy Broadcast Mic was not made the default here` until `default` has run.
 - `mic`, `mic status` never start the daemon; `on`, `off`, `device`, `default` and `restore-default` may start it through D-Bus activation and give up after 30 s.
-- The microphone's settings (the switch, the device, the strength and the engine of a module) are also in `omarchy-broadcast settings`, printed under their group labels with no `All cameras:` heading (that heading is the video effects'), in the groups `mic.input`, `mic.noise`, ... (a microphone group is named by its id or by `mic.` and its id, for `settings reset --group`), and `settings set mic.noise.strength 70` writes one.
+- The microphone's settings (the switch, the device, the strength and the engine of a module) are also in `omarchy-broadcast settings`, printed under their group labels with no `All cameras:` heading (that heading is the video effects'), in the groups `mic.input`, `mic.noise`, ... (a microphone group is named by its id or by `mic.` and its id, for `settings reset --group`), and `settings set` writes one, for example:
+
+  ```sh
+  omarchy-broadcast settings set mic.noise.strength 70
+  ```
 - In `watch` without `--json`, a change of the microphone prints a line such as `mic: active | consumers 1 | mic-denoise: br.com.dias.voice-cpu | latency 50.0 ms`.
 - Against a daemon of interface revision 12 or lower the command prints `omarchy-broadcast: the daemon does not support the microphone (its interface revision is N, the microphone needs 13); update omarchy-broadcastd` and exits with status `1`; `mic --json` prints an `error` line with the code `unsupported-daemon` instead.
 
@@ -586,7 +600,11 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 | `3` | The daemon is not running (its name has no owner, or D-Bus could not start it), or there is no D-Bus session bus. |
 | `4` | Any other D-Bus failure (an unexpected reply, a lost connection), a timeout, or a failed write to stdout. |
 
-`status`, `cameras`, `controls`, `settings`, `modules` (reads), `order` (show), `media` (list) and `recommended` give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `media remove`, `recommended apply` and the changing forms of `modules` and `order` after 30 s (time for the daemon to be started), and `media import` after 600 s (an import waits for the daemon to check, copy or convert the file), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
+`status`, `cameras`, `controls`, `settings`, `modules` (reads), `order` (show), `media` (list) and `recommended` give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `media remove`, `recommended apply` and the changing forms of `modules` and `order` after 30 s (time for the daemon to be started), and `media import` after 600 s (an import waits for the daemon to check, copy or convert the file), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). The help lists the exit statuses:
+
+```sh
+omarchy-broadcast --help
+```
 
 ## JSON output
 
@@ -942,7 +960,11 @@ A client should treat the state after a `daemon-not-running` line as "daemon not
 
 - `SIGTERM` or `SIGINT`;
 - `SIGPIPE`, or `EPIPE` on a write to stdout;
-- stdout reporting an error or hang-up: when stdout is a pipe whose reader has gone, `watch` exits at once, even if it has nothing to print. `omarchy-broadcast watch --json | head -1` ends as soon as `head` does.
+- stdout reporting an error or hang-up: when stdout is a pipe whose reader has gone, `watch` exits at once, even if it has nothing to print. The pipeline below ends as soon as `head` does:
+
+  ```sh
+  omarchy-broadcast watch --json | head -1
+  ```
 
 ## `preview --json`
 

@@ -1,22 +1,45 @@
 # Install omarchy-broadcast
 
-Install the core package and one module from the AUR, create the virtual camera device once, and start the daemon. The packages and the device need root. The rest runs as your user.
+Install the core package and one module, create the virtual camera device once, and start the daemon. On Arch Linux and Omarchy the packages come from the AUR. On another Linux distribution you install from a checkout of the repository ([Other distributions](#other-distributions)). The packages and the device need root. The rest runs as your user.
 
 Not sure whether omarchy-broadcast is for you? Read the [README](README.md) first.
 
 ## Before you start
 
-- Omarchy or Arch Linux, an AUR helper such as `yay`, and `sudo`.
-- A systemd user session with a D-Bus session bus. A desktop login provides both.
-- A webcam. Any UVC webcam works. UVC is the standard USB camera class.
-- A v4l2loopback kernel module, for example `v4l2loopback-dkms`. The core package depends on one.
-- Your GPU decides what you add to the packages:
-  - **No NVIDIA GPU:** add `onnxruntime-cpu`. The open-model effects and the CPU microphone need nothing else.
-  - **An NVIDIA GPU:** add `cuda`. `nvidia-utils` comes with the NVIDIA driver. The Maxine effects also need an RTX GPU and an SDK you obtain yourself ([docs/setup/maxine.md](docs/setup/maxine.md)).
+- A system to install on: Omarchy or Arch Linux with an AUR helper such as `yay` (the main route), or another Linux distribution (the [route for other distributions](#other-distributions) works from a checkout and is untested outside Arch and Omarchy).
+- `sudo`, for the packages and the virtual camera device.
+- A webcam. Any standard webcam works, USB or built-in. Cameras that are not standard webcams may not work: see [LIMITATIONS.md](LIMITATIONS.md#cameras-that-are-not-standard-webcams).
+- The requirements below. Your GPU decides what you add.
 
-The full list of requirements is in the [README](README.md#requirements).
+## Requirements
+
+What you need depends on the features you use.
+
+**Always:**
+
+- GStreamer 1.x with the base, good and bad plugin sets (`videoconvert`, `jpegdec`). On Arch these are `gst-plugins-good` and `gst-plugins-bad-libs`, which the core package depends on.
+- A v4l2loopback kernel module, for example `v4l2loopback-dkms`. The core package depends on one. Configure it as in [docs/setup/loopback.md](docs/setup/loopback.md).
+- A systemd user session with a D-Bus session bus. A desktop login provides both.
+
+**By GPU:**
+
+- **Without an NVIDIA GPU:** nothing more for the core. The daemon runs its system-memory pipeline: camera passthrough, the open-model cut-out on the CPU, an Intel GPU or an NPU through ONNX Runtime, and the CPU microphone module need no CUDA. For the open-model effects, add `onnxruntime-cpu` on Arch.
+- **With an NVIDIA GPU:** the proprietary driver (`nvidia-utils` comes with it), the CUDA toolkit (`cuda`, for `nvrtc`) and GStreamer's `nvcodec` plugin (`cudaupload`, `cudaconvert`, `cudadownload`). Without the CUDA toolkit, the default `[video] memory = "auto"` runs the system-memory pipeline and says why in the log and in `omarchy-broadcast settings`. Install `cuda` for the GPU path. The daemon opens `nvidia-utils` and `cuda` at run time ([Without CUDA or without an NVIDIA GPU](docs/setup/daemon.md#without-cuda-or-without-an-nvidia-gpu)).
+
+**By feature:**
+
+- **Open-model cut-out:** the package `omarchy-broadcast-onnx-git` (or `-bin`, or `scripts/install-user.sh`), a model package (`omarchy-onnx-model-mediapipe-landscape` by default) and ONNX Runtime 1.29 or newer from an Arch `onnxruntime-*` package. Related repositories: [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime) and [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models). See [docs/setup/onnx.md](docs/setup/onnx.md).
+- **Maxine video effects:** an NVIDIA RTX GPU, the package `omarchy-broadcast-maxine-vfx-git` and the SDK package `maxine-vfx-sdk-local`. The module finds the SDK in `/opt/nvidia/maxine/videofx` or at `sdk_root` in `[module."br.com.dias.maxine-vfx"]` (`[effect] maxine_root` is an alias). See [docs/setup/maxine.md](docs/setup/maxine.md). The module package depends on `cuda`, and the SDK package on `nvidia-utils`.
+- **Eye contact and auto-framing:** an NVIDIA RTX GPU, the package `omarchy-broadcast-maxine-ar-git` and the SDK package `maxine-ar-sdk-local`. The module finds the SDK in `/opt/nvidia/maxine/arsdk` or at `sdk_root` in `[module."br.com.dias.maxine-ar"]`. See [docs/setup/maxine.md](docs/setup/maxine.md#the-maxine-ar-module).
+- **The microphone's noise removal on the CPU:** nothing more. The Arch package installs the CPU module with the mic host and the audio worker ([docs/setup/microphone.md](docs/setup/microphone.md)).
+- **The microphone on an NVIDIA RTX GPU:** the package `omarchy-broadcast-maxine-afx-git` and the SDK package `maxine-afx-sdk-local`, whose environment the worker applies itself ([docs/setup/microphone.md](docs/setup/microphone.md#on-an-nvidia-gpu-maxine-audio-effects)). Only the older filter-chain units need `deepfilternet-ladspa` or `noise-suppression-for-voice`.
+- **Video backgrounds:** `ffmpeg` is optional. The daemon runs it, at low priority, to import animated GIF, WebP and APNG files and to make the posters of imported videos. On a machine without an NVIDIA GPU it is also the program of the command that converts a video the CPU cannot play; the daemon never runs that command. VP9 profile 0 in WebM, at most 1920x1080 and 30 fps, plays as it is. Any other video shows its poster as a still until you convert it. With an NVIDIA GPU a video plays as it is. The two bundled loops need none of this. See [docs/setup/daemon.md](docs/setup/daemon.md#playing-a-video-without-an-nvidia-gpu) and [docs/dbus-api.md](docs/dbus-api.md#video-backgrounds-revision-18).
+- **The native PipeWire camera output:** a build with the cargo feature `omarchy-broadcastd/pipewire` (libpipewire headers and clang at build time; the Arch package has it) and `[pipewire] enabled = true` in the configuration.
+- **Building from source:** the Rust toolchain. The Arch package is built with it and installed without it ([Build from source](#build-from-source)).
 
 ## Choose your packages
+
+This section and the steps that follow are for Arch Linux and Omarchy. For another distribution, go to [Other distributions](#other-distributions).
 
 ### Prebuilt or built from source
 
@@ -46,7 +69,7 @@ The core installs the daemon, the CLI, the units, the CPU voice module and the m
 - The ONNX models are packages of their own from [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models): `omarchy-onnx-model-<id>`, with `<id>` one of `mediapipe-landscape` (the default), `pphumanseg-v2-mobile`, `pphumanseg-v2-lite` or `modnet`. They install in `/usr/share/omarchy-onnx-models` with each model's own licence ([docs/setup/onnx.md](docs/setup/onnx.md)).
 - The prebuilt packages do not contain the NVIDIA SDKs or ONNX Runtime, which are licensed separately. The Maxine and ONNX modules hold no code of either: they load the SDK or the runtime when the daemon runs. So the `-bin` modules need the SDK packages and an `onnxruntime` package exactly as the `-git` ones do.
 
-## Install
+## Install on Arch or Omarchy
 
 Do the steps in order. Steps 1 to 5 give you a working camera. Steps 6 and 7 are optional.
 
@@ -99,7 +122,11 @@ Do the steps in order. Steps 1 to 5 give you a working camera. Steps 6 and 7 are
    systemctl --user enable --now omarchy-broadcastd
    ```
 
-   The package enables nothing by itself. To start the daemon once, without enabling it, run `omarchy-broadcast start`.
+   The package enables nothing by itself. To start the daemon once, without enabling it, run:
+
+   ```sh
+   omarchy-broadcast start
+   ```
 
 6. **Turn on the virtual microphone (optional).**
 
@@ -123,6 +150,55 @@ On a first install the package prints steps 4 to 6. On an upgrade it prints one 
 systemctl --user try-restart omarchy-broadcastd
 ```
 
+## Other distributions
+
+The AUR packages are for Arch Linux and Omarchy. On another distribution, install from a checkout of the repository. This route has not been tested outside Arch and Omarchy. The daemon probably works on any modern Linux distribution.
+
+### What you need
+
+Your package manager supplies these. Package names differ between distributions, so this guide names none beyond Arch's. `packaging/arch/PKGBUILD` lists the libraries the Arch package depends on.
+
+- The Rust toolchain, to build the daemon and the modules.
+- GStreamer 1.x with the base, good and bad plugin sets (`videoconvert`, `jpegdec`), and the libraries the daemon links: GLib, ALSA (`libasound`, for the microphone's hardware gain) and, for the PipeWire camera output, libpipewire.
+- A v4l2loopback kernel module. Version 0.15.4 has the controls that the daemon's crash cover uses. With an older module the daemon runs and logs a warning ([docs/setup/loopback.md](docs/setup/loopback.md#what-the-daemon-sets-on-the-device)).
+- A systemd user session with a D-Bus session bus. The daemon is a systemd user service and owns a name on the session bus.
+- PipeWire, for the virtual microphone and the optional PipeWire camera node. The loopback works without it.
+- With an NVIDIA GPU, the driver, the CUDA toolkit and GStreamer's `nvcodec` plugin, as under [Requirements](#requirements). Without one, the system-memory pipeline needs none of them.
+- For the open-model effects, ONNX Runtime 1.29 or newer: the module opens `libonnxruntime.so` when the daemon runs. It looks at `$ORT_DYLIB_PATH`, then at `ort_library` in the module's table of `config.toml`, then in the system's library path ([docs/setup/onnx.md](docs/setup/onnx.md#where-the-module-looks-for-the-library)). It also needs the four model files ([docs/setup/onnx.md](docs/setup/onnx.md#from-a-checkout)).
+
+### Steps
+
+1. **Install the daemon and the CLI for your user.** From the repository root, run the script. It builds the release binaries and the modules, installs them under `~/.local`, needs no root and refuses to run as root. [Per-user install from a checkout](#per-user-install-from-a-checkout) lists what it installs and its options.
+
+   ```sh
+   scripts/install-user.sh
+   ```
+
+   The script builds without the PipeWire camera output. To get it, use the [manual install](#manual-install) with the cargo feature `pipewire` ([the PipeWire output](docs/setup/daemon.md#the-pipewire-output)).
+
+2. **Make sure `${XDG_BIN_HOME:-~/.local/bin}` is on your `PATH`.** The script installs `omarchy-broadcast` and `omarchy-broadcastd` there.
+
+3. **Create the virtual camera device.** This needs root and runs once. The checkout holds the `modprobe.d` line that the Arch package ships as an example.
+
+   ```sh
+   sudo install -Dm644 dist/modprobe.d/omarchy-broadcast.conf /etc/modprobe.d/omarchy-broadcast.conf
+   echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
+   sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
+   ```
+
+   Only one `options v4l2loopback` line takes effect. If `/etc/modprobe.d` already has one, merge the two lines as [docs/setup/loopback.md](docs/setup/loopback.md#several-devices) describes. The reload fails with "Module v4l2loopback is in use" while an application holds a loopback node. Close it and run the reload again.
+
+4. **Start the daemon at every login.**
+
+   ```sh
+   systemctl --user daemon-reload
+   systemctl --user enable --now omarchy-broadcastd
+   ```
+
+5. **Add the optional parts.** The open-model effects need ONNX Runtime and the model files ([docs/setup/onnx.md](docs/setup/onnx.md#from-a-checkout)). The virtual microphone needs the script's `--mic` or `--audio` option ([docs/setup/microphone.md](docs/setup/microphone.md)). The NVIDIA Maxine effects need an SDK you obtain yourself ([docs/setup/maxine.md](docs/setup/maxine.md)). The Omarchy bar plugin is for Omarchy only; elsewhere the CLI is the control.
+
+Then [check that it works](#check-that-it-works).
+
 ## Check that it works
 
 ```sh
@@ -137,7 +213,17 @@ Camera:     <your camera>
 Consumers:  0
 ```
 
-`State` is `idle` while no application uses the camera and `active` while one does. It is `off` if you turned the camera off: run `omarchy-broadcast on`. For the service itself, run `systemctl --user status omarchy-broadcastd`: it should be `active (running)`.
+`State` is `idle` while no application uses the camera and `active` while one does. It is `off` if you turned the camera off. Turn it on again:
+
+```sh
+omarchy-broadcast on
+```
+
+For the service itself, check that it is `active (running)`:
+
+```sh
+systemctl --user status omarchy-broadcastd
+```
 
 Now select **Omarchy Broadcast** as the camera in OBS or Chrome and choose an effect:
 
@@ -164,12 +250,12 @@ omarchy-broadcast mic default                  # make Omarchy Broadcast Mic the 
 | Symptom | Cause | Fix |
 |---|---|---|
 | The reload fails with "Module v4l2loopback is in use" | An application holds a loopback node | Close it, check with `fuser -v /dev/video10`, and run the reload again |
-| `omarchy-broadcast status` shows the state `error` | The v4l2loopback device labelled "Omarchy Broadcast" is missing. The daemon retries every 2 s | Do step 4. [docs/setup/loopback.md](docs/setup/loopback.md#troubleshooting) has more |
-| `omarchy-broadcast` exits with status 3 | The daemon is not running, or there is no D-Bus session bus | Run `omarchy-broadcast start` or step 5, then `systemctl --user status omarchy-broadcastd` |
+| `omarchy-broadcast status` shows the state `error` | The v4l2loopback device labelled "Omarchy Broadcast" is missing. The daemon retries every 2 s | Create the virtual camera device (step 4, or step 3 of [Other distributions](#other-distributions)). [docs/setup/loopback.md](docs/setup/loopback.md#troubleshooting) has more |
+| `omarchy-broadcast` exits with status 3 | The daemon is not running, or there is no D-Bus session bus | Run `omarchy-broadcast start` or step 5 (step 4 of Other distributions), then `systemctl --user status omarchy-broadcastd` |
 | The AUR helper offers the previous version | The AUR's RPC index lags a few minutes after a release | Wait and try again |
 | The service fails with status 203/EXEC | The unit names `/usr/bin/omarchy-broadcastd`, but the daemon is in `~/.cargo/bin` | Rewrite `ExecStart=` ([Manual install](#manual-install), step 2) |
 | An old daemon keeps starting after you installed the package | A copy of the unit in `~/.config/systemd/user` shadows the packaged one | [docs/setup/daemon.md](docs/setup/daemon.md#which-unit-is-used) |
-| A second application gets "device busy" | A v4l2loopback device serves one capture stream at a time | [docs/setup/loopback.md](docs/setup/loopback.md#one-application-at-a-time) |
+| A second application gets "device busy" | A v4l2loopback device serves one capture stream at a time | [LIMITATIONS.md](LIMITATIONS.md#one-application-streams-from-the-virtual-camera-at-a-time) and [docs/setup/loopback.md](docs/setup/loopback.md#one-application-at-a-time) |
 
 More in the troubleshooting sections of the guides: [daemon](docs/setup/daemon.md#troubleshooting), [loopback](docs/setup/loopback.md#troubleshooting), [ONNX](docs/setup/onnx.md#8-troubleshooting), [Maxine](docs/setup/maxine.md#7-troubleshooting) and [microphone](docs/setup/microphone.md#troubleshooting).
 
@@ -189,7 +275,13 @@ More in the troubleshooting sections of the guides: [daemon](docs/setup/daemon.m
 cargo build --release
 ```
 
-The PipeWire output is a cargo feature that is off by default: `cargo build --release --features omarchy-broadcastd/pipewire`. It needs the libpipewire headers and clang at build time ([the PipeWire output](docs/setup/daemon.md#the-pipewire-output)). None of the routes below configures the v4l2loopback device (step 4) or installs the Maxine SDK. Choose one route.
+The PipeWire output is a cargo feature that is off by default. It needs the libpipewire headers and clang at build time ([the PipeWire output](docs/setup/daemon.md#the-pipewire-output)):
+
+```sh
+cargo build --release --features omarchy-broadcastd/pipewire
+```
+
+None of the routes below configures the v4l2loopback device (step 4 of the Arch route, step 3 of [Other distributions](#other-distributions)) or installs the Maxine SDK. Choose one route.
 
 | Route | Root needed | Use it when |
 |---|---|---|
@@ -209,7 +301,11 @@ The PipeWire output is a cargo feature that is off by default: `cargo build --re
    sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
    ```
 
-   To install a module too, name its package in the same command, for example `sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst omarchy-broadcast-onnx-git-*.pkg.tar.zst`.
+   To install a module too, name its package in the same command, for example:
+
+   ```sh
+   sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst omarchy-broadcast-onnx-git-*.pkg.tar.zst
+   ```
 
 2. Create the virtual camera device, as in step 4 above. The package does not do it for you.
 
@@ -320,7 +416,11 @@ The script does not install the SDKs, the os-release shim or any drop-in; [docs/
    systemctl --user enable --now omarchy-broadcastd
    ```
 
-   If you enabled the service earlier from an older copy of the unit, run `systemctl --user reenable omarchy-broadcastd` so that `default.target` wants it.
+   If you enabled the service earlier from an older copy of the unit, run this so that `default.target` wants it:
+
+   ```sh
+   systemctl --user reenable omarchy-broadcastd
+   ```
 
 ### Run the benchmark binary
 
@@ -337,7 +437,13 @@ Then select "Omarchy Broadcast" as the camera in OBS or Chrome. Optional argumen
 
 ### Check the repository
 
-`scripts/check-all.sh` runs every check of the repository and stops at the first failure. It needs neither a GPU nor a camera. It runs:
+Run `scripts/check-all.sh` to run every check of the repository. It stops at the first failure and needs neither a GPU nor a camera:
+
+```sh
+scripts/check-all.sh
+```
+
+It runs:
 
 - the format check, clippy and the workspace tests, with `--locked`;
 - the same three for the video and the audio example module, which are built outside the workspace as third-party modules would be;
@@ -357,8 +463,18 @@ Besides the Rust toolchain and the packages listed in [docs/testing.md](docs/tes
 
 2. Remove the files, depending on how you installed:
 
-   - **Arch package:** `sudo pacman -R omarchy-broadcast-git`, or `sudo pacman -R omarchy-broadcast-bin` for the prebuilt package. Remove any module package first, because it depends on the core. This removes the udev rule too. Remove any drop-in you copied from the examples (the WirePlumber one). A Maxine drop-in copied for an earlier version is not needed any more ([docs/setup/maxine.md](docs/setup/maxine.md#3-the-sdk-environment)).
-   - **Per-user install:** run `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed, the modules' libraries and manifests among them. It refuses while the unit is still enabled, so run the command above first. A hand-made Maxine manifest stops it too; remove the files named in [docs/setup/maxine.md](docs/setup/maxine.md#8-uninstall) first.
+   - **Arch package:** remove any module package first, because it depends on the core. Use `omarchy-broadcast-bin` in place of `omarchy-broadcast-git` for the prebuilt package.
+
+     ```sh
+     sudo pacman -R omarchy-broadcast-git
+     ```
+
+     This removes the udev rule too. Remove any drop-in you copied from the examples (the WirePlumber one). A Maxine drop-in copied for an earlier version is not needed any more ([docs/setup/maxine.md](docs/setup/maxine.md#3-the-sdk-environment)).
+   - **Per-user install:** run the script from the checkout. It removes only the files it installed, the modules' libraries and manifests among them. It refuses while the unit is still enabled, so run the command above first. A hand-made Maxine manifest stops it too; remove the files named in [docs/setup/maxine.md](docs/setup/maxine.md#8-uninstall) first.
+
+     ```sh
+     scripts/install-user.sh --uninstall
+     ```
    - **Manual install:**
 
      ```sh
@@ -401,10 +517,3 @@ The core package, `omarchy-broadcast-git` (or `-bin`), installs:
 - the loopback's `modprobe.d` line of [docs/setup/loopback.md](docs/setup/loopback.md), as an inactive example, `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`, to copy into `/etc/modprobe.d`. It is not installed in `/usr/lib/modprobe.d`: only one `options v4l2loopback` line takes effect, and it would collide with one of your own.
 
 The other modules are packages of their own, built from the same `PKGBUILD` ([docs/setup/maxine.md](docs/setup/maxine.md#the-maxine-module), [docs/setup/onnx.md](docs/setup/onnx.md), [docs/modules.md](docs/modules.md)). Each depends on the module ABI that the core provides (`omarchy-broadcast-module-abi`, a range: [docs/modules.md](docs/modules.md#packaging-a-module)). The Maxine SDKs need no drop-in: the daemon applies the SDK package's environment to itself at start ([docs/setup/maxine.md](docs/setup/maxine.md#3-the-sdk-environment)).
-
-### Dependencies
-
-- Required: `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`).
-- Optional, for the GPU path and the Maxine modules: `nvidia-utils` and `cuda` (NVRTC, used by GStreamer's CUDA converters). The daemon opens them at run time ([Without CUDA or without an NVIDIA GPU](docs/setup/daemon.md#without-cuda-or-without-an-nvidia-gpu)). The Maxine video and AR module packages depend on `cuda`, and the Maxine SDK packages on `nvidia-utils`.
-- Optional: `ffmpeg`. The daemon runs it, at low priority, to convert an animated GIF, WebP or APNG at import and to make the poster of an imported video. On a machine without an NVIDIA GPU it is also the program of the command that converts a video the CPU cannot play ([Playing a video without an NVIDIA GPU](docs/setup/daemon.md#playing-a-video-without-an-nvidia-gpu)); the daemon never runs that command. The bundled video loops need none of it, and with an NVIDIA GPU a video plays as it is.
-- The NVIDIA Maxine SDKs are never part of the packages. Each Maxine module package depends on the SDK package of its own (`maxine-vfx-sdk-local`, `maxine-ar-sdk-local` or `maxine-afx-sdk-local`). You build it yourself from the omarchy-nvidia-sdks repository and install it as in [docs/setup/maxine.md](docs/setup/maxine.md).

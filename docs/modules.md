@@ -125,7 +125,14 @@ The rules of this section are enforced from D-Bus revision 14. Those on modules 
 
 **Forcing a module (for debugging and testing).** The configuration table `[modules.forced]` takes a module id and `true` (the key is `modules.forced.<id>`, [config.example.toml](config.example.toml)): the conflicts that involve that module are not enforced, whichever side declares them, for modules and for stages, so that both load and both stages run. It lifts conflicts only: `[requires] modules`, a stage's `requires` and the cut-out placement rule hold. It applies to video modules; an audio module's conflicts are lifted by `[mic] force_conflicts` instead, and a force for an audio module has no effect and no row in the schema.
 
-A force is written like any configuration choice: `omarchy-broadcast config set modules.forced.<id> true`, `SetConfig`, or `omarchy-broadcast modules enable <id> --force`, which writes the force first and then enables the module. A plain `modules enable` clears a force. A forced module is marked wherever it is listed: `forced` in `GetModules`, in `modules list` and in its JSON, a `Forced:` line in `modules info`, and the bar plugin's setup dialog; the dialog shows the mark and does not offer the switch. While a force actually lets two modules or two stages run together, `Warning` carries `forced: <A> runs together with <B> despite a declared conflict (modules.forced)`; a force that overrides nothing says nothing.
+A force is written like any configuration choice, with `config set` or `SetConfig`, or with `modules enable --force`, which writes the force first and then enables the module:
+
+```sh
+omarchy-broadcast config set modules.forced.<id> true
+omarchy-broadcast modules enable <id> --force
+```
+
+A plain `modules enable` clears a force. A forced module is marked wherever it is listed: `forced` in `GetModules`, in `modules list` and in its JSON, a `Forced:` line in `modules info`, and the bar plugin's setup dialog; the dialog shows the mark and does not offer the switch. While a force actually lets two modules or two stages run together, `Warning` carries `forced: <A> runs together with <B> despite a declared conflict (modules.forced)`; a force that overrides nothing says nothing.
 
 ### The frame-generation stage
 
@@ -179,11 +186,26 @@ The daemon reads manifests from these directories, in order; a later directory o
 3. The directories of `[modules] dirs` in `config.toml` (absolute paths).
 4. The colon-separated directories of the `OBC_MODULE_PATH` environment variable, for development and tests.
 
-Discovery reads manifests and nothing else: no library is opened, so a broken library cannot stop the daemon from starting. The daemon looks again at its start and on `SIGHUP` or `ReloadConfig`. A library is opened for a module that is **enabled** (all are, except the ones the configuration's `[modules] disabled`, a `modules.enabled.<id> = false`, the user, or the crash ledger disabled): `omarchy-broadcast modules enable|disable ID`, and that no conflict or requirement refuses ([Conflicts, requirements and forcing](#conflicts-requirements-and-forcing)).
+Discovery reads manifests and nothing else: no library is opened, so a broken library cannot stop the daemon from starting. The daemon looks again at its start and on `SIGHUP` or `ReloadConfig`. A library is opened for a module that is **enabled** (all are, except the ones the configuration's `[modules] disabled`, a `modules.enabled.<id> = false`, the user, or the crash ledger disabled), and that no conflict or requirement refuses ([Conflicts, requirements and forcing](#conflicts-requirements-and-forcing)). The user enables or disables a module with:
 
-The Arch build makes a package for each module of this repository, so that a module is never installed without the SDK or runtime it needs and a user who wants no NVIDIA software installs none. `omarchy-broadcast-maxine-vfx-git` installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` with its manifest, `maxine-vfx.toml`, in `/usr/lib/omarchy-broadcast/modules.d` (the manifest names the library by absolute path); `omarchy-broadcast-maxine-ar-git` installs the Maxine AR module likewise (`libobc_module_maxine_ar.so`, `maxine-ar.toml`), and `omarchy-broadcast-onnx-git` the ONNX module. Each depends on the module ABI that the core provides, as a range ([Packaging a module](#packaging-a-module)), and on its SDK or runtime. The Maxine packages need no drop-in: the daemon applies the SDK package's environment to itself. `scripts/install-user.sh` in a checkout builds both Maxine modules and installs them for the current user, in `~/.local/share/omarchy-broadcast/modules/` with a manifest in `~/.local/share/omarchy-broadcast/modules.d/`, which replaces the packaged manifest of the same id. The two audio modules ([The audio modules in this repository](#the-audio-modules-in-this-repository)) are installed likewise: the CPU voice module by the core package and the Maxine audio module by `omarchy-broadcast-maxine-afx-git`, and both by `install-user.sh --audio`. A module you build yourself goes in your own `modules.d`, with `library` relative to the manifest or absolute.
+```sh
+omarchy-broadcast modules enable ID
+omarchy-broadcast modules disable ID
+```
 
-**A rebuilt library needs a daemon restart.** Libraries are opened with `RTLD_NODELETE` and are never unloaded: a module may hold process-wide state that must outlive a reload, and code it started must never run unmapped. A library rebuilt at the same path is therefore not loaded again while the daemon runs; the code first loaded stays. A new or changed manifest, or a library at another path, is picked up on a reload; for a rebuilt library, run `systemctl --user restart omarchy-broadcastd`.
+The Arch build makes a package for each module of this repository, so that a module is never installed without the SDK or runtime it needs and a user who wants no NVIDIA software installs none. `omarchy-broadcast-maxine-vfx-git` installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` with its manifest, `maxine-vfx.toml`, in `/usr/lib/omarchy-broadcast/modules.d` (the manifest names the library by absolute path); `omarchy-broadcast-maxine-ar-git` installs the Maxine AR module likewise (`libobc_module_maxine_ar.so`, `maxine-ar.toml`), and `omarchy-broadcast-onnx-git` the ONNX module. Each depends on the module ABI that the core provides, as a range ([Packaging a module](#packaging-a-module)), and on its SDK or runtime. The Maxine packages need no drop-in: the daemon applies the SDK package's environment to itself. `scripts/install-user.sh` in a checkout builds both Maxine modules and installs them for the current user, in `~/.local/share/omarchy-broadcast/modules/` with a manifest in `~/.local/share/omarchy-broadcast/modules.d/`, which replaces the packaged manifest of the same id. The two audio modules ([The audio modules in this repository](#the-audio-modules-in-this-repository)) are installed likewise: the CPU voice module by the core package and the Maxine audio module by `omarchy-broadcast-maxine-afx-git`, and both by the `--audio` option of `install-user.sh`, run from a checkout:
+
+```sh
+scripts/install-user.sh --audio
+```
+
+A module you build yourself goes in your own `modules.d`, with `library` relative to the manifest or absolute.
+
+**A rebuilt library needs a daemon restart.** Libraries are opened with `RTLD_NODELETE` and are never unloaded: a module may hold process-wide state that must outlive a reload, and code it started must never run unmapped. A library rebuilt at the same path is therefore not loaded again while the daemon runs; the code first loaded stays. A new or changed manifest, or a library at another path, is picked up on a reload; for a rebuilt library, restart the daemon:
+
+```sh
+systemctl --user restart omarchy-broadcastd
+```
 
 ## Module configuration
 
@@ -355,7 +377,13 @@ A module in any language that exports C symbols implements the header, [`omarchy
 - answer a constant it does not handle with `OBC_ERR_UNSUPPORTED`, and ignore a parameter it does not know;
 - keep every string it hands back alive until the next call on the same object.
 
-Build it from the root of this repository with `cc -std=c11 -shared -fPIC -I crates/obc-module-abi/include -o libobc_module_hello_c.so examples/module-hello-c/hello.c`; its README has the full command. The manifest of a C module declares `abi_minor` for the minor version of the header it was built against.
+Build it from the root of this repository:
+
+```sh
+cc -std=c11 -shared -fPIC -I crates/obc-module-abi/include -o libobc_module_hello_c.so examples/module-hello-c/hello.c
+```
+
+Its README has the full command. The manifest of a C module declares `abi_minor` for the minor version of the header it was built against.
 
 ### Status values (ABI 1.3)
 
@@ -465,9 +493,15 @@ The values the user sets are kept by setting id in the state file, and reach the
 
 ## The crash ledger
 
-The daemon keeps a small JSON file, `modules-crash.json`, in its state directory (`$XDG_STATE_HOME/omarchy-broadcast/`). While a module's code runs a pipeline or a probe, the file holds a marker for the module; a clean stop clears it. At each start the daemon counts, per module, the consecutive starts that found its marker (a start that finds none resets the count). A module that was running when the daemon went down **twice in a row** is disabled, with the reason `Disabled after crashing the daemon twice in a row`, until the user enables it again (`omarchy-broadcast modules enable ID`), which forgives it. A session marks only the modules that run in it: the effect module while the background effect is on or one of its stages is requested, the enhancer while enhancement is on, and another module's chain while one of its stages is. A damaged ledger file counts as empty.
+The daemon keeps a small JSON file, `modules-crash.json`, in its state directory (`$XDG_STATE_HOME/omarchy-broadcast/`). While a module's code runs a pipeline or a probe, the file holds a marker for the module; a clean stop clears it. At each start the daemon counts, per module, the consecutive starts that found its marker (a start that finds none resets the count). A module that was running when the daemon went down **twice in a row** is disabled, with the reason `Disabled after crashing the daemon twice in a row`, until the user enables it again, which forgives it:
 
-The audio worker keeps the same kind of ledger for audio modules in its own file, `audio-modules-crash.json`, in the same directory, so that a strike of an audio module never counts against the camera and the other way round. A call into an audio module that does not return within two seconds aborts the worker, and leaves the marker: it counts as a crash. `omarchy-broadcast modules enable ID` forgives an audio module too.
+```sh
+omarchy-broadcast modules enable ID
+```
+
+A session marks only the modules that run in it: the effect module while the background effect is on or one of its stages is requested, the enhancer while enhancement is on, and another module's chain while one of its stages is. A damaged ledger file counts as empty.
+
+The audio worker keeps the same kind of ledger for audio modules in its own file, `audio-modules-crash.json`, in the same directory, so that a strike of an audio module never counts against the camera and the other way round. A call into an audio module that does not return within two seconds aborts the worker, and leaves the marker: it counts as a crash. The same `modules enable` command forgives an audio module too.
 
 ## Audio modules
 
@@ -533,7 +567,7 @@ The `audio` form of the macro fills the vtable's audio entries and leaves a vide
 
 ## The audio modules in this repository
 
-Two `audio-filter` modules are built here and installed by the Arch packages (the CPU voice module in the core, the Maxine audio module in `omarchy-broadcast-maxine-afx-git`) and by `scripts/install-user.sh --audio`, each a library with a manifest in a `modules.d` directory. Both provide stages of the microphone and take 48 kHz mono blocks of 480 samples. The user's side is [setup/microphone.md](setup/microphone.md).
+Two `audio-filter` modules are built here and installed by the Arch packages (the CPU voice module in the core, the Maxine audio module in `omarchy-broadcast-maxine-afx-git`) and by the `--audio` option of `scripts/install-user.sh`, each a library with a manifest in a `modules.d` directory. Both provide stages of the microphone and take 48 kHz mono blocks of 480 samples. The user's side is [setup/microphone.md](setup/microphone.md).
 
 | Module | Id | Stages (slot) | Device | Rank | Needs |
 |---|---|---|---|---|---|
@@ -593,4 +627,9 @@ How the Maxine module behaves, for anyone writing a module over a vendor SDK:
 - For an audio module, `examples/module-hello-audio` has unit tests of its gain and tone, `crates/obc-module-sdk/tests/audio_vtable.rs` drives an exported audio module through the vtable with raw ABI structures, and `crates/obc-module-host/tests/modules.rs` loads the audio example and an audio fixture through the worker's host.
 - `crates/obc-module-afx` shows a module over a vendor SDK tested without the SDK: a mock SDK fixture stands in for it, and its hardware tests are ignored ([testing.md](testing.md#the-maxine-audio-effects-module)).
 - `crates/obc-module-onnx` shows a module over a runtime library, tested with and without it: its unit tests, and its manifest, settings and probe through `obc-module-host`, run anywhere; `tests/runtime.rs` runs it with a real ONNX Runtime and the models and is skipped, with the reason printed, unless `ORT_DYLIB_PATH` and `OBC_ONNX_MODEL_DIR` are given; `tests/hardware.rs` (ignored) runs CUDA frames on a real GPU.
-- To try a module in the daemon: put its manifest in a directory, run the daemon with `OBC_MODULE_PATH` set to it (`omarchy-broadcast modules` lists what it found, with the reasons), and use `omarchy-broadcast settings` to turn its stage on.
+- To try a module in the daemon: put its manifest in a directory and run the daemon with `OBC_MODULE_PATH` set to it. The first command below lists what the daemon found, with the reasons; the second lists the settings, to turn its stage on:
+
+  ```sh
+  omarchy-broadcast modules
+  omarchy-broadcast settings
+  ```

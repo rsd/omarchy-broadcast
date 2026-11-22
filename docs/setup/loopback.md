@@ -25,6 +25,12 @@ The daemon finds the device by its **label**, `Omarchy Broadcast`, not by its `/
        /etc/modprobe.d/omarchy-broadcast.conf
    ```
 
+   From a checkout, the same line is in `dist/modprobe.d/omarchy-broadcast.conf`:
+
+   ```sh
+   sudo install -Dm644 dist/modprobe.d/omarchy-broadcast.conf /etc/modprobe.d/omarchy-broadcast.conf
+   ```
+
 2. Load the module at boot. For example, create `/etc/modules-load.d/v4l2loopback.conf` containing the line `v4l2loopback`:
 
    ```sh
@@ -72,14 +78,14 @@ With the daemon running, `omarchy-broadcast status` shows the camera state ([dae
 |---|---|---|
 | `Module v4l2loopback is in use` on `modprobe -r` | An application holds a loopback node | Find it with `fuser -v /dev/video10`, close it, reload the module |
 | The daemon is in the state `error` and retries every 2 s | No device carries the label `Omarchy Broadcast` | Check the name in `/sys/class/video4linux/*/name`, then fix the `card_label` and reload the module |
-| Two applications want the camera and the second gets "device busy" or no camera | v4l2loopback 0.14 and later lets one process stream at a time | See [One application at a time](#one-application-at-a-time) |
+| Two applications want the camera and the second gets "device busy" or no camera | v4l2loopback 0.14 and later lets one process stream at a time | See [One application at a time](#one-application-at-a-time) and [LIMITATIONS.md](../../LIMITATIONS.md#one-application-streams-from-the-virtual-camera-at-a-time) |
 | The camera does not show up in OBS or a browser | With `exclusive_caps=1` the device appears only while the daemon is streaming | Start the daemon and open the camera in an application; see [Why `exclusive_caps=1`](#why-exclusive_caps1) |
 | Device names show literal quote characters | Each label was quoted separately in the `modprobe.d` line | Put all labels inside one pair of quotes ([Several devices](#several-devices)) |
 | The daemon logs "crash cover not in place" | The v4l2loopback version lacks the `timeout` and `timeout_image_io` controls | Use a newer v4l2loopback (0.15.4 has them); the daemon still runs ([below](#what-the-daemon-sets-on-the-device)) |
 
 ## One application at a time
 
-A v4l2loopback device from version 0.14 on lets only one process stream from its capture side at a time. A second application that opens the same device can read its format and list its controls. Its attempt to start streaming (`VIDIOC_S_FMT` or `VIDIOC_REQBUFS`, or a plain `read()`) fails with `EBUSY`, even when it asks for exactly the format the device already has.
+A v4l2loopback device from version 0.14 on lets only one process stream from its capture side at a time ([LIMITATIONS.md](../../LIMITATIONS.md#one-application-streams-from-the-virtual-camera-at-a-time) has the effect and the workarounds). A second application that opens the same device can read its format and list its controls. Its attempt to start streaming (`VIDIOC_S_FMT` or `VIDIOC_REQBUFS`, or a plain `read()`) fails with `EBUSY`, even when it asks for exactly the format the device already has.
 
 The driver gives the right to stream to the first process and keeps it until that process lets go. No module option changes this:
 
@@ -93,12 +99,8 @@ In practice:
 
 - **One application can share the camera internally.** Chrome and Chromium open the device once and share the capture between their tabs, so several tabs of the same browser can show the camera at the same time.
 - **A second application gets "device busy"** (or no camera, or an error about the format) while the first one streams. It works once the first one releases the camera. `omarchy-broadcast status` shows `Consumers` for the applications that hold the device.
-- **For several applications at once, use the PipeWire camera node.** The daemon can register the camera as a native PipeWire video source next to the loopback, and PipeWire serves any number of consumers from it. Enable it with `[pipewire] enabled = true` in the configuration ([daemon.md](daemon.md#the-pipewire-output)). Then:
-  - Chrome and Chromium need the `WebRtcPipeWireCamera` flag (`chrome://flags`, "PipeWire Camera support").
-  - OBS Studio has a "Video Capture Device (PipeWire)" source.
-  - Firefox uses the camera portal.
-  - Zoom and Discord cannot use a PipeWire camera. They keep using the loopback device, which serves one of them at a time.
-- **The PipeWire node has a known limitation.** It offers one format at a time to all its consumers. When consumers ask for different formats (one for YUY2, another that accepts only NV12), the second connection can stall the node until every consumer has disconnected. This is why the node is optional and the loopback stays the default. If one application stops receiving frames after another one starts, close both and start them again, or make the second one use the loopback.
+- **For several applications at once, use the PipeWire camera node.** The daemon can register the camera as a native PipeWire video source next to the loopback, and PipeWire serves any number of consumers from it. Enable it with `[pipewire] enabled = true` in the configuration ([daemon.md](daemon.md#the-pipewire-output)), which also lists the setting each application needs. Zoom and Discord cannot use a PipeWire camera. They keep using the loopback device, which serves one of them at a time.
+- **The PipeWire node has a known limitation** ([LIMITATIONS.md](../../LIMITATIONS.md#the-pipewire-node-and-mixed-formats)). It offers one format at a time to all its consumers. If one application stops receiving frames after another one starts, close both and start them again, or make the second one use the loopback.
 
 ## Why `exclusive_caps=1`
 

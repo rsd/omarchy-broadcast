@@ -16,7 +16,7 @@ Measured on 2026-11-16 with one camera on a lit desk: firmware `bcdDevice` 0.21,
 
 The camera has three interfaces: VideoControl, VideoStreaming, and a USB Audio Class microphone. It has no HID interface.
 
-The UVC descriptors list a camera terminal, a processing unit and seven extension units (XU). In every control request, `wIndex = unit << 8 | interface` (interface 0) and `wValue = selector << 8`. Unit IDs are specific to the camera and firmware. **Match extension units by GUID, never by unit ID.**
+The USB Video Class (UVC) descriptors, the standard protocol USB and built-in webcams use, list a camera terminal, a processing unit and seven extension units (XU). In every control request, `wIndex = unit << 8 | interface` (interface 0) and `wValue = selector << 8`. Unit IDs are specific to the camera and firmware. **Match extension units by GUID, never by unit ID.**
 
 | Unit | Type | GUID | Selectors present | Identified as |
 |---|---|---|---|---|
@@ -167,7 +167,7 @@ The default capture request (`camera.mode`, 1080p60) resolves to **MJPEG 1920x10
 |---|---|---|---|---|
 | none (passthrough) | 30.2 | 6.0 ms | 13 % | 1 % |
 
-Every NVIDIA Maxine effect was also run: blur, replace, noise removal, HDR look, relighting, eye contact and auto-framing. Each held the camera's 30 fps, and no frame was dropped in any run. Maxine performance figures are not published ([README](../../README.md#limitations)). "Enhance low-resolution camera" does not apply: the camera captures at the output's full resolution.
+Every NVIDIA Maxine effect was also run: blur, replace, noise removal, HDR look, relighting, eye contact and auto-framing. Each held the camera's 30 fps, and no frame was dropped in any run. Maxine performance figures are not published ([LIMITATIONS.md](../../LIMITATIONS.md)). "Enhance low-resolution camera" does not apply: the camera captures at the output's full resolution.
 
 ### Settings
 

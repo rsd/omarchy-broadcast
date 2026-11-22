@@ -2,7 +2,7 @@
 
 The Logitech MX Brio works on Linux with the standard `uvcvideo` driver: 4K30 and 1080p60 video, the standard controls, the field of view, Show Mode and the privacy shutter. omarchy-broadcast adds a few more settings and replaces the Logitech features that cannot run on Linux. This page is the reference for the camera (and the MX Brio 705 for Business, the same camera with a business bundle). It covers what the plain kernel gives you, the vendor extension units and what is known about them, what omarchy-broadcast adds, and what is missing and why.
 
-Measured on 2026-11-14, with firmware 1.1.394 on USB 3 (5000M). Logitech's own statement for Linux is "basic UVC webcam support only, with no Logitech software". Everything beyond UVC below is measured on Linux, decoded from USB captures of Logitech's software, or marked as unverified.
+Measured on 2026-11-14, with firmware 1.1.394 on USB 3 (5000M). Logitech's own statement for Linux is "basic UVC webcam support only, with no Logitech software". USB Video Class (UVC) is the standard protocol USB and built-in webcams use. Everything beyond UVC below is measured on Linux, decoded from USB captures of Logitech's software, or marked as unverified.
 
 ## Evidence levels
 

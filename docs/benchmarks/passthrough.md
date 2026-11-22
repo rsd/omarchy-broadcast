@@ -149,7 +149,7 @@ Two in-process measurements on one `CLOCK_MONOTONIC` clock, plus the GStreamer l
    - Querying the pipeline itself is useless here: a `sync=false` sink answers `live=false, min=0`.
 
 **Limits**
-- **Sensor and USB time is excluded.** Sensor exposure and readout, USB transfer and UVC driver time come before the src pad. They are identical for a direct reader, so they cancel out of "added" latency.
+- **Sensor and USB time is excluded.** Sensor exposure and readout, USB transfer and USB Video Class (UVC) driver time (UVC is the standard protocol USB and built-in webcams use) come before the src pad. They are identical for a direct reader, so they cancel out of "added" latency.
 - **No glass-to-glass.** The consumer app's own processing, rendering and display are excluded. That would need an on-screen clock and a camera pointed at it, which is out of scope here.
 - **The stamp alters the picture in bench mode only.** It changes 16 luma pixels in the top-left corner, and only in `--consumer` runs.
 - **The GPU is shared.** It was shared with another workload (see the GPU note), so the GPU-side numbers are pessimistic, not best case.

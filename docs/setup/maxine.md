@@ -75,8 +75,12 @@ It provides these stages ([../modules.md](../modules.md#the-manifest) explains t
 
 Check the module with the CLI:
 
-- `omarchy-broadcast modules` lists the module with its status and stages. A stage whose feature is not installed says `unavailable: Not installed`.
-- `omarchy-broadcast modules info br.com.dias.maxine-vfx` shows its manifest and library paths.
+```bash
+omarchy-broadcast modules
+omarchy-broadcast modules info br.com.dias.maxine-vfx
+```
+
+`modules` lists the module with its status and stages. A stage whose feature is not installed says `unavailable: Not installed`. `modules info` shows its manifest and library paths.
 
 The module's settings are the `effect.*` settings of `omarchy-broadcast settings`.
 
@@ -220,7 +224,20 @@ When something is missing, the daemon runs without that SDK, and the module repo
 | `OBC_NO_SDK_ENV=1` in the environment | Nothing at the default level (a line with `-v`): the check is skipped |
 | The second run cannot be started | A warning (`cannot execute again with the SDK environment of ...`) and the daemon runs without it |
 
-`OBC_NO_SDK_ENV=1` is for debugging, for a daemon that must run without the SDKs (for example `systemctl --user edit omarchy-broadcastd`, `Environment=OBC_NO_SDK_ENV=1`). The processes the test suites start set it, so a developer's SDK does not leak into them ([../testing.md](../testing.md)).
+`OBC_NO_SDK_ENV=1` is for debugging, for a daemon that must run without the SDKs. For example, open a drop-in for the unit:
+
+```bash
+systemctl --user edit omarchy-broadcastd
+```
+
+and add:
+
+```ini
+[Service]
+Environment=OBC_NO_SDK_ENV=1
+```
+
+The processes the test suites start set it, so a developer's SDK does not leak into them ([../testing.md](../testing.md)).
 
 ### A drop-in from an earlier version
 
@@ -262,7 +279,13 @@ When a root is chosen, the module loads the SDK's own libraries from it, by abso
 Things to know:
 
 - **The key works with the package installed.** `/usr/share/maxine-vfx/maxine-vfx.env` sets `MAXINE_VFX_ROOT`, but the daemon never applies a root variable from it (section 3), so `sdk_root` and `[effect] maxine_root` are honoured. A `MAXINE_VFX_ROOT` that you set yourself in the daemon's environment still wins over the key, and the daemon logs a warning when both are set.
-- **The root is fixed once the SDK is loaded.** The SDK is loaded when an effect or noise removal first loads or is first checked, and a loaded library is never unloaded. After that, a different root (a changed `sdk_root` or `maxine_root` after `systemctl --user reload omarchy-broadcastd`) is refused. The effect fails with a message that asks for a restart (`systemctl --user restart omarchy-broadcastd`). A reload that changes the key logs this. A running output keeps the root it was started with.
+- **The root is fixed once the SDK is loaded.** The SDK is loaded when an effect or noise removal first loads or is first checked, and a loaded library is never unloaded. After that, a different root (a changed `sdk_root` or `maxine_root` after `systemctl --user reload omarchy-broadcastd`) is refused. The effect fails with a message that asks for a restart:
+
+  ```bash
+  systemctl --user restart omarchy-broadcastd
+  ```
+
+  A reload that changes the key logs this. A running output keeps the root it was started with.
 - **A failure keeps the reason.** A missing or incomplete SDK makes the requested effect or noise removal fail as before, with the reason in the `Error` property. Libraries that could not be loaded are named in it.
 
 ### Environment variables
@@ -298,7 +321,7 @@ An SDK tree that was installed some other way, for example under `~/.local/opt/m
    (`[effect] maxine_root = "..."` does the same, as an alias)
 
    or as `Environment=MAXINE_VFX_ROOT=%h/.local/opt/maxine/VideoFX` in the drop-in.
-2. The two shim lines, in a drop-in at `~/.config/systemd/user/omarchy-broadcastd.service.d/maxine-tree.conf`. Any name ending in `.conf` works; the directory name must match the unit. Adjust the paths, then run `systemctl --user daemon-reload` and restart the daemon:
+2. The two shim lines, in a drop-in at `~/.config/systemd/user/omarchy-broadcastd.service.d/maxine-tree.conf`. Any name ending in `.conf` works; the directory name must match the unit. Adjust the paths:
 
    ```ini
    [Service]
@@ -306,9 +329,22 @@ An SDK tree that was installed some other way, for example under `~/.local/opt/m
    Environment=MAXINE_OS_RELEASE=%h/.local/lib/maxine-vfx/fake-os-release
    ```
 
+   Then reload systemd and restart the daemon:
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user restart omarchy-broadcastd.service
+   ```
+
 The shim of your tree counts as in place. The daemon sees a library named `os-release-shim.so` loaded in its own process, from whatever directory, logs `SDK environment already in place`, and applies nothing from a package. So the two can be installed together. You need no `LD_LIBRARY_PATH` line and no list of feature directories.
 
-The shim library and the replacement `os-release` come from the omarchy-nvidia-sdks repository, which owns both. omarchy-broadcast does not contain them. In a checkout of that repository, `make -C tools/os-release-shim` writes `target/os-release-shim/os-release-shim.so`, and the replacement `os-release` is that repository's `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-vfx/`, where the two lines above point, or change the paths. The "The compatibility shim" and "Running a program" sections of its `docs/usage.md` describe them and the unpackaged case.
+The shim library and the replacement `os-release` come from the omarchy-nvidia-sdks repository, which owns both. omarchy-broadcast does not contain them. In a checkout of that repository, build the shim:
+
+```bash
+make -C tools/os-release-shim
+```
+
+It writes `target/os-release-shim/os-release-shim.so`. The replacement `os-release` is that repository's `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-vfx/`, where the two lines above point, or change the paths. The "The compatibility shim" and "Running a program" sections of its `docs/usage.md` describe them and the unpackaged case.
 
 `%h` is the user's home directory. systemd does not expand `$HOME` or other variables inside `Environment=`.
 
@@ -317,33 +353,85 @@ The shim library and the replacement `os-release` come from the omarchy-nvidia-s
 With the SDK installed and its environment applied to the daemon (section 3), you select the effects in two ways:
 
 - In `config.toml`: the `[effect]` section (`mode`, `blur_strength`, `background_image`, `denoise`, `enhance`, `relight`, `relight_light`, `relight_direction`, `relight_brightness`, `privacy`, `privacy_mode`, `maxine_root`) and the module's own `[module."br.com.dias.maxine-vfx"]` table (`sdk_root`). See [../config.example.toml](../config.example.toml).
-- At run time, with `omarchy-broadcast effect none|blur|replace [--strength X] [--image PATH]`, which the daemon remembers across restarts. For every effect and stage there is also `omarchy-broadcast settings` (`effect.*`, for example `settings set effect.lighting.relight on`). See [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
+- At run time, with the `effect` command, which the daemon remembers across restarts:
+
+  ```bash
+  omarchy-broadcast effect none
+  omarchy-broadcast effect blur
+  omarchy-broadcast effect replace
+  ```
+
+  The command takes the options `--strength X` and `--image PATH`.
+
+  For every effect and stage there is also `omarchy-broadcast settings` (`effect.*`), for example:
+
+  ```bash
+  omarchy-broadcast settings set effect.lighting.relight on
+  ```
+
+  See [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
 
 ### Video noise removal
 
-Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or `omarchy-broadcast denoise on|off` at run time. It removes the grain a webcam produces, which is mostly visible in dim rooms. It runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the package (section 2).
+Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or at run time:
+
+```bash
+omarchy-broadcast denoise on
+omarchy-broadcast denoise off
+```
+
+It removes the grain a webcam produces, which is mostly visible in dim rooms. It runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the package (section 2).
 
 - **It fails open.** Noise removal hides nothing. If it cannot load or run (the feature or SDK is missing, or the frame size is out of range), the stream continues without it, and the daemon's `Error` property says `noise removal unavailable: <reason>`. The privacy setting (`[effect] privacy`) does not apply to it and the daemon does not enter `error`. With privacy on, the effects themselves fail closed, as below.
 - **Frame size.** The feature supports frames from 80x80 up to 1920x1080 (the SDK's range). An output contract above 1080p runs without noise removal and reports the reason.
 - **Strength.** The SDK's strength is binary: 0 favours texture, 1 favours noise removal. The daemon uses 1 and has no setting for it. For comparisons during development, `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process overrides it. It is a development knob only and is not a supported configuration.
-- **Cost.** It adds one GPU pass per frame and its model's GPU memory. With it off, nothing is added: no pass, copy or allocation. The models load only while it is on. Measure on your machine with `obc-bench --denoise` ([../testing.md](../testing.md)).
+- **Cost.** It adds one GPU pass per frame and its model's GPU memory. With it off, nothing is added: no pass, copy or allocation. The models load only while it is on. Measure on your machine ([../testing.md](../testing.md)):
+
+  ```bash
+  obc-bench --denoise
+  ```
 
 ### Relighting, enhancement, HDR look and chair
 
 Relighting and enhancement are stages that stack the same way, and they fail open too. If one cannot run, the video continues without it and `Error` says why (`relighting unavailable: <reason>; the video continues without it`, `enhance unavailable: ...`).
 
-- **Relighting** (`[effect] relight = true`, or `omarchy-broadcast settings set effect.lighting.relight on`) lights the person with a warm, neutral or cool key light (`relight_light`). The direction is from -90 to 90 degrees (`relight_direction`) and the brightness from 50 to 200 percent (`relight_brightness`). The direction and the brightness change while it runs, with no reload. It runs after the green-screen mask, so it needs `nvvfxgreenscreen` as well. It lights only the person: the camera image (`none`), the blurred image or the replacement behind them is not relit. The daemon makes the lighting environments; the SDK ships none. When the camera is switched, the stage is built again from scratch, so the first frames of the new camera run without it.
-- **Enhancement** (`[effect] enhance = true`, or `settings set effect.video.enhance on`) upscales a camera that captures well below the output size. It runs before the picture is fitted to the output, by one of two methods (below). It applies only where it helps:
+- **Relighting** is on with `[effect] relight = true` or, at run time, with:
+
+  ```bash
+  omarchy-broadcast settings set effect.lighting.relight on
+  ```
+
+  It lights the person with a warm, neutral or cool key light (`relight_light`). The direction is from -90 to 90 degrees (`relight_direction`) and the brightness from 50 to 200 percent (`relight_brightness`). The direction and the brightness change while it runs, with no reload. It runs after the green-screen mask, so it needs `nvvfxgreenscreen` as well. It lights only the person: the camera image (`none`), the blurred image or the replacement behind them is not relit. The daemon makes the lighting environments; the SDK ships none. When the camera is switched, the stage is built again from scratch, so the first frames of the new camera run without it.
+- **Enhancement** is on with `[effect] enhance = true` or, at run time, with:
+
+  ```bash
+  omarchy-broadcast settings set effect.video.enhance on
+  ```
+
+  It upscales a camera that captures well below the output size. It runs before the picture is fitted to the output, by one of two methods (below). It applies only where it helps:
   - The part of the camera frame the output shows must have at most half the pixels of the area it fills. A 960x540 or 640x360 mode into a 1080p output does; a 1080p camera does not.
   - The camera's frames must be NV12 or I420.
 
   Otherwise the setting is greyed with the reason ("The camera already captures at full resolution", "The camera's format cannot be enhanced"). Turning it on or off while the camera is open reopens the camera, like a camera switch: the virtual camera holds the last frame and keeps its format.
 
-  The **method** is the setting `effect.video.enhance_method` ("Enhancement method"). Write it with `omarchy-broadcast settings set effect.video.enhance_method ai|fast` or in the panel. It is greyed while enhancement is off, and a change reopens the camera as turning enhancement on or off does. It has no key in `config.toml`; like the other settings of a module, it is kept in the state file.
+  The **method** is the setting `effect.video.enhance_method` ("Enhancement method"). Write it in the panel or with:
+
+  ```bash
+  omarchy-broadcast settings set effect.video.enhance_method ai
+  omarchy-broadcast settings set effect.video.enhance_method fast
+  ```
+
+  It is greyed while enhancement is off, and a change reopens the camera as turning enhancement on or off does. It has no key in `config.toml`; like the other settings of a module, it is kept in the state file.
   - `ai` ("AI super resolution", the default) is NVIDIA's AI video super resolution, the `nvvfxvideosuperres` feature.
   - `fast` ("Fast upscale (lower power)") is NVIDIA's non-AI upscale, the `nvvfxupscale` feature, at the SDK's default sharpening. It is lighter on the GPU and draws less power, for a picture with less restored detail than the AI method. It has no model files.
   - With neither method chosen, the installed one runs, `ai` first. If `ai` is chosen (it is the default) and its feature is not installed while `nvvfxupscale` is, the fast method runs instead and the daemon's log says so. If `fast` is chosen and `nvvfxupscale` is not installed, the stage is refused with the reason (`enhance unavailable: ...`). The costlier AI method never replaces it. The stage is shown as "Not installed" only when neither feature is.
-- **HDR look** (`omarchy-broadcast settings set effect.video.hdr true`, or the "HDR look" switch in the panel; off by default) gives the picture the look of NVIDIA's TrueHDR. TrueHDR converts the picture to HDR10 (the PQ transfer, BT.2020 primaries, 10 bits). omarchy-broadcast then converts the result back to an ordinary 8-bit SDR picture: a tone map that keeps the mid-tones where the camera had them, rolls the highlights off to SDR white and keeps the colour. So the virtual camera, the PipeWire node and the preview all show it, in any application. The picture has more contrast in the highlights and shadows and richer colour. It is a matter of taste, and with the switch off nothing is loaded. It needs the `nvvfxtruehdr` feature, which has no model files; without it the setting is greyed "Not installed". It runs on the finished picture, after the cut-out, the blur or the replacement, and relighting, and before frame generation.
+- **HDR look** is off by default. Turn it on with the "HDR look" switch in the panel or with:
+
+  ```bash
+  omarchy-broadcast settings set effect.video.hdr true
+  ```
+
+  It gives the picture the look of NVIDIA's TrueHDR. TrueHDR converts the picture to HDR10 (the PQ transfer, BT.2020 primaries, 10 bits). omarchy-broadcast then converts the result back to an ordinary 8-bit SDR picture: a tone map that keeps the mid-tones where the camera had them, rolls the highlights off to SDR white and keeps the colour. So the virtual camera, the PipeWire node and the preview all show it, in any application. The picture has more contrast in the highlights and shadows and richer colour. It is a matter of taste, and with the switch off nothing is loaded. It needs the `nvvfxtruehdr` feature, which has no model files; without it the setting is greyed "Not installed". It runs on the finished picture, after the cut-out, the blur or the replacement, and relighting, and before frame generation.
   - **No HDR output.** The output is 8-bit SDR and no application receives HDR. A real 10-bit HDR output is not built: no application that reads the camera on the reference system would show it as HDR.
   - **Banding.** NVIDIA's debander is on (the SDK default), and it limits banding in smooth gradients of an 8-bit source (a plain wall, a soft shadow). Banding may still show there. If you see it, turn the look off.
   - **High output rates.** The HDR look is tested up to 60 fps. When frames arrive much faster than a camera delivers them, NVIDIA's TrueHDR can give a frame an output that depends on the frames before it. At an output rate above 60 fps (the setting allows up to 240) this is untested, and it would show as faint temporal blending or flicker. There is no restriction.
@@ -354,7 +442,13 @@ Relighting and enhancement are stages that stack the same way, and they fail ope
 
   It applies to `blur` and `replace` (and to the relighting that uses the same mask), is greyed while the effect is `none`, and has no key in `config.toml`. Only the SDK's quality modes of the green screen are used. A change loads the green screen again in the other mode. The new one is built before the old one is released, so the previous cut-out keeps running until it is ready, and if the new one cannot be built the previous chain keeps running. The cut-out hides the room, so a failure here follows the privacy setting (`[effect] privacy`) like any other failure of the effect. With privacy on, it never lets the camera image through.
 - **The mask edge.** Before the background effects use the person mask, the Maxine module maps it through a fixed curve: a mask value of 128 or less becomes fully background, 224 or more becomes fully person, and values in between rise linearly. The values are fixed and there is no setting for them. The room no longer shows around the subject or faintly through it. The cost is that the outline sits 1 to 2 px further in, and fine structures such as hair and fingers lose a little of their soft edge. Two limits remain. The curve changes the edge, not the classification: if the model counts an object (a pile of blankets, say) as part of the person, it stays visible. The edge can also flicker slightly on a still subject, because the curve turns some small mask changes into larger changes of opacity at the edge.
-- **Cost.** Each stage adds a GPU pass per frame and its models' GPU memory while it is on, and nothing while it is off. Measure on your machine with `obc-bench --effect blur --denoise --relight` ([../testing.md](../testing.md)). The figures are not published.
+- **Cost.** Each stage adds a GPU pass per frame and its models' GPU memory while it is on, and nothing while it is off. Measure on your machine ([../testing.md](../testing.md)):
+
+  ```bash
+  obc-bench --effect blur --denoise --relight
+  ```
+
+  The figures are not published.
 
 ### The replacement image and what you see while an effect loads
 
@@ -405,7 +499,12 @@ The AR SDK is a separate personal download from the Video Effects SDK. omarchy-n
 
 The module is the library `libobc_module_maxine_ar.so` and the manifest `maxine-ar.toml`. The Arch package `omarchy-broadcast-maxine-ar-git` (or `omarchy-broadcast-maxine-ar-bin`) installs it and depends on `maxine-ar-sdk-local` (and on the module ABI that the core provides). `scripts/install-user.sh` installs it for the current user in the same way as the Maxine module (see "From a checkout" under [The Maxine module](#the-maxine-module)).
 
-It opens the SDK at run time, so it installs and loads without the SDK or an NVIDIA GPU. Without the SDK, or without the models the effect needs for your GPU, the effect's setting is greyed with the reason, for example `Maxine AR SDK not installed` or `No face detection models for this GPU (sm_120)`. Check it with `omarchy-broadcast modules` and `omarchy-broadcast modules info br.com.dias.maxine-ar`.
+It opens the SDK at run time, so it installs and loads without the SDK or an NVIDIA GPU. Without the SDK, or without the models the effect needs for your GPU, the effect's setting is greyed with the reason, for example `Maxine AR SDK not installed` or `No face detection models for this GPU (sm_120)`. Check it with:
+
+```bash
+omarchy-broadcast modules
+omarchy-broadcast modules info br.com.dias.maxine-ar
+```
 
 | Stage | Setting | SDK features and models needed |
 |---|---|---|
@@ -433,7 +532,11 @@ As for the Video Effects module:
 
 - The key works with the package installed (the daemon applies no root from the environment file, section 3).
 - `LD_LIBRARY_PATH` is not needed. The module loads the SDK's libraries from the root by absolute path.
-- The SDK is loaded once per process. A different root takes `systemctl --user restart omarchy-broadcastd`.
+- The SDK is loaded once per process. A different root takes a restart of the daemon:
+
+  ```bash
+  systemctl --user restart omarchy-broadcastd
+  ```
 
 The two modules have separate roots, set separately. Any other key in the table is refused.
 
@@ -477,7 +580,11 @@ If a stage is greyed or does not run, the reason is the one `omarchy-broadcast m
 | `No face detection models for this GPU (sm_120)` (or `126-point face landmark`, or `Eye Contact`) | The package has no models of that kind for your GPU architecture | `ls /opt/nvidia/maxine/arsdk/lib/models`, and rebuild the package for your architecture |
 | The stage is available but is dropped, and the `Warning` names an SDK status | The shim is not applied to the daemon (the feature libraries read `/etc/os-release`), or the models are not found | The AR shim section above and section 3 (the `SDK environment` line). `MAXINE_OS_RELEASE_DEBUG=1` shows the redirect |
 
-A drop-in `maxine-ar.conf` written for an earlier version is not needed any more. Remove it as in section 8. Remove the AR module package and then the SDK package with `sudo pacman -R omarchy-broadcast-maxine-ar-git maxine-ar-sdk-local` (`omarchy-broadcast-maxine-ar-bin` for the prebuilt module), only if nothing else uses the SDK.
+A drop-in `maxine-ar.conf` written for an earlier version is not needed any more. Remove it as in section 8. Remove the AR module package and then the SDK package, only if nothing else uses the SDK (`omarchy-broadcast-maxine-ar-bin` for the prebuilt module):
+
+```bash
+sudo pacman -R omarchy-broadcast-maxine-ar-git maxine-ar-sdk-local
+```
 
 ## The Maxine audio effects module
 
@@ -497,9 +604,20 @@ journalctl --user -u omarchy-broadcast-audiod | grep 'SDK environment'
 
 The worker starts on demand and exits when the microphone is idle, so the next start applies the environment. You need no restart of the unit after installing the package.
 
-The Arch package `omarchy-broadcast-maxine-afx-git` (or `omarchy-broadcast-maxine-afx-bin`) installs the module and depends on `maxine-afx-sdk-local`. `scripts/install-user.sh --audio` installs the module for the current user. The module installs and loads without the SDK, and without the SDK the microphone uses its CPU module.
+The Arch package `omarchy-broadcast-maxine-afx-git` (or `omarchy-broadcast-maxine-afx-bin`) installs the module and depends on `maxine-afx-sdk-local`. From a checkout, install the module for the current user with:
 
-[microphone.md](microphone.md#on-an-nvidia-gpu-maxine-audio-effects) covers what the effects do, the settings in the Mic tab, studio voice's exclusion of noise and echo removal and its delay, the choice of provider, and troubleshooting. Check the module with `omarchy-broadcast modules` and `omarchy-broadcast modules info br.com.dias.maxine-afx`, which show each stage's reason.
+```bash
+scripts/install-user.sh --audio
+```
+
+The module installs and loads without the SDK, and without the SDK the microphone uses its CPU module.
+
+[microphone.md](microphone.md#on-an-nvidia-gpu-maxine-audio-effects) covers what the effects do, the settings in the Mic tab, studio voice's exclusion of noise and echo removal and its delay, the choice of provider, and troubleshooting. Check the module with the commands below, which show each stage's reason:
+
+```bash
+omarchy-broadcast modules
+omarchy-broadcast modules info br.com.dias.maxine-afx
+```
 
 ## 8. Uninstall
 
@@ -513,9 +631,21 @@ systemctl --user restart omarchy-broadcastd.service
 
 Without the SDK the daemon runs as usual and the effects are unavailable.
 
-**Drop-ins from an earlier version.** Remove a drop-in copied for an earlier version (`~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf`, `maxine-ar.conf`) with `rm -f`, then run `systemctl --user daemon-reload` and restart the daemon. You do not need it any more.
+**Drop-ins from an earlier version.** You do not need a drop-in copied for an earlier version (`maxine.conf`, `maxine-ar.conf`). Remove it, then reload systemd and restart the daemon:
 
-**A checkout.** To remove the Maxine module of a checkout installed with `scripts/install-user.sh`, run `scripts/install-user.sh --uninstall`. It removes the module's library and manifest, and the directories among them once they are empty.
+```bash
+rm -f ~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf ~/.config/systemd/user/omarchy-broadcastd.service.d/maxine-ar.conf
+systemctl --user daemon-reload
+systemctl --user restart omarchy-broadcastd.service
+```
+
+**A checkout.** To remove the Maxine module of a checkout installed with `scripts/install-user.sh`, run:
+
+```bash
+scripts/install-user.sh --uninstall
+```
+
+It removes the module's library and manifest, and the directories among them once they are empty.
 
 A module installed by hand (the recipe under "From a checkout") has a manifest without the script's mark, and the script refuses to remove it. Delete that manifest and the library it names first, then run the uninstall again:
 
@@ -523,7 +653,11 @@ A module installed by hand (the recipe under "From a checkout") has a manifest w
 rm -f ~/.local/share/omarchy-broadcast/modules.d/maxine-vfx.toml ~/.local/lib/omarchy-broadcast/modules/libobc_module_maxine.so
 ```
 
-Restart the daemon after either. The packaged module goes with the omarchy-broadcast package, and `omarchy-broadcast modules disable br.com.dias.maxine-vfx` turns it off without removing it.
+Restart the daemon after either. The packaged module goes with the omarchy-broadcast package. To turn it off without removing it:
+
+```bash
+omarchy-broadcast modules disable br.com.dias.maxine-vfx
+```
 
 **An older shim.** An os-release shim installed by `scripts/install-user.sh` of an older omarchy-broadcast release, under `~/.local/lib/omarchy-broadcast/`, is removed by `scripts/install-user.sh --uninstall` of the current script, and by reinstalling with it. To remove it by hand:
 
@@ -531,7 +665,18 @@ Restart the daemon after either. The packaged module goes with the omarchy-broad
 rm -f ~/.local/lib/omarchy-broadcast/os-release-shim.so ~/.local/lib/omarchy-broadcast/fake-os-release
 ```
 
-**The audio module** needs no drop-in either. Once `maxine-afx-sdk-local` is removed (after `omarchy-broadcast-maxine-afx-git`, or `-bin`, which depends on it), the worker starts without the SDK from its next start. Delete a drop-in copied for an earlier version, `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf`, with `rm -f` and `systemctl --user daemon-reload`. `scripts/install-user.sh --uninstall` removes the module's library and manifest of a checkout, and the packaged ones go with the omarchy-broadcast package. `omarchy-broadcast modules disable br.com.dias.maxine-afx` turns the module off without removing it.
+**The audio module** needs no drop-in either. Once `maxine-afx-sdk-local` is removed (after `omarchy-broadcast-maxine-afx-git`, or `-bin`, which depends on it), the worker starts without the SDK from its next start. Delete a drop-in copied for an earlier version, `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf`:
+
+```bash
+rm -f ~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf
+systemctl --user daemon-reload
+```
+
+`scripts/install-user.sh --uninstall` removes the module's library and manifest of a checkout, and the packaged ones go with the omarchy-broadcast package. To turn the module off without removing it:
+
+```bash
+omarchy-broadcast modules disable br.com.dias.maxine-afx
+```
 
 The NGC CLI, the NGC key and the downloads belong to omarchy-nvidia-sdks. Its documentation covers removing them.
 

@@ -12,7 +12,11 @@ This README is the module's reference: build, install, every setting, key and va
 | Runtime | `libonnxruntime.so` 1.29 or later, opened at run time |
 | Licence | MIT OR Apache-2.0 (the module); the models Apache-2.0 |
 
-With both modules installed, the `quality` profile picks Maxine (the higher rank) and the `battery` profile picks this one (a CPU device). `omarchy-broadcast modules pin background br.com.dias.onnx-cutout` picks it whatever the profile.
+With both modules installed, the `quality` profile picks Maxine (the higher rank) and the `battery` profile picks this one (a CPU device). This command picks it whatever the profile:
+
+```sh
+omarchy-broadcast modules pin background br.com.dias.onnx-cutout
+```
 
 ## Building
 
@@ -140,7 +144,14 @@ For `nvidia-tensorrt-sdk` (`/opt/nvidia/tensorrt`), set the path for the daemon'
 EnvironmentFile=-/usr/share/nvidia-tensorrt/nvidia-tensorrt.env
 ```
 
-Then run `systemctl --user daemon-reload` and restart the daemon. A TensorRT under `/usr/lib` (the AUR's `tensorrt`) needs nothing.
+Then reload systemd and restart the daemon:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart omarchy-broadcastd
+```
+
+A TensorRT under `/usr/lib` (the AUR's `tensorrt`) needs nothing.
 
 The daemon never applies the Maxine SDK environment's own `LD_LIBRARY_PATH`, because its bundled CUDA and TensorRT libraries would shadow these engines. So the value of this drop-in is the one the daemon runs with. A `maxine.conf` drop-in of an earlier version also sets it; you no longer need it, so remove it. The full procedure is in [docs/setup/onnx.md](../../docs/setup/onnx.md).
 

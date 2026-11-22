@@ -91,8 +91,14 @@ suspend at all right now**, whatever our process does.
 
 ## (b) During an obc-bench linger after teardown
 
-The run: `./target/release/obc-bench --sink-device /dev/video10 --gpu-stage passthrough --duration 10
---linger-after-teardown 90`. It was run twice, once with `--no-gpu-stats` and once with NVML sampling on; both gave
+The run:
+
+```sh
+./target/release/obc-bench --sink-device /dev/video10 --gpu-stage passthrough --duration 10 \
+  --linger-after-teardown 90
+```
+
+It was run twice, once with `--no-gpu-stats` and once with NVML sampling on; both gave
 the same result. The camera and sink were checked free with `fuser` first.
 
 `nvidia-smi` was run during the linger because the dGPU was already awake for the other clients (section a), so the
@@ -117,8 +123,11 @@ Notes:
 
 ## (c) After our process exited
 
-Measured with `scripts/dgpu-idle-check.sh --pid <bench pid> --wait 20` about 2 s after exit (exit 1 because of the
-other clients):
+Measured about 2 s after exit (exit 1 because of the other clients) with:
+
+```sh
+scripts/dgpu-idle-check.sh --pid <bench pid> --wait 20
+```
 
 - Our pid is gone; the holders are back to the baseline set (Hyprland and the 3D workload's processes).
 - `nvidia-smi --query-compute-apps` lists only the 3D workload.

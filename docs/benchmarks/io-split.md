@@ -168,7 +168,11 @@ Raw results:
 
 ## 6. Live switching with the held frame
 
-Section 2 repeated with the held frame at a switch: MX Brio NV12 1920x1080@30 and FHD Camera MJPEG 1920x1080@30, `--switch-every 10`, 130 s measured, both cameras' frame rate pinned with `--camera-fixed-framerate`, and the same external consumer (`gst-launch-1.0 -v v4l2src device=/dev/video11 ! fpsdisplaysink video-sink=fakesink text-overlay=false sync=false`).
+Section 2 repeated with the held frame at a switch: MX Brio NV12 1920x1080@30 and FHD Camera MJPEG 1920x1080@30, `--switch-every 10`, 130 s measured, both cameras' frame rate pinned with `--camera-fixed-framerate`, and the same external consumer:
+
+```sh
+gst-launch-1.0 -v v4l2src device=/dev/video11 ! fpsdisplaysink video-sink=fakesink text-overlay=false sync=false
+```
 
 | Metric | Section 2 (fixed grid, no hold) | Held frame |
 |---|---|---|
