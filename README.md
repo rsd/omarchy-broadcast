@@ -6,7 +6,7 @@ Omarchy Broadcast is a daemon for Linux, written in Rust on GStreamer. It turns 
 
 ## What you get
 
-**On any machine** (CPU, or an Intel GPU or NPU through ONNX Runtime):
+**On any machine** (CPU, or an Intel GPU or NPU through ONNX Runtime; [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime) packages its engines):
 
 - Background blur and background replacement with open Apache-2.0 models. A replacement can be an image, an animated image or a video; two loops and a set of backgrounds are bundled.
 - Camera passthrough with the camera's own image settings: brightness, contrast, saturation, exposure, white balance, focus and zoom, set per camera.
