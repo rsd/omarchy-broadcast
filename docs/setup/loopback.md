@@ -11,7 +11,7 @@ The daemon finds the device by its **label**, `Omarchy Broadcast`, not by its `/
 
 ## Single device
 
-[Step 5 of INSTALL.md](../../INSTALL.md#steps) creates the device: it installs the line below as `/etc/modprobe.d/omarchy-broadcast.conf`, loads the module at boot with `/etc/modules-load.d/v4l2loopback.conf` and reloads the module. The Arch package ships the line as an example, `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`, and a checkout has it in `dist/modprobe.d/omarchy-broadcast.conf`:
+[Step 4 of INSTALL.md](../../INSTALL.md#steps) creates the device: it installs the line below as `/etc/modprobe.d/omarchy-broadcast.conf`, loads the module at boot with `/etc/modules-load.d/v4l2loopback.conf` and reloads the module. The Arch package ships the line as an example, `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`, and a checkout has it in `dist/modprobe.d/omarchy-broadcast.conf`:
 
 ```text
 options v4l2loopback devices=1 video_nr=10 card_label="Omarchy Broadcast" exclusive_caps=1 max_buffers=4
@@ -33,7 +33,7 @@ options v4l2loopback devices=2 video_nr=10,11 card_label="First Device,Omarchy B
 
 ## Check that it works
 
-Step 5 of [INSTALL.md](../../INSTALL.md#steps) ends with the check, which needs no root: the name of the device is `Omarchy Broadcast`. With the daemon running, `omarchy-broadcast status` shows the camera state ([daemon.md](daemon.md#check-that-it-works)).
+Step 4 of [INSTALL.md](../../INSTALL.md#steps) ends with the check, which needs no root: the name of the device is `Omarchy Broadcast`. With the daemon running, `omarchy-broadcast status` shows the camera state ([daemon.md](daemon.md#check-that-it-works)).
 
 ## Troubleshooting
 

@@ -33,7 +33,7 @@ The library is `crates/obc-module-onnx/target/release/libobc_module_onnx.so`. No
 On Arch, install the package `omarchy-broadcast-onnx-git` (or the prebuilt `omarchy-broadcast-onnx-bin`) instead of the steps below. The steps below install from a build.
 
 1. **Install ONNX Runtime**, 1.29 or later: any package that provides `onnxruntime`. [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime) provides ONNX Runtime 1.29.0 as pacman packages for Arch and Omarchy, and says which package fits which hardware: see [step 1 of its INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md#1-choose-your-packages).
-   - TensorRT also needs its library directory on the daemon's `LD_LIBRARY_PATH` (see "TensorRT's library path" below).
+   - TensorRT also needs its libraries on the daemon's library path. A package that installs them under `/usr/lib` or registers their directory with the loader needs nothing more; otherwise set `LD_LIBRARY_PATH` for the daemon (see "TensorRT's library path" below).
 2. **Install the module**: the library and the manifest in a `modules.d` directory, with `library` pointing at the library:
 
    ```sh
@@ -131,7 +131,7 @@ The module asks the loaded runtime which providers it was built with. It checks 
 
 ### TensorRT's library path
 
-TensorRT 11 opens its per-GPU builder library by name (`libnvinfer_builder_resource_sm<NN>.so.<version>`; TensorRT 10, `libnvinfer_builder_resource.so.<version>`), which only the process's library path resolves. Without TensorRT's lib directory on the daemon's `LD_LIBRARY_PATH`, ONNX Runtime's TensorRT provider crashes the process, on an engine build and on loading a cached engine.
+TensorRT 11 opens its per-GPU builder library by name (`libnvinfer_builder_resource_sm<NN>.so.<version>`; TensorRT 10, `libnvinfer_builder_resource.so.<version>`), which only the process's library path resolves. Without TensorRT's builder library on the daemon's library path (`LD_LIBRARY_PATH`, the loader's cache or its default directories), ONNX Runtime's TensorRT provider crashes the process, on an engine build and on loading a cached engine.
 
 The module opens that library itself before it starts TensorRT. When it cannot, TensorRT is refused with a reason, `auto` goes on to CUDA and an explicit `tensorrt` fails the load.
 

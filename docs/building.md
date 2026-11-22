@@ -29,7 +29,7 @@ Your package manager supplies these. Package names differ between distributions,
 
 2. Make sure `${XDG_BIN_HOME:-~/.local/bin}` is on your `PATH`. The script installs `omarchy-broadcast` and `omarchy-broadcastd` there.
 
-3. Create the virtual camera device. The checkout holds the `modprobe.d` line that the Arch package ships as an example. Install it, then run the other two commands of [INSTALL.md](../INSTALL.md#steps), step 5, which load the module at boot and reload it:
+3. Create the virtual camera device. The checkout holds the `modprobe.d` line that the Arch package ships as an example. Install it, then run the other two commands of [INSTALL.md](../INSTALL.md#steps), step 4, which load the module at boot and reload it:
 
    ```sh
    sudo install -Dm644 dist/modprobe.d/omarchy-broadcast.conf /etc/modprobe.d/omarchy-broadcast.conf
@@ -41,7 +41,7 @@ Your package manager supplies these. Package names differ between distributions,
    systemctl --user daemon-reload
    ```
 
-   Then start the daemon at every login and [check that it works](../INSTALL.md#check-that-it-works), as in INSTALL.md, step 6.
+   Then start the daemon at every login and [check that it works](../INSTALL.md#check-that-it-works), as in INSTALL.md, step 5.
 
 5. Add the optional parts. The open-model effects need ONNX Runtime and the model files ([setup/onnx.md](setup/onnx.md#from-a-checkout)). The virtual microphone needs the script's `--mic` or `--audio` option ([setup/microphone.md](setup/microphone.md)). The NVIDIA Maxine effects need an SDK you obtain yourself ([setup/maxine.md](setup/maxine.md)).
 
@@ -131,7 +131,7 @@ The two binaries and the unit file, with no script. None of the routes on this p
    systemctl --user daemon-reload
    ```
 
-   Start the daemon as in [INSTALL.md](../INSTALL.md#steps), step 6. If you enabled the service earlier from an older copy of the unit, run this so that `default.target` wants it:
+   Start the daemon as in [INSTALL.md](../INSTALL.md#steps), step 5. If you enabled the service earlier from an older copy of the unit, run this so that `default.target` wants it:
 
    ```sh
    systemctl --user reenable omarchy-broadcastd

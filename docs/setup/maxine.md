@@ -42,7 +42,7 @@ The module needs neither the open-model module nor ONNX Runtime, but without the
 Then:
 
 1. Build and install the SDK package `maxine-vfx-sdk-local` from your download, with omarchy-nvidia-sdks (section 2).
-2. Install the module package `omarchy-broadcast-maxine-vfx-bin` (or `omarchy-broadcast-maxine-vfx-git`), as [INSTALL.md](../../INSTALL.md#steps) describes in step 4. The module package depends on `maxine-vfx-sdk-local`.
+2. Install the module package `omarchy-broadcast-maxine-vfx-bin` (or `omarchy-broadcast-maxine-vfx-git`), as [INSTALL.md](../../INSTALL.md#add-the-nvidia-effects-optional-nvidia-rtx-gpu-only) describes. The module package depends on `maxine-vfx-sdk-local`.
 3. If the daemon is already running, restart it. Check the log and the module (section 3). The log shows `SDK environment applied from /usr/share/maxine-vfx/maxine-vfx.env`. `modules` lists `br.com.dias.maxine-vfx` with its stages.
 
 ## The Maxine module
@@ -163,7 +163,7 @@ Nothing in omarchy-broadcast builds or downloads the SDK. The module package `om
 
 The daemon needs the os-release shim from the moment it starts (see below). You need no systemd drop-in for it. With the SDK package installed, `omarchy-broadcastd` applies the package's environment to itself when it starts, and logs that it did.
 
-Install the packages ([INSTALL.md](../../INSTALL.md#steps), step 4), restart the daemon and check the log and the module:
+Install the packages ([INSTALL.md](../../INSTALL.md#add-the-nvidia-effects-optional-nvidia-rtx-gpu-only)), restart the daemon and check the log and the module:
 
 ```bash
 systemctl --user restart omarchy-broadcastd.service

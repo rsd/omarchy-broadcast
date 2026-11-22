@@ -591,13 +591,13 @@ The filter-chain units stay supported for anyone who wants a fixed engine with n
 
 The units are **mutually exclusive** with the microphone with audio modules above. `omarchy-broadcast mic on` refuses while one of these units runs. Starting either kind of unit stops the other (`Conflicts=`).
 
-Two engines are available, each with its own configuration file: RNNoise (the default, light on CPU) and DeepFilterNet (higher quality, more CPU). See [Choose the engine of the units](#choose-the-engine-of-the-units). Each runs as its own process, started by one instance of the systemd user unit `omarchy-broadcast-mic@.service`. Both create a source with the same name, so run one at a time. Each engine has its own `pipewire -c` process, not a `pipewire.conf.d` drop-in or PipeWire's stock `filter-chain.service`. A plugin fault or overrun then stays inside that process and cannot disturb other audio streams, and starting, stopping or reconfiguring the filter does not restart PipeWire or drop any stream. A drop-in directory would also load both engines together, and the stock unit is shared with any other filters you run.
+Two engines are available, each with its own configuration file: RNNoise (the default of the filter-chain units, light on CPU) and DeepFilterNet (higher quality, more CPU). See [Choose the engine of the units](#choose-the-engine-of-the-units). Each runs as its own process, started by one instance of the systemd user unit `omarchy-broadcast-mic@.service`. Both create a source with the same name, so run one at a time. Each engine has its own `pipewire -c` process, not a `pipewire.conf.d` drop-in or PipeWire's stock `filter-chain.service`. A plugin fault or overrun then stays inside that process and cannot disturb other audio streams, and starting, stopping or reconfiguring the filter does not restart PipeWire or drop any stream. A drop-in directory would also load both engines together, and the stock unit is shared with any other filters you run.
 
 The configuration files and the unit are in the repository's `dist/` directory (`dist/pipewire/` and `dist/systemd/`). There are three ways to install them. Each installs both engines' configurations and the unit, and none enables anything.
 
 ## Before you start with the units
 
-- At least one LADSPA plugin package. The Arch package lists both as optional dependencies. Install the plugin of each engine you want. The RNNoise engine (default):
+- At least one LADSPA plugin package. The Arch package lists both as optional dependencies. Install the plugin of each engine you want. The RNNoise engine (the default of the units):
 
 ```sh
 sudo pacman -S noise-suppression-for-voice
@@ -708,7 +708,7 @@ The source is mono at 48 kHz. A stereo microphone is downmixed.
 
 ## Choose the engine of the units
 
-RNNoise is the default. It costs little CPU, which matters on a laptop battery. Its voice-activity gate mutes everything it does not classify as voice (ambience, music, keyboard between words), so a room with no one speaking comes out as silence.
+RNNoise is the default of the units (the CPU module's default is DeepFilterNet). It costs little CPU, which matters on a laptop battery. Its voice-activity gate mutes everything it does not classify as voice (ambience, music, keyboard between words), so a room with no one speaking comes out as silence.
 
 Choose DeepFilterNet when you want higher quality, noise removed from under speech, or non-speech sound kept (for example an instrument), and have CPU to spare. It is a neural model that removes noise from inside speech and lowers the noise floor instead of gating. Listening tests found both acceptable.
 

@@ -8,12 +8,12 @@ Find your case, then follow the steps for it.
 
 | Your case | What to do |
 |---|---|
-| Arch Linux or Omarchy | [Steps](#steps) 1 to 6. The packages come from the AUR, prebuilt (`-bin`) or built on your machine (`-git`) |
-| Another Linux distribution | [docs/building.md](docs/building.md) compiles and installs from a checkout. It sends you back here for steps 5 and 6 |
-| An NVIDIA RTX GPU, and you want the NVIDIA effects | Add step 4 (optional) |
+| Arch Linux or Omarchy | [Steps](#steps) 1 to 5. The packages come from the AUR, prebuilt (`-bin`) or built on your machine (`-git`) |
+| Another Linux distribution | [docs/building.md](docs/building.md) compiles and installs from a checkout. It sends you back here for steps 4 and 5 |
+| An NVIDIA RTX GPU, and you want the NVIDIA effects | Add [the NVIDIA effects](#add-the-nvidia-effects-optional-nvidia-rtx-gpu-only), after the check |
 | Omarchy, and you want the bar plugin | Add [the bar plugin](#add-the-bar-plugin-optional-omarchy), after the check |
 
-Steps 3 and 4 are optional, and you can do them after [the check](#check-that-it-works). You also need a webcam. Any standard webcam works, USB or built-in. Cameras that are not standard webcams may not work: see [LIMITATIONS.md](LIMITATIONS.md#cameras-that-are-not-standard-webcams).
+Step 3 is optional, and you can do it after [the check](#check-that-it-works). You also need a webcam. Any standard webcam works, USB or built-in. Cameras that are not standard webcams may not work: see [LIMITATIONS.md](LIMITATIONS.md#cameras-that-are-not-standard-webcams).
 
 ## Steps
 
@@ -37,35 +37,11 @@ Steps 3 and 4 are optional, and you can do them after [the check](#check-that-it
    yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git
    ```
 
-   The command installs the core and the module. The module's package also brings in its default model, so the open-model effects work without a further download. On a first install the package prints the next steps, which are steps 5 and 6 below.
+   The command installs the core and the module. The module's package also brings in its default model, so the open-model effects work without a further download. On a first install the package prints the next steps, which are steps 4 and 5 below.
 
 3. **Add more models (optional).** [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models) holds four open person-segmentation models as ONNX files, with checksums and licences, and one Arch package for each. You can do this after the check, because the default model is already installed. Install more of them there, then choose one in [docs/setup/onnx.md](docs/setup/onnx.md#choose-the-model-and-the-engine).
 
-4. **Add the NVIDIA effects (optional, NVIDIA RTX GPU only).** The NVIDIA Maxine effects need an NVIDIA RTX GPU and its driver ([requirements](docs/setup/maxine.md#1-requirements)), and an SDK that you download from NVIDIA yourself. [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) turns each SDK into a local pacman package: `maxine-vfx-sdk-local` for the video effects, `maxine-ar-sdk-local` for eye contact and auto-framing, `maxine-afx-sdk-local` for the microphone's effects. Build and install the SDK packages you want there first. [docs/setup/maxine.md](docs/setup/maxine.md#2-the-sdk-package) lists the SDK features each effect needs, and that repository covers the microphone's effects and their sample rates.
-
-   **Install only the module packages whose SDK package you built.** A module package depends on its SDK package. If that is not installed, the AUR helper tries to build it from its AUR recipe. That build fails without your SDK download, and the module package is not installed. The video and AR module packages also pull in `cuda` as a dependency, so you do not install it yourself. Run the command of each module you want. Use `-git` in place of `-bin` if you chose the source kind in step 2.
-
-   The video effects need `maxine-vfx-sdk-local`:
-
-   ```sh
-   yay -S omarchy-broadcast-maxine-vfx-bin
-   ```
-
-   Eye contact and auto-framing need `maxine-ar-sdk-local`:
-
-   ```sh
-   yay -S omarchy-broadcast-maxine-ar-bin
-   ```
-
-   The microphone's effects need `maxine-afx-sdk-local`:
-
-   ```sh
-   yay -S omarchy-broadcast-maxine-afx-bin
-   ```
-
-   The daemon lists the modules once it runs (see [Check that it works](#check-that-it-works)). You can do this step after the check: install the packages, then restart the daemon as [Update](#update) shows. [docs/setup/maxine.md](docs/setup/maxine.md) covers their setup and checks.
-
-5. **Create the virtual camera.** This needs root and runs once. The core package depends on a v4l2loopback kernel module (`v4l2loopback-dkms` provides it), so step 2 installed one if the system had none. The package ships the `modprobe.d` line as an example.
+4. **Create the virtual camera.** This needs root and runs once. The core package depends on a v4l2loopback kernel module (`v4l2loopback-dkms` provides it), so step 2 installed one if the system had none. The package ships the `modprobe.d` line as an example.
 
    ```sh
    sudo install -Dm644 /usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf /etc/modprobe.d/omarchy-broadcast.conf
@@ -81,7 +57,7 @@ Steps 3 and 4 are optional, and you can do them after [the check](#check-that-it
 
    Expect `Omarchy Broadcast`. If `modprobe` fails with `Module v4l2loopback is in use`, an application holds the camera: see [Troubleshooting](#troubleshooting). If it says the module is not found, the running kernel has no v4l2loopback module built for it ([the requirement](docs/setup/loopback.md#before-you-start)).
 
-6. **Start the daemon at every login.**
+5. **Start the daemon at every login.**
 
    ```sh
    systemctl --user enable --now omarchy-broadcastd
@@ -103,13 +79,13 @@ Camera:     <your camera>
 Consumers:  0
 ```
 
-After step 6 on a first install, `State` is `idle`: no application uses the camera yet, and you need no `omarchy-broadcast on`. It is `active` while an application uses the camera. It is `off` only if you turned the camera off earlier, because that state persists, and `omarchy-broadcast on` turns the camera back on. For the service itself, check that it is `active (running)`:
+After step 5 on a first install, `State` is `idle`: no application uses the camera yet, and you need no `omarchy-broadcast on`. It is `active` while an application uses the camera. It is `off` only if you turned the camera off earlier, because that state persists, and `omarchy-broadcast on` turns the camera back on. For the service itself, check that it is `active (running)`:
 
 ```sh
 systemctl --user status omarchy-broadcastd
 ```
 
-Select **Omarchy Broadcast** as the camera in an application, such as the browser Omarchy ships (Chromium) or OBS. With `exclusive_caps=1`, the device is listed as a camera only while the daemon runs ([why](docs/setup/loopback.md#why-exclusive_caps1)), so step 6 comes first. The daemon streams into the device from its start, black frames (or the away image) while no application reads it. Then choose an effect:
+Select **Omarchy Broadcast** as the camera in an application, such as the browser Omarchy ships (Chromium) or OBS. With `exclusive_caps=1`, the device is listed as a camera only while the daemon runs ([why](docs/setup/loopback.md#why-exclusive_caps1)), so step 5 comes first. The daemon streams into the device from its start, black frames (or the away image) while no application reads it. Then choose an effect:
 
 ```sh
 omarchy-broadcast effect blur
@@ -147,6 +123,34 @@ The engine is `CPU` here. It can also be `NVIDIA TensorRT`, `NVIDIA CUDA`, `Open
 
 Every command of the CLI is in [docs/cli-json.md](docs/cli-json.md). The guides cover the rest: [the daemon](docs/setup/daemon.md) (the unit, the optional PipeWire camera, the configuration), [the virtual camera device](docs/setup/loopback.md), [the open-model effects](docs/setup/onnx.md) and [the NVIDIA effects](docs/setup/maxine.md).
 
+## Add the NVIDIA effects (optional, NVIDIA RTX GPU only)
+
+This section starts in a second repository. The NVIDIA Maxine effects need an NVIDIA RTX GPU and its driver, and an SDK that you download from NVIDIA yourself. [The requirements](docs/setup/maxine.md#1-requirements) include the SDK features each effect needs. [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) turns each SDK into a local pacman package: `maxine-vfx-sdk-local` for the video effects, `maxine-ar-sdk-local` for eye contact and auto-framing, `maxine-afx-sdk-local` for the microphone's effects. Build and install the SDK packages you want there, then come back here. That repository also covers the microphone's effects and their sample rates.
+
+**Install only the module packages whose SDK package you built.** A module package depends on its SDK package. If that is not installed, the AUR helper tries to build it from its AUR recipe. That build fails without your SDK download, and the module package is not installed. The video and AR module packages also pull in `cuda` as a dependency, so you do not install it yourself.
+
+The commands below install the prebuilt kind. If you chose the `-git` kind in step 2, replace `-bin` with `-git` at the end of each name, for example `omarchy-broadcast-maxine-vfx-git`. Run the command of each module you want.
+
+The video effects need `maxine-vfx-sdk-local`:
+
+```sh
+yay -S omarchy-broadcast-maxine-vfx-bin
+```
+
+Eye contact and auto-framing need `maxine-ar-sdk-local`:
+
+```sh
+yay -S omarchy-broadcast-maxine-ar-bin
+```
+
+The microphone's effects need `maxine-afx-sdk-local`:
+
+```sh
+yay -S omarchy-broadcast-maxine-afx-bin
+```
+
+The daemon has run since step 5, and it picks up new modules when it restarts. Restart it with the command under [Update](#update). The modules list of [Check that it works](#check-that-it-works) then shows the new modules. [docs/setup/maxine.md](docs/setup/maxine.md#3-the-sdk-environment) shows how to check the video and AR modules, and [its audio section](docs/setup/maxine.md#the-maxine-audio-effects-module) the microphone's. The page covers their setup.
+
 ## Add the virtual microphone (optional)
 
 The virtual microphone is optional and off until you turn it on. [docs/setup/microphone.md](docs/setup/microphone.md) covers turning it on, choosing it as the default microphone and its noise removal, on the CPU or on an NVIDIA GPU.
@@ -170,10 +174,10 @@ The daemon runs the new version afterwards. A module library that is rebuilt tak
 | Symptom | Cause | Fix |
 |---|---|---|
 | The reload fails with "Module v4l2loopback is in use" | An application holds a loopback node | Close it, check with `fuser -v /dev/video10`, and run the reload again |
-| `omarchy-broadcast status` shows the state `error` | The v4l2loopback device labelled "Omarchy Broadcast" is missing. The daemon retries every 2 s | Create the virtual camera (step 5). [docs/setup/loopback.md](docs/setup/loopback.md#troubleshooting) has more |
-| `omarchy-broadcast` exits with status 3 | The daemon is not running, or there is no D-Bus session bus | Run `omarchy-broadcast start` or step 6, then `systemctl --user status omarchy-broadcastd` |
+| `omarchy-broadcast status` shows the state `error` | The v4l2loopback device labelled "Omarchy Broadcast" is missing. The daemon retries every 2 s | Create the virtual camera (step 4). [docs/setup/loopback.md](docs/setup/loopback.md#troubleshooting) has more |
+| `omarchy-broadcast` exits with status 3 | The daemon is not running, or there is no D-Bus session bus | Run `omarchy-broadcast start` or step 5, then `systemctl --user status omarchy-broadcastd` |
 | The AUR helper offers the previous version | The AUR's RPC index lags a few minutes after a release | Wait and try again |
-| The install of a Maxine module package fails while building `maxine-vfx-sdk-local` (or `-ar-`, `-afx-`), with `no Maxine VFX SDK found` (or `AR`, `AFX`) | The SDK package is not installed, so the AUR helper builds its recipe, which needs your own SDK download | Build and install it with [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) first (step 4) |
+| The install of a Maxine module package fails while building `maxine-vfx-sdk-local` (or `-ar-`, `-afx-`), with `no Maxine VFX SDK found` (or `AR`, `AFX`) | The SDK package is not installed, so the AUR helper builds its recipe, which needs your own SDK download | Build and install it with [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) first ([Add the NVIDIA effects](#add-the-nvidia-effects-optional-nvidia-rtx-gpu-only)) |
 | An old daemon keeps starting after you installed the package | A copy of the unit in `~/.config/systemd/user` shadows the packaged one | [docs/setup/daemon.md](docs/setup/daemon.md#which-unit-is-used) |
 
 More in the troubleshooting sections of the guides: [daemon](docs/setup/daemon.md#troubleshooting), [loopback](docs/setup/loopback.md#troubleshooting), [ONNX](docs/setup/onnx.md#8-troubleshooting), [Maxine](docs/setup/maxine.md#7-troubleshooting) and [microphone](docs/setup/microphone.md#troubleshooting).

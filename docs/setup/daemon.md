@@ -25,7 +25,7 @@ The install steps are in [INSTALL.md](../../INSTALL.md), and building from a che
 
 ## Start the daemon
 
-[Step 6 of INSTALL.md](../../INSTALL.md#steps) starts the daemon now and at every login.
+[Step 5 of INSTALL.md](../../INSTALL.md#steps) starts the daemon now and at every login.
 
 To start the daemon now without enabling it, use D-Bus activation: the `omarchy-broadcast start` command starts the service through its D-Bus activation file, if it is not running, and prints the status ([Check that it works](../../INSTALL.md#check-that-it-works)). It changes no state: the daemon restores what it saved and never turns the camera on by itself. The camera opens when an application uses it. The Arch package and the per-user install ship the activation file; the manual install has it as the optional step 4 ([Manual install](../building.md#manual-install)) ([dbus-api.md](../dbus-api.md#service-presence-and-activation)).
 
