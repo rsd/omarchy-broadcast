@@ -147,6 +147,25 @@ Without ONNX Runtime, or without any model file, the module still loads. `omarch
 
 ## 2. Install ONNX Runtime
 
+### Arch's packages or omarchy-onnxruntime
+
+Two package sets provide ONNX Runtime 1.29.0 with the same API, and the module works with either. They differ in the hardware they cover.
+
+- **Arch's packages** come from the official `extra` repository and make the smallest install. Each one is a complete build: `onnxruntime-cpu` (the CPU engine), `onnxruntime-cuda` and `onnxruntime-opt-cuda` (the CPU and CUDA engines; `-opt` is built with AVX2), and the ROCm builds. You install one of them.
+- **omarchy-onnxruntime** ([repository](https://github.com/rsd/omarchy-onnxruntime)) is one build split into one package per engine, so you install only the engines your hardware has. It covers more hardware: it adds TensorRT on NVIDIA GPUs, OpenVINO on an Intel CPU, GPU or NPU, and a CUDA 12 line for older NVIDIA GPUs (Pascal and Volta, untested on that hardware). Each engine's vendor runtime carries version bounds, so pacman refuses a system update that would break an engine instead of leaving one that fails to load. Prebuilt `-bin` packages are on its releases page. It depends on `nccl` even on a machine without an NVIDIA GPU.
+
+The two sets conflict, because both install `libonnxruntime.so`. Install one set per machine.
+
+| Your hardware | Take | Engines the module then uses |
+|---|---|---|
+| A CPU only | Arch: `onnxruntime-cpu` | CPU |
+| An NVIDIA GPU, the CUDA engine is enough | Arch: `onnxruntime-opt-cuda`, or omarchy-onnxruntime: `onnxruntime-core` and `onnxruntime-provider-cuda13-<preset>` | CUDA, CPU |
+| An NVIDIA GPU, with TensorRT | omarchy-onnxruntime: `onnxruntime-core`, `onnxruntime-provider-cuda13-<preset>` and `onnxruntime-provider-tensorrt-cuda13` | TensorRT, CUDA, CPU |
+| An Intel CPU, GPU or NPU | omarchy-onnxruntime: `onnxruntime-core` and `onnxruntime-provider-openvino` | OpenVINO (NPU, GPU, CPU), CPU |
+| An AMD GPU | Either set | CPU. The module has no AMD engine yet |
+
+The repository's [docs/choosing.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/choosing.md) compares the two sets in full, with sources.
+
 ### Recommended: `onnxruntime-core` and the provider packages you need
 
 The omarchy-onnxruntime repository, <https://github.com/rsd/omarchy-onnxruntime>, builds these packages from one build of ONNX Runtime 1.29.0, split into one package per engine:
@@ -163,7 +182,7 @@ Each provider is a library of its own beside `libonnxruntime.so`, loaded only wh
 
 Install `onnxruntime-core` and the providers for the hardware you have (a subset is fine) together in one `pacman -U`, after the vendor runtimes of those engines. The repository's [INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md) gives the procedure and the order of the steps.
 
-AMD GPUs have no engine at present. ONNX Runtime removed the ROCm provider in 1.23, and a MIGraphX provider package (`onnxruntime-provider-migraphx`) is planned.
+AMD GPUs have no engine in the module yet. Arch's ROCm builds and the omarchy-onnxruntime package `onnxruntime-provider-migraphx` (untested on AMD hardware) carry AMD providers, but the module does not use them. On an AMD machine it runs the CPU engine.
 
 The vendor runtimes of each engine are:
 
