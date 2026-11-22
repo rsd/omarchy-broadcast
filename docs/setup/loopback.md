@@ -6,43 +6,18 @@ The daemon finds the device by its **label**, `Omarchy Broadcast`, not by its `/
 
 ## Before you start
 
-- Root access (`sudo`).
-- A v4l2loopback kernel module, for example `v4l2loopback-dkms`. The Arch package depends on one.
+- A v4l2loopback kernel module. The Arch packages depend on one. On another distribution you supply it ([building.md](../building.md#before-you-start)).
 - No other `options v4l2loopback` line in `/etc/modprobe.d`. Only one such line takes effect. If you already have one, merge the two as in [Several devices](#several-devices).
 
 ## Single device
 
-1. Create `/etc/modprobe.d/omarchy-broadcast.conf` with this line:
+[Step 5 of INSTALL.md](../../INSTALL.md#steps) creates the device: it installs the line below as `/etc/modprobe.d/omarchy-broadcast.conf`, loads the module at boot with `/etc/modules-load.d/v4l2loopback.conf` and reloads the module. The Arch package ships the line as an example, `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`, and a checkout has it in `dist/modprobe.d/omarchy-broadcast.conf`:
 
-   ```text
-   options v4l2loopback devices=1 video_nr=10 card_label="Omarchy Broadcast" exclusive_caps=1 max_buffers=4
-   ```
+```text
+options v4l2loopback devices=1 video_nr=10 card_label="Omarchy Broadcast" exclusive_caps=1 max_buffers=4
+```
 
-   The Arch package ships the same line as an example, `/usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf`. Copy it instead of typing it:
-
-   ```sh
-   sudo install -Dm644 /usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf \
-       /etc/modprobe.d/omarchy-broadcast.conf
-   ```
-
-   From a checkout, the same line is in `dist/modprobe.d/omarchy-broadcast.conf`:
-
-   ```sh
-   sudo install -Dm644 dist/modprobe.d/omarchy-broadcast.conf /etc/modprobe.d/omarchy-broadcast.conf
-   ```
-
-2. Load the module at boot. For example, create `/etc/modules-load.d/v4l2loopback.conf` containing the line `v4l2loopback`:
-
-   ```sh
-   echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
-   ```
-
-3. Reload the module. This fails with "Module v4l2loopback is in use" while any application holds a loopback node, so check first and close those applications:
-
-   ```sh
-   fuser -v /dev/video10
-   sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
-   ```
+The reload fails with "Module v4l2loopback is in use" while any application holds a loopback node. Check first with `fuser -v /dev/video10` and close those applications.
 
 ## Several devices
 
@@ -58,19 +33,7 @@ options v4l2loopback devices=2 video_nr=10,11 card_label="First Device,Omarchy B
 
 ## Check that it works
 
-No root needed:
-
-```sh
-cat /sys/class/video4linux/video10/name
-```
-
-Expected output:
-
-```text
-Omarchy Broadcast
-```
-
-With the daemon running, `omarchy-broadcast status` shows the camera state ([daemon.md](daemon.md#check-that-it-works)).
+Step 5 of [INSTALL.md](../../INSTALL.md#steps) ends with the check, which needs no root: the name of the device is `Omarchy Broadcast`. With the daemon running, `omarchy-broadcast status` shows the camera state ([daemon.md](daemon.md#check-that-it-works)).
 
 ## Troubleshooting
 

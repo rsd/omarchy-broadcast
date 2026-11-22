@@ -7,14 +7,13 @@ The daemon owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus
 ## Before you start
 
 - The v4l2loopback device with the label "Omarchy Broadcast" and `exclusive_caps=1`, set up as in [loopback.md](loopback.md). The daemon finds the device by its label. Without it the daemon runs in the state `error` and retries every 2 s.
-- A systemd user session with a D-Bus session bus. This is the normal state of a desktop login.
-- Optional, for the GPU path and the Maxine modules: an NVIDIA GPU, the NVIDIA driver (`nvidia-utils`), CUDA (`cuda`, for NVRTC) and GStreamer's `nvcodec` plugin ([INSTALL.md, Requirements](../../INSTALL.md#requirements)). See [Without CUDA or without an NVIDIA GPU](#without-cuda-or-without-an-nvidia-gpu).
+- Optional, for the GPU path and the Maxine modules: an NVIDIA GPU with its driver (`nvidia-utils`). See [Without CUDA or without an NVIDIA GPU](#without-cuda-or-without-an-nvidia-gpu).
 
 ### Without CUDA or without an NVIDIA GPU
 
 Without an NVIDIA GPU you need nothing extra. The daemon runs the video in system memory ([onnx.md](onnx.md#using-it-on-a-machine-without-an-nvidia-gpu)).
 
-On a machine with an NVIDIA GPU, install `cuda` as well as `nvidia-utils` for the GPU path, because GStreamer's CUDA converters need NVRTC from `cuda`. Without it:
+On a machine with an NVIDIA GPU, the GPU path needs `cuda` as well as `nvidia-utils`, because GStreamer's CUDA converters open NVRTC, which `cuda` provides. You rarely install `cuda` by hand. The Maxine video and AR module packages depend on it (the SDK's bundled CUDA 12.8 does not supply NVRTC), and so does every ONNX Runtime package that has a GPU engine. A machine with an NVIDIA GPU and none of those runs without `cuda`, in system memory, and the ONNX module then runs on the CPU. Install `cuda` to use the GPU path. Without it:
 
 - The default `[video] memory = "auto"` runs the video in system memory. The log and the `video.memory` row say why: "the CUDA toolkit (NVRTC) is not installed; install `cuda` for the GPU path".
 - An explicit `memory = "cuda"` fails the camera start with that reason.
@@ -22,23 +21,13 @@ On a machine with an NVIDIA GPU, install `cuda` as well as `nvidia-utils` for th
 
 ## Install
 
-The install steps, the package choices and the install routes are in [INSTALL.md](../../INSTALL.md). Do them first, then return here to run and configure the daemon. The manual route ([Manual install](../../INSTALL.md#manual-install)) needs a rewritten `ExecStart=` in the unit file.
+The install steps are in [INSTALL.md](../../INSTALL.md), and building from a checkout is in [building.md](../building.md). Do them first, then return here to run and configure the daemon. The manual route ([Manual install](../building.md#manual-install)) needs a rewritten `ExecStart=` in the unit file.
 
 ## Start the daemon
 
-This command starts the daemon now and at every login. Each install route in [INSTALL.md](../../INSTALL.md) ends with it.
+[Step 6 of INSTALL.md](../../INSTALL.md#steps) starts the daemon now and at every login.
 
-```sh
-systemctl --user enable --now omarchy-broadcastd
-```
-
-To start the daemon now without enabling it, use D-Bus activation:
-
-```sh
-omarchy-broadcast start
-```
-
-This starts the service through its D-Bus activation file, if it is not running, and prints the status. It changes no state: the daemon restores what it saved and never turns the camera on by itself. The camera opens when an application uses it. The Arch package and the per-user install ship the activation file; the manual install has it as the optional step 3 ([INSTALL.md](../../INSTALL.md#manual-install)) ([dbus-api.md](../dbus-api.md#service-presence-and-activation)).
+To start the daemon now without enabling it, use D-Bus activation: the `omarchy-broadcast start` command starts the service through its D-Bus activation file, if it is not running, and prints the status ([Check that it works](../../INSTALL.md#check-that-it-works)). It changes no state: the daemon restores what it saved and never turns the camera on by itself. The camera opens when an application uses it. The Arch package and the per-user install ship the activation file; the manual install has it as the optional step 4 ([Manual install](../building.md#manual-install)) ([dbus-api.md](../dbus-api.md#service-presence-and-activation)).
 
 Which commands start the daemon:
 
@@ -47,12 +36,7 @@ Which commands start the daemon:
 
 ## Check that it works
 
-```sh
-systemctl --user status omarchy-broadcastd
-omarchy-broadcast status
-```
-
-The service should be `active (running)`, and `status` should print the state, the camera and the output mode. The service is ready (`Type=dbus`) once it owns its bus name. It requests the name after the loopback writer has started, so the virtual camera is already listed as a capture device at that point.
+[Check that it works in INSTALL.md](../../INSTALL.md#check-that-it-works) shows the commands and the output to expect: the service is `active (running)`, and `omarchy-broadcast status` prints the state, the camera and the output mode. The service is ready (`Type=dbus`) once it owns its bus name. It requests the name after the loopback writer has started, so the virtual camera is already listed as a capture device at that point.
 
 If `status` shows an `Error:` line, see Troubleshooting.
 
@@ -61,7 +45,7 @@ If `status` shows an `Error:` line, see Troubleshooting.
 | Symptom | Cause | Fix |
 |---|---|---|
 | The daemon is in the state `error` and retries every 2 s | The v4l2loopback device with the label "Omarchy Broadcast" is missing | Set it up as in [loopback.md](loopback.md) |
-| The service fails with status 203/EXEC | The unit names `/usr/bin/omarchy-broadcastd`, but the daemon is in `~/.cargo/bin` | Rewrite `ExecStart=` ([Manual install](../../INSTALL.md#manual-install), step 2) |
+| The service fails with status 203/EXEC | The unit names `/usr/bin/omarchy-broadcastd`, but the daemon is in `~/.cargo/bin` | Rewrite `ExecStart=` ([Manual install](../building.md#manual-install), step 3) |
 | An old daemon keeps starting after you installed the package | A copy of the unit in `~/.config/systemd/user` shadows the packaged one | See [Which unit is used](#which-unit-is-used) |
 | The unit is `failed` after repeated crashes | systemd's start limit: 5 starts within 60 s | Run `systemctl --user reset-failed omarchy-broadcastd`, then start it ([Restarts and crashes](#restarts-and-crashes)) |
 | The daemon exits with status 3 and is not restarted | Another instance already owns the bus name | Stop the other instance, then start the service |
@@ -97,13 +81,7 @@ systemctl --user cat omarchy-broadcastd
 
 ## Stop, disable, uninstall
 
-Stop and disable the service, on every install route:
-
-```sh
-systemctl --user disable --now omarchy-broadcastd
-```
-
-Removing the files depends on how you installed: see [Uninstall](../../INSTALL.md#uninstall).
+[Uninstall in INSTALL.md](../../INSTALL.md#uninstall) stops and disables the service, on every install route, and says how to remove the files. A build from a checkout is removed as [building.md](../building.md#uninstall-a-build-from-source) describes.
 
 ## Optional setup
 
@@ -131,7 +109,21 @@ Keep the `70-` prefix: the file name must sort before `73-seat-late.rules`, wher
 
 WirePlumber probes video devices when it starts. A loopback device that has no writer at that moment is recorded as output-only and not probed again. Applications that list cameras through PipeWire (the camera portal, OBS's PipeWire source, browsers using PipeWire) then do not show it. Two remedies:
 
-- Install the drop-in ([Manual install](../../INSTALL.md#manual-install), step 4). It starts WirePlumber after the daemon is ready. After installing it, reload the units and restart WirePlumber once for the current session:
+- Install the drop-in. It starts WirePlumber after the daemon is ready. The Arch package ships it as an inactive example, and does not install it. A checkout has the same file in `dist/`. The drop-in applies to every install route. Install it from the package's example:
+
+  ```sh
+  install -Dm644 /usr/share/doc/omarchy-broadcast/examples/systemd/wireplumber.service.d/omarchy-broadcast.conf \
+      ~/.config/systemd/user/wireplumber.service.d/omarchy-broadcast.conf
+  ```
+
+  Or from a checkout:
+
+  ```sh
+  install -Dm644 dist/systemd/wireplumber.service.d/omarchy-broadcast.conf \
+      ~/.config/systemd/user/wireplumber.service.d/omarchy-broadcast.conf
+  ```
+
+  After installing it, reload the units and restart WirePlumber once for the current session:
 
   ```sh
   systemctl --user daemon-reload
@@ -155,14 +147,12 @@ The daemon can also register a native PipeWire video source, "Omarchy Broadcast"
 
 It is off in two places: the daemon must be built with the cargo feature, and the configuration must enable it.
 
-**Build.** The Arch package is built with the feature. From source, build or install with it. It needs the libpipewire headers and clang at build time and links `libpipewire-0.3`:
+**Build.** The Arch package is built with the feature. From source, build or install with it. It needs the libpipewire headers and clang at build time and links `libpipewire-0.3`. The per-user script ([building.md](../building.md#per-user-install)) builds without it, so use the manual install ([building.md](../building.md#manual-install)) with the feature:
 
 ```sh
 cargo build --release --features omarchy-broadcastd/pipewire
 cargo install --path crates/omarchy-broadcastd --features pipewire
 ```
-
-`scripts/install-user.sh` builds without it.
 
 **Enable.** Add this to `~/.config/omarchy-broadcast/config.toml`:
 
@@ -307,6 +297,8 @@ A video background plays on every machine, but how depends on the GPU. With an N
 
 **What plays on the CPU.** A **VP9** video, **profile 0** (8-bit 4:2:0), in a **WebM or Matroska** file, of **at most 1920x1080** and **at most 30 frames a second**. The two loops that come with the package are such files. So is every animated GIF, WebP or APNG you import, because the daemon converts those to a WebM of this kind at import.
 
+**What runs `ffmpeg`.** The daemon runs it, at low priority, to import animated GIF, WebP and APNG files and to make the posters of imported videos ([dbus-api.md](../dbus-api.md#video-backgrounds-revision-18)). The two bundled loops need none of this.
+
 **What happens otherwise.** An H.264, HEVC or AV1 video, or a VP9 one that is larger or faster, is shown as its **poster, a still picture** (the first frame), behind you. `omarchy-broadcast status` shows why in its warning:
 
 ```text
@@ -327,7 +319,7 @@ omarchy-broadcast media convert-command ~/Videos/clip.mp4
 ffmpeg -nostdin -n -protocol_whitelist file -i '/home/user/Videos/clip.mp4' -map 0:v:0 -an -sn -dn -map_metadata -1 -vf 'scale=w=max(2\,trunc(min(1\,min(1920/iw\,1080/ih))*iw/2)*2):h=max(2\,trunc(min(1\,min(1920/iw\,1080/ih))*ih/2)*2),setsar=1' -fpsmax 30 -pix_fmt yuv420p -c:v libvpx-vp9 -profile:v 0 -deadline realtime -cpu-used 8 -row-mt 1 -crf 32 -b:v 8M -g 60 -force_key_frames 'expr:gte(t,n_forced*2)' -f webm '/home/user/Videos/omarchy-broadcast/clip-cpu.webm'
 ```
 
-Copy that line into a terminal and run it. It needs `ffmpeg` with `libvpx-vp9`. It makes a VP9 WebM that fits inside 1920x1080, at most 30 frames a second, without audio. The command refuses to overwrite a file (`-n`), and your original is not changed. To convert the same file twice, print the command again for a new output name.
+Copy that line into a terminal and run it. It runs `ffmpeg` with its `libvpx-vp9` encoder. It makes a VP9 WebM that fits inside 1920x1080, at most 30 frames a second, without audio. The command refuses to overwrite a file (`-n`), and your original is not changed. To convert the same file twice, print the command again for a new output name.
 
 **Where the result goes.** The output is written to `omarchy-broadcast` in your **Videos** folder, as `<name>-cpu.webm` (`clip-cpu.webm` above; `clip-cpu-2.webm` when that name is taken). It is listed with your other videos the next time the gallery is shown, and plays on the CPU when you choose it.
 
@@ -398,76 +390,3 @@ journalctl --user -u omarchy-broadcastd -f
 ```
 
 Add `-v` to `ExecStart` for debug output (consumer counts, teardown times). Exit status 3 means another instance already owns the bus name. systemd does not restart the service on that status.
-
-## Publishing to the AUR
-
-This part is for maintainers. The AUR holds two recipes of the split package ([Prebuilt or built from source](../../INSTALL.md#prebuilt-or-built-from-source)): the source one, pkgbase `omarchy-broadcast-git`, and the prebuilt one, pkgbase `omarchy-broadcast-bin` ([The prebuilt packages](#the-prebuilt-packages-omarchy-broadcast-bin)). This section covers the source one first.
-
-The AUR copy of `packaging/arch/PKGBUILD` differs from it only in where it builds from. It clones `https://github.com/rsd/omarchy-broadcast.git` instead of the local checkout, and its header comment says so. `scripts/aur.sh` makes that copy:
-
-- It replaces exactly the local-checkout header paragraph, the build hint and the `source=` line. It fails when one of them is not in the PKGBUILD exactly once. A change to one of those lines is made in the script too.
-- It generates the `.SRCINFO` with `LC_ALL=C makepkg --printsrcinfo` on the copy, alone in an empty directory, in an environment holding only `PATH` and an empty `HOME`.
-- It copies the install scriptlet, `packaging/arch/omarchy-broadcast.install`, unchanged. The scriptlet lies beside the copy when the `.SRCINFO` is generated, because makepkg checks that it exists.
-- The AUR repository holds exactly `PKGBUILD`, `.SRCINFO`, `omarchy-broadcast.install` and `LICENSE` (0BSD, written by the script too). `--aur` and `--check` refuse any other file in it.
-
-```sh
-scripts/aur.sh                  # prints the AUR PKGBUILD
-scripts/aur.sh --srcinfo        # prints its .SRCINFO
-scripts/aur.sh --check DIR      # fails, with a diff, when DIR's files are stale or DIR holds another file
-scripts/aur.sh --aur DIR        # writes PKGBUILD, .SRCINFO, omarchy-broadcast.install and LICENSE into DIR
-```
-
-`DIR` must be the top of a git clone of the AUR repository. The script commits nothing. The clone is kept in `aur/omarchy-broadcast-git`, which this repository ignores. To publish, after the release commit is pushed to GitHub:
-
-```sh
-git clone ssh://aur@aur.archlinux.org/omarchy-broadcast-git.git aur/omarchy-broadcast-git   # once
-scripts/aur.sh --aur aur/omarchy-broadcast-git
-cd aur/omarchy-broadcast-git
-git diff                        # review
-git add PKGBUILD .SRCINFO omarchy-broadcast.install LICENSE
-git commit -m '<version>-1'
-git push
-```
-
-The committed `pkgver=` is the release version. makepkg replaces it with the output of `pkgver()` (`<version>.r<commits>.g<hash>`), which sorts after it. A new AUR commit is needed only when the PKGBUILD changes (a dependency, a file installed, a new version in `pkgver=`), not for every commit of the repository.
-
-After a push, the AUR's web interface shows the new version at once. Its RPC index, which AUR helpers such as `yay` query, can take a few minutes to follow, so `yay` may still offer the previous version for a while. This needs no action.
-
-### The prebuilt packages (`omarchy-broadcast-bin`)
-
-The `-bin` recipe installs the files of a GitHub release, so you make and publish the release first. Each package of the split package has one asset, `<name>-<version>-x86_64.tar.zst`. It is the `usr/` tree of the `-git` package as it is, with its licence directory named `<name>-bin`. The recipe pins every asset by the sha256 in the release's `SHA256SUMS`. It has no `build()` and no build dependencies.
-
-`scripts/release-bin.sh [--nocheck] [--out DIR]` makes the assets:
-
-- It releases the commit `HEAD` names when it starts, and the workspace version of that commit. It refuses when the `pkgver=` of that commit's `packaging/arch/PKGBUILD` is another. It warns that uncommitted changes are not built.
-- It builds the five `-git` packages of that commit with `makepkg` in a scratch directory, without installing anything and without `-s`, so the build dependencies must be installed. `--nocheck` skips `check()`, the workspace test suite.
-- It writes the assets, `SHA256SUMS` and, in `pkg/`, the `-git` packages they were made of into the directory `--out` names. That directory must not exist or must be empty. The script has a default and prints the path when it is done. It writes into a temporary directory beside it and moves it into place only when the release is complete, so a failure leaves nothing behind.
-
-Before any asset is kept, the script runs a gate that keeps the NVIDIA SDKs and ONNX Runtime out of the release:
-
-- Every file of an asset must be one that the package is expected to hold. There is no other shared library, no model or engine file and no `models/` directory.
-- Every ELF file must need only the libraries on its own allowlist (the modules and the LADSPA plugin: only the C runtime) and define only its own dynamic symbols (a module: `obc_module_abi_version` and `obc_module_entry`).
-- The libraries must hold none of the strings that only SDK code linked in statically carries.
-
-A Maxine module that fails the gate is left out of the release, and the script says so. If the core or the ONNX module fails it, the script fails.
-
-The script does not publish anything. It prints, and does not run, the commands for the rest: tag the commit and push the tag, then `gh release create` with the assets and `SHA256SUMS`, then the update of the AUR repository. Run them in this order. The assets must be on the GitHub release before the push to the AUR, because the `-bin` sources download from it:
-
-1. Push the release commit to GitHub, then tag and push the tag.
-2. Create the release `v<version>` on GitHub with the assets and `SHA256SUMS`.
-3. Make the AUR recipe from the release directory, and review it:
-
-   ```sh
-   git clone ssh://aur@aur.archlinux.org/omarchy-broadcast-bin.git aur/omarchy-broadcast-bin   # once
-   scripts/aur.sh --bin RELEASE_DIR --aur aur/omarchy-broadcast-bin
-   scripts/aur.sh --bin RELEASE_DIR --check aur/omarchy-broadcast-bin
-   cd aur/omarchy-broadcast-bin
-   git diff                        # review
-   git add PKGBUILD .SRCINFO omarchy-broadcast.install LICENSE
-   git commit -m 'Update to <version>'
-   git push origin HEAD:master
-   ```
-
-`scripts/aur.sh --bin RELEASE_DIR` has no package data of its own. The description, licences, dependencies, optional dependencies, provides and conflicts come from the `.PKGINFO` of each `-git` package in `RELEASE_DIR/pkg`. Before it writes anything, it checks that every asset matches `SHA256SUMS` and holds the `usr/` tree of its `-git` package unchanged, apart from the licence directory name.
-
-The packages of the recipe are those of the assets `SHA256SUMS` lists, so a Maxine module left out of the release is left out of the recipe. `--srcinfo` prints the `.SRCINFO`, and `--check` and `--aur` behave as for the `-git` recipe. The AUR repository holds the same four files. A new AUR commit is needed for every release, since `pkgver=` is the release version.

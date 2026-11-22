@@ -25,9 +25,7 @@ Both create a source with the same name, so they exclude each other. Each unit d
 
 ## Before you start
 
-- PipeWire with WirePlumber 0.5 (the default on Omarchy).
-- A systemd user session.
-- For the CPU module: nothing else. DeepFilterNet and RNNoise are built into it, with no model files and no LADSPA package.
+- For the CPU module: nothing. DeepFilterNet and RNNoise are built into it, with no model files and no LADSPA package.
 - Optional, for the GPU module: an NVIDIA RTX GPU and the Maxine Audio Effects SDK, as the `maxine-afx-sdk-local` package ([On an NVIDIA GPU](#on-an-nvidia-gpu-maxine-audio-effects)).
 
 ## Install
@@ -43,7 +41,7 @@ The package installs:
 - the worker, `/usr/bin/omarchy-broadcast-audiod`, with its units `omarchy-broadcast-audiod.service` and `omarchy-broadcast-audiod.socket` and the D-Bus activation file `br.com.dias.OmarchyBroadcast.AudioWorker.service`.
 - the CPU voice module, with its manifest, in `/usr/lib/omarchy-broadcast/modules` and `modules.d`, and the third-party licence notices.
 
-The Maxine audio effects module is a package of its own from the same build, `omarchy-broadcast-maxine-afx-git`. It depends on the module ABI that the core provides and on `maxine-afx-sdk-local`. The packages never contain the SDK. Install the module package with the core to get the GPU module. You need no drop-in: the worker applies the SDK package's environment to itself ([below](#the-workers-sdk-environment)).
+The Maxine audio effects module is a package of its own from the same build, `omarchy-broadcast-maxine-afx-bin` (prebuilt) or `omarchy-broadcast-maxine-afx-git` (built on your machine). It depends on the module ABI that the core provides and on `maxine-afx-sdk-local`. The packages never contain the SDK. Install the module package with the core to get the GPU module. You need no drop-in: the worker applies the SDK package's environment to itself ([below](#the-workers-sdk-environment)).
 
 Building the package fetches the DeepFilterNet source from its upstream repository (a git dependency pinned by commit), so `makepkg` needs network access.
 
@@ -55,7 +53,7 @@ From the repository root, run:
 scripts/install-user.sh --audio
 ```
 
-It builds and installs the same parts without root, under `~/.local` ([INSTALL.md](../../INSTALL.md#per-user-install-from-a-checkout)):
+It builds and installs the same parts without root, under `~/.local` ([building.md](../building.md#per-user-install)):
 
 - the worker in `${XDG_BIN_HOME:-~/.local/bin}`;
 - the plugin, the mic host's configuration (with the plugin's absolute path), and the library and manifest of the CPU module and of the Maxine audio effects module (which loads without the SDK), under `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/`;
@@ -109,6 +107,8 @@ Consumers:  1
 Provider:   mic-denoise: br.com.dias.voice-cpu
 Latency:    40.0 ms
 ```
+
+With the Maxine audio effects module, the `Provider:` line names `br.com.dias.maxine-afx` for the stages it runs, for example `Provider:   mic-denoise: br.com.dias.maxine-afx`. It has one `<stage>: <module>` clause for each stage that runs.
 
 The states:
 
@@ -260,7 +260,7 @@ On a machine with an NVIDIA RTX GPU, the microphone can run the NVIDIA Maxine Au
 
 Speaker focus and headset bandwidth restoration need an extra download ([described below](#optional-features-speaker-focus-and-headset-bandwidth)).
 
-NVIDIA licenses the SDK, and omarchy-broadcast never distributes it. You download it with your own NVIDIA account. The sibling project omarchy-nvidia-sdks packages it for Arch as `maxine-afx-sdk-local`. The Arch package `omarchy-broadcast-maxine-afx-git` (which depends on `maxine-afx-sdk-local`) and `install-user.sh --audio` install the module.
+NVIDIA licenses the SDK, and omarchy-broadcast never distributes it. You download it with your own NVIDIA account. The sibling project omarchy-nvidia-sdks packages it for Arch as `maxine-afx-sdk-local`. The Arch package `omarchy-broadcast-maxine-afx-bin` or `omarchy-broadcast-maxine-afx-git` (both depend on `maxine-afx-sdk-local`) and `install-user.sh --audio` install the module.
 
 The module opens the SDK only at run time, so everything above works without the SDK, on any machine. The CPU module keeps the microphone going, and the Maxine stages are listed as unavailable, with the reason. The SDK's licence terms and the compatibility shim are described for the video SDK in [maxine.md](maxine.md#9-licence-and-support). They apply to this one too.
 
@@ -326,13 +326,7 @@ For an SDK unpacked by hand:
    systemctl --user daemon-reload
    ```
 
-The `LD_LIBRARY_PATH` line is the required one. Add `features/speaker_focus/lib` and `features/superres/lib` when you installed those features. The shim and the replacement `os-release` come from the omarchy-nvidia-sdks repository. In a checkout of it, build the shim:
-
-```sh
-make -C tools/os-release-shim
-```
-
-Take `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-afx/`. The worker sees a library named `os-release-shim.so` loaded in its own process, from whatever directory, and applies nothing from a package.
+The `LD_LIBRARY_PATH` line is the required one. Add `features/speaker_focus/lib` and `features/superres/lib` when you installed those features. The shim and the replacement `os-release` come from the omarchy-nvidia-sdks repository, whose `docs/usage.md` describes how to build the shim and where the replacement `os-release` file is. Put both in `~/.local/lib/maxine-afx/`. The worker sees a library named `os-release-shim.so` loaded in its own process, from whatever directory, and applies nothing from a package.
 
 ### Where the SDK is
 
@@ -373,30 +367,16 @@ Until a feature's library and models are installed, the Mic tab shows its switch
 
 To install them:
 
-1. From the SDK's `features` directory, run NVIDIA's `download_features.sh` with your NGC API key in the `NGC_API_KEY` environment variable. Download into a directory of your own, then copy the result into the SDK:
-
-   ```sh
-   cd /opt/nvidia/maxine/afx/features
-   NGC_API_KEY=<your NGC key> ./download_features.sh -o ~/maxine-afx-extra --effects speaker_focus-48k,superres-16k_to_48k
-   sudo cp -a ~/maxine-afx-extra/speaker_focus ~/maxine-afx-extra/superres /opt/nvidia/maxine/afx/features/
-   ```
-
-   - Run it from the `features` directory: the script then detects your GPU's compute capability itself. Its `--gpu` option lists only data-centre and workstation GPUs, so leave it out.
-   - `-o` downloads into a directory of your own, so the key is never used under `sudo`. Only the copy into `/opt` needs it.
-   - Take only the effects you want: list `speaker_focus-48k` or `superres-16k_to_48k` alone if you need only one, and copy only that directory.
+1. Download the two features and build `maxine-afx-sdk-local` with them. [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) owns this step: its [Audio Effects section of docs/download.md](https://github.com/rsd/omarchy-nvidia-sdks/blob/main/docs/download.md#maxine-audio-effects-sdk) shows the download with your own NGC access and how to take only some effects. Ask it for `speaker_focus-48k` (speaker focus) and `superres-16k_to_48k` (headset bandwidth), or only the one you need.
 2. Check that the files are in the SDK root the module uses. For speaker focus, that is `features/speaker_focus/lib` and `features/speaker_focus/models/sm_<NN>`. For headset bandwidth, it is `features/superres/lib` and `features/superres/models/sm_<NN>`. `<NN>` is your GPU's compute capability.
-3. Put each feature's library directory on the audio worker's library search path. The `maxine-afx-sdk-local` package's environment file lists them from its next release, so with the package you need nothing more. With an SDK tree of your own, add `features/speaker_focus/lib` and `features/superres/lib` to the `LD_LIBRARY_PATH` line of your [drop-in](#an-sdk-tree-without-the-package).
+3. Put each feature's library directory on the audio worker's library search path. The environment file of the `maxine-afx-sdk-local` package lists them from release 3.0.0.12-2 (pkgrel 2) on, so with that release or a later one you need nothing more. With an SDK tree of your own, add `features/speaker_focus/lib` and `features/superres/lib` to the `LD_LIBRARY_PATH` line of your [drop-in](#an-sdk-tree-without-the-package).
 4. Restart the worker:
 
    ```sh
    systemctl --user try-restart omarchy-broadcast-audiod.service
    ```
 
-The layout above follows NVIDIA's download and has not yet been verified against a real installation. If a switch stays greyed after the steps, this command shows the stage's current reason:
-
-```sh
-omarchy-broadcast modules
-```
+The layout above follows NVIDIA's download and has not yet been verified against a real installation. If a switch stays greyed after the steps, `omarchy-broadcast modules` shows the stage's current reason ([the output is described in INSTALL.md](../../INSTALL.md#check-that-it-works)).
 
 ### Studio voice excludes noise and echo removal
 
@@ -481,7 +461,7 @@ journalctl --user -u omarchy-broadcastd                                # the dae
 | The voice sounds clipped or pumping | The reduction is too strong | Lower `mic.noise.strength`, or use the other engine |
 | High CPU while recording | DeepFilterNet is the heavier engine | `settings set mic.cpu.engine rnnoise`, or lower the load another way |
 | A module is `disabled` | It crashed the worker twice in a row | Read the worker's log, then `omarchy-broadcast modules enable ID` |
-| The GPU stages say the worker's `LD_LIBRARY_PATH` does not name the Maxine feature libraries | The worker runs without the SDK's environment (`maxine-afx-sdk-local` is not installed, was installed after the worker started, or `OBC_NO_SDK_ENV` is set), or with a `LD_LIBRARY_PATH` of your own that leads to another root than the one in use | Install `omarchy-broadcast-maxine-afx-git` and the SDK package, then `systemctl --user try-restart omarchy-broadcast-audiod.service`. The worker's log has `SDK environment applied from /usr/share/maxine-afx/maxine-afx.env` ([above](#the-workers-sdk-environment)). The CPU module keeps working meanwhile |
+| The GPU stages say the worker's `LD_LIBRARY_PATH` does not name the Maxine feature libraries | The worker runs without the SDK's environment (`maxine-afx-sdk-local` is not installed, was installed after the worker started, or `OBC_NO_SDK_ENV` is set), or with a `LD_LIBRARY_PATH` of your own that leads to another root than the one in use | Install `omarchy-broadcast-maxine-afx-bin` (or `-git`) and the SDK package, then `systemctl --user try-restart omarchy-broadcast-audiod.service`. The worker's log has `SDK environment applied from /usr/share/maxine-afx/maxine-afx.env` ([above](#the-workers-sdk-environment)). The CPU module keeps working meanwhile |
 | The GPU stages say `Maxine Audio Effects SDK not installed` | No SDK root was found, or it lacks the core library | Install `maxine-afx-sdk-local`, or set `sdk_root` or `MAXINE_AFX_ROOT` ([Where the SDK is](#where-the-sdk-is)) |
 | `Maxine ... not installed`, or `No ... models for this GPU` | The package was built without that effect, or without models for your GPU architecture | Rebuild `maxine-afx-sdk-local` with the effect for your architecture and reinstall it. `omarchy-broadcast modules info br.com.dias.maxine-afx` shows each stage's reason |
 | `NVIDIA driver not loaded` | The probe found no NVIDIA driver (`/proc/driver/nvidia` is missing) | Load the NVIDIA driver. The CPU module is used meanwhile |
@@ -504,23 +484,17 @@ systemctl --user disable --now omarchy-broadcast-mic.service
 
 Then remove the files according to the route:
 
-- Arch package: removing it removes the daemon too (`omarchy-broadcast-bin` for the prebuilt package). You cannot remove the microphone files alone. Leaving the unit disabled is enough.
+- Arch package: removing it removes the daemon too ([Uninstall in INSTALL.md](../../INSTALL.md#uninstall)). You cannot remove the microphone files alone. Leaving the unit disabled is enough.
 
-  ```sh
-  sudo pacman -R omarchy-broadcast-git
-  ```
-
-- `install-user.sh --audio`:
-
-  ```sh
-  scripts/install-user.sh --uninstall
-  ```
+- `install-user.sh --audio`: run the script's `--uninstall` option ([building.md](../building.md#uninstall-a-build-from-source)).
 
 Remove the Maxine module package and then the SDK package with the command below, only if nothing else uses the SDK. The worker then starts without it.
 
 ```sh
-sudo pacman -R omarchy-broadcast-maxine-afx-git maxine-afx-sdk-local
+sudo pacman -R omarchy-broadcast-maxine-afx-bin maxine-afx-sdk-local
 ```
+
+Use `omarchy-broadcast-maxine-afx-git` in place of `-bin` if you installed the source kind.
 
 A drop-in copied for an earlier version, `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf`, is not needed any more. Remove it and reload systemd:
 
@@ -584,8 +558,6 @@ The configuration files and the unit are in the repository's `dist/` directory (
 
 ## Before you start with the units
 
-- PipeWire with WirePlumber 0.5 (the default on Omarchy).
-- A systemd user session.
 - At least one LADSPA plugin package. The Arch package lists both as optional dependencies.
 
 ```sh
@@ -617,7 +589,7 @@ From the repository root, run:
 scripts/install-user.sh --mic
 ```
 
-It also installs, without root (see [INSTALL.md](../../INSTALL.md#per-user-install-from-a-checkout)):
+It also installs, without root (see [building.md](../building.md#per-user-install)):
 
 - the configurations in `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/pipewire/`;
 - the unit as `${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-mic@.service`, with `ExecStart=` pointing at that absolute configuration path.
@@ -755,17 +727,9 @@ systemctl --user disable --now omarchy-broadcast-mic@rnnoise.service omarchy-bro
 
 Then remove the files, according to the route:
 
-- Arch package: removing it removes the daemon too. You cannot remove the microphone files alone. Leaving the instances disabled is enough.
+- Arch package: removing it removes the daemon too ([Uninstall in INSTALL.md](../../INSTALL.md#uninstall)). You cannot remove the microphone files alone. Leaving the instances disabled is enough.
 
-  ```sh
-  sudo pacman -R omarchy-broadcast-git
-  ```
-
-- `install-user.sh --mic`:
-
-  ```sh
-  scripts/install-user.sh --uninstall
-  ```
+- `install-user.sh --mic`: run the script's `--uninstall` option ([building.md](../building.md#uninstall-a-build-from-source)).
 
 - Manual install:
 

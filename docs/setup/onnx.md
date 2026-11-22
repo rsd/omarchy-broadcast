@@ -8,17 +8,7 @@ This page covers how to install the module, its runtime and its models, how to c
 
 ## Quick start
 
-On a machine without an NVIDIA GPU, install the CPU runtime and the module, restart the daemon and check the module:
-
-```bash
-yay -S onnxruntime-cpu omarchy-broadcast-onnx-git
-systemctl --user restart omarchy-broadcastd
-omarchy-broadcast modules
-```
-
-`omarchy-broadcast-onnx-bin` is the prebuilt twin of `omarchy-broadcast-onnx-git` and works with either kind of core ([INSTALL.md](../../INSTALL.md#prebuilt-or-built-from-source)). The module package pulls in the default model. The `modules` output lists the module with its stage `background`, or with the reason it cannot run.
-
-On an NVIDIA GPU, or for an Intel NPU or GPU, install the runtime and provider packages of sections 1 and 2 instead of `onnxruntime-cpu`.
+The module needs ONNX Runtime 1.29 or later (section 2). Install it, then the module package ([INSTALL.md](../../INSTALL.md#steps)), which brings the default model. If the daemon is already running, restart it. Check the module and the engine as under [Check the install](#check-the-install).
 
 ## Using it on a machine without an NVIDIA GPU
 
@@ -26,13 +16,7 @@ The module needs no NVIDIA GPU, and neither does the daemon's effect path. When 
 
 ### Install
 
-Install an ONNX Runtime build, the module and the models (section 3). `onnxruntime-cpu` or `onnxruntime-core` is enough. The omarchy-onnxruntime provider packages add the Intel and NVIDIA engines (section 2).
-
-```bash
-yay -S onnxruntime-cpu omarchy-broadcast-onnx-git
-```
-
-Install `onnxruntime-cpu` first, as above, or pick it when yay asks which provider of `onnxruntime` to install. The module depends on `onnxruntime>=1.29`, which several packages provide. The AUR's `onnxruntime-core` builds with CUDA, cuDNN, OpenVINO and TensorRT. That build is much larger than a machine without an NVIDIA GPU needs. `onnxruntime-cpu`, from the Arch repositories, is the CPU engine only.
+Install ONNX Runtime (section 2), the module and the models (section 3). The module needs no CUDA.
 
 ### What the daemon decides
 
@@ -110,7 +94,7 @@ omarchy-broadcast config show | grep -A1 battery_saver     # "Now: active, on ba
 
 ### The cost on the CPU
 
-Measured on the reference machine: an Intel Core Ultra 9 275HX laptop, the CPU build of ONNX Runtime 1.31.1, the default MediaPipe model and the module's default of 4 threads. An application read the virtual camera at 30 fps with the blur on.
+Measured on the reference machine: an Intel Core Ultra 9 275HX laptop, the CPU build of ONNX Runtime 1.31.1 (a newer version than the 1.29.0 packages, so the figures are not those of a 1.29.0 build), the default MediaPipe model and the module's default of 4 threads. An application read the virtual camera at 30 fps with the blur on.
 
 | Camera, output | Daemon CPU, blur (effect off) | Effect, per processed frame |
 |---|---|---|
@@ -138,8 +122,8 @@ The privacy rules are the same as with CUDA:
 
 | Item | Requirement |
 |---|---|
-| The module | Installed from the package `omarchy-broadcast-onnx-git` (or its prebuilt twin `omarchy-broadcast-onnx-bin`), or by `scripts/install-user.sh` (section 3) |
-| ONNX Runtime | `libonnxruntime.so`, version 1.29 or newer. With no NVIDIA GPU: `onnxruntime-cpu` (see above). Otherwise recommended: `onnxruntime-core` plus the provider packages of the engines you use (CUDA, TensorRT, OpenVINO), from omarchy-onnxruntime. `onnxruntime-cpu` and `onnxruntime-opt-cuda` also work (section 2) |
+| The module | Installed from the package `omarchy-broadcast-onnx-bin` (or its source twin `omarchy-broadcast-onnx-git`) as [INSTALL.md](../../INSTALL.md#steps) describes, or by `scripts/install-user.sh` (section 3) |
+| ONNX Runtime | `libonnxruntime.so`, version 1.29 or newer (section 2) |
 | The models | One package per model, `omarchy-onnx-model-<id>`, or the `.onnx` files in one of the directories of section 3. A single file is enough to use that model |
 | An NVIDIA GPU | Not needed. The CPU engine runs the model, and the daemon runs the effect path in system memory when it finds no usable CUDA (see above). An NVIDIA GPU adds the TensorRT and CUDA engines. An Intel CPU, GPU or NPU adds the OpenVINO engines, with a runtime that has them |
 
@@ -147,65 +131,11 @@ Without ONNX Runtime, or without any model file, the module still loads. `omarch
 
 ## 2. Install ONNX Runtime
 
-### Arch's packages or omarchy-onnxruntime
+The module needs ONNX Runtime 1.29 or later: a `libonnxruntime.so` with the C API of that version. The module package depends on `onnxruntime>=1.29`, and any package that provides it satisfies the module.
 
-Two package sets provide ONNX Runtime 1.29.0 with the same API, and the module works with either. They differ in the hardware they cover.
+Any package that provides `onnxruntime` 1.29 or later satisfies the module, a CPU-only one included, and the package decides which engines the module can use. The choice is made in [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime): [step 1 of its INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md#1-choose-your-packages) is the table of hardware and packages and says which vendor runtimes each engine needs, and its [docs/choosing.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/choosing.md) compares that set with Arch's `onnxruntime-*` packages. This guide does not repeat them. Its [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/engines.md) describes each engine and what it needs. After you install a package, check it as [Check the install](#check-the-install) describes: the reasons in section 5 say what an engine is missing.
 
-- **Arch's packages** come from the official `extra` repository and make the smallest install. Each one is a complete build: `onnxruntime-cpu` (the CPU engine), `onnxruntime-cuda` and `onnxruntime-opt-cuda` (the CPU and CUDA engines; `-opt` is built with AVX2), and the ROCm builds. You install one of them.
-- **omarchy-onnxruntime** ([repository](https://github.com/rsd/omarchy-onnxruntime)) is one build split into one package per engine, so you install only the engines your hardware has. It covers more hardware: it adds TensorRT on NVIDIA GPUs, OpenVINO on an Intel CPU, GPU or NPU, and a CUDA 12 line for older NVIDIA GPUs (Pascal and Volta, untested on that hardware). Each engine's vendor runtime carries version bounds, so pacman refuses a system update that would break an engine instead of leaving one that fails to load. Prebuilt `-bin` packages are on its releases page. It depends on `nccl` even on a machine without an NVIDIA GPU.
-
-The two sets conflict, because both install `libonnxruntime.so`. Install one set per machine.
-
-| Your hardware | Take | Engines the module then uses |
-|---|---|---|
-| A CPU only | Arch: `onnxruntime-cpu` | CPU |
-| An NVIDIA GPU, the CUDA engine is enough | Arch: `onnxruntime-opt-cuda`, or omarchy-onnxruntime: `onnxruntime-core` and `onnxruntime-provider-cuda13-<preset>` | CUDA, CPU |
-| An NVIDIA GPU, with TensorRT | omarchy-onnxruntime: `onnxruntime-core`, `onnxruntime-provider-cuda13-<preset>` and `onnxruntime-provider-tensorrt-cuda13` | TensorRT, CUDA, CPU |
-| An Intel CPU, GPU or NPU | omarchy-onnxruntime: `onnxruntime-core` and `onnxruntime-provider-openvino` | OpenVINO (NPU, GPU, CPU), CPU |
-| An AMD GPU | Either set | CPU. The module has no AMD engine yet |
-
-The repository's [docs/choosing.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/choosing.md) compares the two sets in full, with sources.
-
-### Recommended: `onnxruntime-core` and the provider packages you need
-
-The omarchy-onnxruntime repository, <https://github.com/rsd/omarchy-onnxruntime>, builds these packages from one build of ONNX Runtime 1.29.0, split into one package per engine:
-
-| Package | Engine |
-|---|---|
-| `onnxruntime-core` | `libonnxruntime.so` with the CPU engine. It works on its own. Replaces and conflicts with the earlier single package `onnxruntime-full` |
-| `onnxruntime-provider-cuda13-<preset>` (preset `rtx`, the default, for Turing to Blackwell; or `sm120`, `all` or a list of architectures) | The CUDA engine. Needs `cuda`, `cudnn` and `nvidia-utils` |
-| `onnxruntime-provider-tensorrt-cuda13` | The TensorRT engine. Needs the CUDA provider and `tensorrt` |
-| `onnxruntime-provider-openvino` | The OpenVINO engines (Intel CPU, GPU and NPU). Needs `openvino` |
-| `python-onnxruntime-core` | The Python module (the module does not use it) |
-
-Each provider is a library of its own beside `libonnxruntime.so`, loaded only when it is asked for. A provider that is not installed, or whose vendor runtime is missing, disables that engine and nothing else.
-
-Install `onnxruntime-core` and the providers for the hardware you have (a subset is fine) together in one `pacman -U`, after the vendor runtimes of those engines. The repository's [INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md) gives the procedure and the order of the steps.
-
-AMD GPUs have no engine in the module yet. Arch's ROCm builds and the omarchy-onnxruntime package `onnxruntime-provider-migraphx` (untested on AMD hardware) carry AMD providers, but the module does not use them. On an AMD machine it runs the CPU engine.
-
-The vendor runtimes of each engine are:
-
-| Engine | Packages |
-|---|---|
-| NVIDIA CUDA | `cuda`, `cudnn`, `nvidia-utils` |
-| NVIDIA TensorRT | TensorRT 11, as the package `tensorrt`: the AUR's `tensorrt` (under `/usr`) or `nvidia-tensorrt-sdk-local` from omarchy-nvidia-sdks (under `/opt/nvidia/tensorrt`, visible to every program from its pkgrel 4); see "TensorRT's library path" below |
-| OpenVINO, Intel CPU | `openvino` |
-| OpenVINO, Intel GPU | `openvino-intel-gpu-plugin`, `intel-compute-runtime`, and an Intel GPU present in the running system (on a laptop with a GPU switch, hybrid mode rather than discrete-only) |
-| OpenVINO, Intel NPU | `openvino-intel-npu-plugin`, `intel-npu-driver`, `level-zero-loader`, and access to `/dev/accel/accel0` (normally through the `render` group) |
-
-The repository's [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/engines.md) describes each engine and what it needs. Its [docs/results.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/results.md) has raw-model figures of four models on six targets.
-
-### Alternatives
-
-Any other package that provides `onnxruntime` 1.29 or newer works with the module. With no NVIDIA GPU, take `onnxruntime-cpu`, which the install command [above](#using-it-on-a-machine-without-an-nvidia-gpu) also uses:
-
-```bash
-sudo pacman -S onnxruntime-opt-cuda   # an NVIDIA GPU: the CPU and the CUDA engines
-sudo pacman -S onnxruntime-cpu        # anything else: the CPU engine only
-```
-
-The CUDA provider of `onnxruntime-opt-cuda` also needs cuDNN (the `cudnn` package) and the NVIDIA driver's CUDA library. A missing `libcudnn.so.9` shows as a reason (section 5). The Arch packages ship the CPU, CUDA and ROCm providers. The module has no ROCm engine, and these builds have no TensorRT or OpenVINO engine.
+AMD GPUs have no engine in the module yet. On an AMD machine it runs the CPU engine.
 
 ### Which engines you get
 
@@ -275,35 +205,19 @@ systemctl --user restart omarchy-broadcastd
 
 ### From the AUR or the Arch package
 
-With an AUR helper, install `omarchy-broadcast-onnx-git`, or `omarchy-broadcast-onnx-bin`, the prebuilt package with the same files. Either works with the core of either kind ([INSTALL.md](../../INSTALL.md#prebuilt-or-built-from-source)). With no NVIDIA GPU, install it together with the CPU runtime ([above](#using-it-on-a-machine-without-an-nvidia-gpu)):
-
-```bash
-yay -S onnxruntime-cpu omarchy-broadcast-onnx-git
-```
+[INSTALL.md](../../INSTALL.md#steps) installs the module package, `omarchy-broadcast-onnx-bin` or its source twin `omarchy-broadcast-onnx-git`. Either works with the core of either kind.
 
 The module is one package of the split build of `packaging/arch/PKGBUILD`, built with the core `omarchy-broadcast-git` and the other module packages. It depends on:
 
 - the module ABI that the core provides (`omarchy-broadcast-module-abi>=1.6` and `<2`, [../modules.md](../modules.md#packaging-a-module));
-- `onnxruntime>=1.29`, which any variant of section 2 satisfies;
+- `onnxruntime>=1.29`, which a package of section 2 provides;
 - the package of the default model, `omarchy-onnx-model-mediapipe-landscape`.
 
-It installs the library and the manifest under `/usr/lib/omarchy-broadcast/`. It is a separate package because the ONNX Runtime variants conflict with one another: the core must not pull one in. Its optional dependencies are the other model packages and the engines, as the virtual names `onnxruntime-provider-cuda`, `onnxruntime-provider-tensorrt` and `onnxruntime-provider-openvino` (section 2).
+It installs the library and the manifest under `/usr/lib/omarchy-broadcast/`. It is a separate package because the ONNX Runtime variants conflict with one another: the core must not pull one in. Its optional dependencies are the other model packages and the ONNX Runtime engine packages.
 
 ### The model packages
 
-The models are packages of their own, one per model, from the [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models) repository (`packaging/arch/PKGBUILD` there). The name is `omarchy-onnx-model-<id>`, with the model's id from the table below. The version is that of the repository's release: 1.0.0, from the `v1.0.0` release assets, each checked against the release's SHA-256 at build time.
-
-Each package installs its one `.onnx` file in `/usr/share/omarchy-onnx-models/`, with that model's licence and notice in `/usr/share/licenses/omarchy-onnx-model-<id>/`. The models are kept apart from the module for two reasons:
-
-- the four files are about 70 MB, which a `-git` rebuild of the module would otherwise download again each time;
-- each model has its own licence terms.
-
-The default model's package is a dependency of the module. Install the others when you want to choose them:
-
-```bash
-sudo pacman -U omarchy-onnx-model-mediapipe-landscape-*.pkg.tar.zst   # the default
-sudo pacman -U omarchy-onnx-model-modnet-*.pkg.tar.zst                  # optional
-```
+The models are packages of their own, one per model, from the [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models) repository. The name is `omarchy-onnx-model-<id>`, with the model's id from the table below. Each package installs its one `.onnx` file in `/usr/share/omarchy-onnx-models/`. The module's package depends on the default model's package, so you install the others only when you want to choose them. That repository's [INSTALL.md](https://github.com/rsd/omarchy-onnx-models/blob/main/INSTALL.md) installs them.
 
 ### From a checkout
 
@@ -342,14 +256,13 @@ The models are the project's own conversions to ONNX of the upstream releases, w
 
 ### Check the install
 
-Restart the daemon, then list the modules:
+If the daemon is already running, restart it so that it reads the new module:
 
 ```bash
 systemctl --user restart omarchy-broadcastd
-omarchy-broadcast modules
 ```
 
-The module is listed with its stage `background`, or with the reason it cannot run.
+[Check that it works in INSTALL.md](../../INSTALL.md#check-that-it-works) lists the modules and shows the engine the cut-out runs on. The module is listed with its stage `background`, or with the reason it cannot run. The log line `ONNX cut-out: <model> runs on <engine>` names the engine, and section 5 reads the reasons for the others.
 
 ## 4. Choose the module, the model and the engine
 
@@ -477,7 +390,7 @@ The module writes one line per engine to the daemon's log (`journalctl --user -u
 
 | Reason | Means |
 |---|---|
-| `not in this ONNX Runtime build (no libonnxruntime_providers_<x>.so beside ...)` | The loaded library has no such provider, or its provider library is not next to `libonnxruntime.so`. The engine is not tried: `auto` skips it, and a chosen engine falls back to a later one with this reason in the notice. Install the provider package for the engine (the message names it) or a build that has it (section 2) |
+| `not in this ONNX Runtime build (no libonnxruntime_providers_<x>.so beside ...)` | The loaded library has no such provider, or its provider library is not next to `libonnxruntime.so`. The engine is not tried: `auto` skips it, and a chosen engine falls back to a later one with this reason in the notice. Install the provider package for the engine (the message names it), as omarchy-onnxruntime describes (section 2) |
 | `CUDA not available: ...` | The CUDA provider is there; the GPU or its libraries are not. The CUDA error follows, for example `no CUDA-capable device is detected`, or a missing `libcudnn.so.9` |
 | `TensorRT not available: TensorRT's libraries are not on the daemon's library path (... not found; add TensorRT's lib directory to LD_LIBRARY_PATH)` | TensorRT's builder library cannot be found by name. TensorRT is not started (it would crash the process), `auto` moves on to CUDA, and a chosen `tensorrt` falls back to CUDA (or a later engine) with a notice. Add TensorRT's directory for the daemon (section 2, "TensorRT's library path") |
 | `TensorRT not available: TensorRT <ver> has no builder library for this GPU (sm<NN>)` | TensorRT's libraries are found, but the installed TensorRT ships no builder library for this GPU's architecture. Use a TensorRT version that supports the GPU, or another engine |
@@ -523,21 +436,21 @@ The NVIDIA GPU then stays asleep under `openvino-gpu`. The log says whether the 
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `modules` lists the stage `unavailable: ONNX Runtime not installed (libonnxruntime.so not found)` | No `libonnxruntime.so` where the module looks | Install a package of section 2, or set `ORT_DYLIB_PATH` in the daemon's environment or `ort_library` in the module's table, then restart the daemon |
+| `modules` lists the stage `unavailable: ONNX Runtime not installed (libonnxruntime.so not found)` | No `libonnxruntime.so` where the module looks | Install ONNX Runtime (section 2), or set `ORT_DYLIB_PATH` in the daemon's environment or `ort_library` in the module's table, then restart the daemon |
 | `unavailable: No cut-out model installed (searched: ...)` | No model file in the directories listed | Install the models (section 3). The message names the directories searched |
 | A model fails to load with a checksum or file error | The file is not the catalogue's: a different conversion, a truncated copy | Use the files that the package or the checkout's scripts produce. Their checksums are in the module's README |
-| The model runs on the CPU although you have an NVIDIA GPU | `auto` found nothing better: the installed build is `onnxruntime-cpu`, or the CUDA reason says why (`CUDA not available: ...`) | Install `onnxruntime-core` with a CUDA provider package (or `onnxruntime-opt-cuda`) and `cudnn`, and read the reason in the log (section 5) |
+| The model runs on the CPU although you have an NVIDIA GPU | `auto` found nothing better: the installed ONNX Runtime has only the CPU engine, or the CUDA reason says why (`CUDA not available: ...`) | Install an ONNX Runtime package with the CUDA engine, as omarchy-onnxruntime describes (section 2), and read the reason in the log (section 5) |
 | The log says TensorRT's libraries are not on the daemon's library path, and the model runs on CUDA | TensorRT's directory is not on the daemon's library path (`/opt/nvidia/tensorrt/lib` with `nvidia-tensorrt-sdk-local` pkgrel 3 or earlier) | Update the package to pkgrel 4 or later, or add the drop-in of section 2, "TensorRT's library path", then reload systemd and restart the daemon |
 | `Warning` says `<engine> was chosen and cannot run: <reason>; using <other engine>` | The engine you chose cannot run here. The module runs the first later engine of the order that starts. The stored setting is unchanged | Read the reason and fix it, or choose `auto` or the engine that runs |
 | The load fails with `<engine> was chosen and cannot run: ...; no later engine could run it (...)` | The chosen engine and every engine after it in the order failed | Read the reasons in the list. Choose `auto` or an engine that can run |
 | After changing the engine or model the picture did not change, and `Warning` ends `the previous setting keeps running` | The new setting could not load. The previous one keeps running by design | Read the reason before the semicolon and fix it, or set the setting back. Change it again or apply it again to try it once more |
 | The NVIDIA GPU wakes up when `openvino-gpu` is chosen | The OpenCL loader opened NVIDIA's driver: the module's limit was not applied (an `OCL_ICD_*` variable was already set, or the loader was in the process before) | Remove your `OCL_ICD_*` setting from the daemon's environment, or make it list the Intel driver only. The log says why the limit was left alone |
 | The picture is black for many seconds the first time the effect is on (with privacy on; with privacy off the camera is shown until the engine is ready) | The TensorRT engine is being built | Wait for `the TensorRT engine for <model> is ready` in the log (section 6) |
-| On a machine without an NVIDIA GPU the effect does not run (the picture is black with privacy on) and `Warning` says the Maxine module cannot run | Only the Maxine module provides `background`: the ONNX module, its models or its runtime are missing, so its stage is `unavailable` | Install the module, the models and `onnxruntime-cpu` (sections 2 and 3). `omarchy-broadcast modules` shows the reason |
+| On a machine without an NVIDIA GPU the effect does not run (the picture is black with privacy on) and `Warning` says the Maxine module cannot run | Only the Maxine module provides `background`: the ONNX module, its models or its runtime are missing, so its stage is `unavailable` | Install the module, the models and ONNX Runtime (sections 2 and 3). `omarchy-broadcast modules` shows the reason |
 | The log says `video memory: system` on an NVIDIA machine | `[video] memory` is `system`, or the probe found no usable CUDA (`auto`: for example ``the CUDA toolkit (NVRTC) is not installed; install `cuda` for the GPU path``), or a start fell back after CUDA failed, or the battery saver is active (`auto: battery saver, on battery` or `... power profile power-saver`) | The log line gives the reason. Set `memory = "cuda"` to require CUDA, or `battery_saver = "off"` to keep CUDA on the battery, and reload |
 | `OpenVINO GPU: ... Device GPU is not available`, and the model runs on another engine | There is no Intel GPU in the running system. On a laptop with a GPU switch (a MUX), the discrete-only mode leaves the integrated Intel GPU off the bus (`lspci` shows no Intel display device, and `/dev/dri` holds only the NVIDIA GPU). The module limits OpenCL to Intel's driver (section 7), so the NVIDIA GPU is not offered to OpenVINO in its place | Use another engine, or switch the laptop to its hybrid mode and reboot if you want the Intel GPU. With only an NVIDIA GPU, `auto` is correct to use TensorRT, CUDA or the CPU |
 | `OpenVINO NPU: ... Device NPU is not available`, with the NPU's driver installed | The daemon cannot open `/dev/accel/accel0`: the node belongs to the group `render` and your user is not in it (check with `ls -l /dev/accel/accel0` and `id`). The NPU's user-space packages are not enough | Add your user to the group with `sudo usermod -aG render $USER`, log in again and restart the daemon. Or give the node the access you want with a udev rule of your own, then `sudo udevadm trigger -s accel` |
-| After a first install the module does not appear | The daemon reads manifests at start and on reload | `systemctl --user restart omarchy-broadcastd` |
+| After a first install the module does not appear | The daemon reads manifests at start and on reload | If the daemon is already running, restart it: `systemctl --user restart omarchy-broadcastd` |
 
 ## 9. Uninstall
 
@@ -557,9 +470,5 @@ sudo pacman -R omarchy-onnx-model-<id>      # for each model package you install
   sudo pacman -Rs omarchy-broadcast-onnx-bin
   ```
 
-- For a checkout, this removes what the script installed, the module's library, manifest and models included:
-
-  ```bash
-  scripts/install-user.sh --uninstall
-  ```
+- For a checkout, the script's `--uninstall` option removes what the script installed, the module's library, manifest and models included ([building.md](../building.md#uninstall-a-build-from-source)).
 - The TensorRT engine cache is under `$XDG_CACHE_HOME/omarchy-broadcast/` (by default `~/.cache/omarchy-broadcast/`). You can delete it at any time. It is rebuilt on the next use.

@@ -34,22 +34,14 @@ Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, 
 Before you start, you need:
 
 - an NVIDIA GPU of compute capability 7.5 or newer, and driver 570.26 or newer (section 1);
-- the core package `omarchy-broadcast-git` (or `omarchy-broadcast-bin`) installed and working ([INSTALL.md](../../INSTALL.md));
+- the core package installed and working ([INSTALL.md](../../INSTALL.md));
 - the SDK downloaded from NVIDIA with your own account (section 2).
 
 Then:
 
-1. Build the SDK package `maxine-vfx-sdk-local` from your download (section 2).
-2. Install the SDK package and the module package `omarchy-broadcast-maxine-vfx-git` (or `omarchy-broadcast-maxine-vfx-bin`). The module package depends on `maxine-vfx-sdk-local`.
-3. Restart the daemon.
-4. Check the log and the module (section 3):
-
-```bash
-journalctl --user -u omarchy-broadcastd | grep 'SDK environment'
-omarchy-broadcast modules
-```
-
-The log shows `SDK environment applied from /usr/share/maxine-vfx/maxine-vfx.env`. `modules` lists `br.com.dias.maxine-vfx` with its stages.
+1. Build and install the SDK package `maxine-vfx-sdk-local` from your download, with omarchy-nvidia-sdks (section 2).
+2. Install the module package `omarchy-broadcast-maxine-vfx-bin` (or `omarchy-broadcast-maxine-vfx-git`), as [INSTALL.md](../../INSTALL.md#steps) describes in step 4. The module package depends on `maxine-vfx-sdk-local`.
+3. If the daemon is already running, restart it. Check the log and the module (section 3). The log shows `SDK environment applied from /usr/share/maxine-vfx/maxine-vfx.env`. `modules` lists `br.com.dias.maxine-vfx` with its stages.
 
 ## The Maxine module
 
@@ -90,7 +82,7 @@ The module's settings are the `effect.*` settings of `omarchy-broadcast settings
 
 A manifest in `~/.local/share/omarchy-broadcast/modules.d` replaces the packaged one of the same id. A module library that is rebuilt later takes a daemon restart to load (libraries are never unloaded). A changed manifest only needs a reload.
 
-A checkout that was not installed with the script (the cargo route of [INSTALL.md](../../INSTALL.md#manual-install)) can take the module by hand, with the recipe below. The script refuses to replace a manifest written this way, so remove it first when you use the script later (section 8):
+A checkout that was not installed with the script (the cargo route of [building.md](../building.md#manual-install)) can take the module by hand, with the recipe below. The script refuses to replace a manifest written this way, so remove it first when you use the script later (section 8):
 
 ```bash
 cargo build --release -p obc-module-maxine
@@ -142,9 +134,16 @@ Which effect needs which feature:
 - The enhancement stage is available when either of its features is installed. Section 6 says what runs when the chosen method is the one that is missing.
 - The daemon checks what is installed from these files, without waking the GPU. A stage whose feature is missing is shown as "Not installed" by the clients and is never requested.
 
-## 2. Build and install maxine-vfx-sdk-local
+## 2. The SDK package
 
-The omarchy-nvidia-sdks repository owns everything about the SDK itself: the NVIDIA account and NGC access, the download, the supported GPU architectures, and the Arch package `maxine-vfx-sdk-local`. Follow its README and its `docs/download.md` for the download, and `docs/gpu-support.md` for the architectures.
+The omarchy-nvidia-sdks repository owns everything about the SDK itself: the NVIDIA account and NGC access, the download, the supported GPU architectures, and the Arch package `maxine-vfx-sdk-local`. Follow its [README](https://github.com/rsd/omarchy-nvidia-sdks#readme) and [INSTALL.md](https://github.com/rsd/omarchy-nvidia-sdks/blob/main/INSTALL.md) to build and install the package, and its `docs/download.md` for the download and `docs/gpu-support.md` for the architectures. Install it before the module package, which depends on it.
+
+Build the package with the features omarchy-broadcast uses (section 1). Leave out what you do not want:
+
+- `nvvfxrelighting` is only for relighting;
+- `nvvfxvideosuperres` and `nvvfxupscale` are only for enhancement;
+- `nvvfxtruehdr` is only for the HDR look;
+- frame generation needs `nvvfxvideoframegeneration`, which you can add the same way.
 
 The package installs:
 
@@ -154,32 +153,7 @@ The package installs:
 
 The daemon finds both files at start (section 3).
 
-### Build the package
-
-Build the package with the features omarchy-broadcast uses. Leave out what you do not want:
-
-- `nvvfxrelighting` is only for relighting;
-- `nvvfxvideosuperres` and `nvvfxupscale` are only for enhancement;
-- `nvvfxtruehdr` is only for the HDR look;
-- frame generation needs `nvvfxvideoframegeneration`, which you can add the same way.
-
-From a checkout of the omarchy-nvidia-sdks repository, with the download in `~/Downloads/maxine` and `sm_120` standing for your architecture:
-
-```bash
-maxine-vfx/configure.sh --src ~/Downloads/maxine --archs sm_120 \
-    --features nvvfxgreenscreen,nvvfxbackgroundblur,nvvfxdenoising,nvvfxrelighting,nvvfxvideosuperres,nvvfxupscale,nvvfxtruehdr --write
-(cd maxine-vfx && makepkg -f)
-```
-
-### Install the package
-
-Install the package yourself:
-
-```bash
-cd maxine-vfx && sudo pacman -U maxine-vfx-sdk-local-*.pkg.tar*
-```
-
-Nothing in omarchy-broadcast builds or downloads the SDK. The module package `omarchy-broadcast-maxine-vfx-git` depends on `maxine-vfx-sdk-local`, so pacman asks for it when you install the module. The core does not need it. The SDK is a personal download, which is why the module is a package of its own.
+Nothing in omarchy-broadcast builds or downloads the SDK. The module package `omarchy-broadcast-maxine-vfx-git` (or `-bin`) depends on `maxine-vfx-sdk-local`, so its install stops until the SDK package is installed. The core does not need it. The SDK is a personal download, which is why the module is a package of its own.
 
 **Licence.** The SDK is under NVIDIA's licence and is for your own machine only. omarchy-broadcast never distributes it. You must not put the SDK, the models or the package in a repository, a package or a release artifact. The licence notes are in the "Licence and personal use" section of the omarchy-nvidia-sdks README.
 
@@ -187,16 +161,15 @@ Nothing in omarchy-broadcast builds or downloads the SDK. The module package `om
 
 The daemon needs the os-release shim from the moment it starts (see below). You need no systemd drop-in for it. With the SDK package installed, `omarchy-broadcastd` applies the package's environment to itself when it starts, and logs that it did.
 
-Install the packages, restart the daemon and check the log:
+Install the packages ([INSTALL.md](../../INSTALL.md#steps), step 4), restart the daemon and check the log and the module:
 
 ```bash
-# the module package, with the core; it depends on the module ABI the core provides and on maxine-vfx-sdk-local
-sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst omarchy-broadcast-maxine-vfx-git-*.pkg.tar.zst
 systemctl --user restart omarchy-broadcastd.service
 journalctl --user -u omarchy-broadcastd | grep 'SDK environment'
+omarchy-broadcast modules
 ```
 
-The line is `SDK environment applied from /usr/share/maxine-vfx/maxine-vfx.env`. With the AR SDK installed as well, it names the two files, separated by a comma. The same holds for a checkout (`scripts/install-user.sh`) when `maxine-vfx-sdk-local` is installed.
+The line is `SDK environment applied from /usr/share/maxine-vfx/maxine-vfx.env`. With the AR SDK installed as well, it names the two files, separated by a comma. `modules` lists `br.com.dias.maxine-vfx` with its stages. The same holds for a checkout (`scripts/install-user.sh`) when `maxine-vfx-sdk-local` is installed.
 
 ### What the daemon does
 
@@ -338,13 +311,7 @@ An SDK tree that was installed some other way, for example under `~/.local/opt/m
 
 The shim of your tree counts as in place. The daemon sees a library named `os-release-shim.so` loaded in its own process, from whatever directory, logs `SDK environment already in place`, and applies nothing from a package. So the two can be installed together. You need no `LD_LIBRARY_PATH` line and no list of feature directories.
 
-The shim library and the replacement `os-release` come from the omarchy-nvidia-sdks repository, which owns both. omarchy-broadcast does not contain them. In a checkout of that repository, build the shim:
-
-```bash
-make -C tools/os-release-shim
-```
-
-It writes `target/os-release-shim/os-release-shim.so`. The replacement `os-release` is that repository's `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-vfx/`, where the two lines above point, or change the paths. The "The compatibility shim" and "Running a program" sections of its `docs/usage.md` describe them and the unpackaged case.
+The shim library and the replacement `os-release` come from the omarchy-nvidia-sdks repository, which owns both. omarchy-broadcast does not contain them. Its `docs/usage.md` describes how to build the shim and where the replacement `os-release` file is ("The compatibility shim" and "Running a program"), and the unpackaged case. Put both files in `~/.local/lib/maxine-vfx/`, where the two lines above point, or change the paths.
 
 `%h` is the user's home directory. systemd does not expand `$HOME` or other variables inside `Environment=`.
 
@@ -596,19 +563,11 @@ It differs from the two video modules in three ways, which is why this page does
 - **`LD_LIBRARY_PATH` is required.** The SDK opens its effects' feature libraries by a name that only the library search path resolves, read when the process starts. So, unlike the video modules, which load their libraries by absolute path, this module requires the path to lead to the feature libraries of the root in use. The package's environment file sets it, and the worker, unlike the daemon, applies it: it merges the file's entries after the ones of its own environment (section 3). Without it the stages are unavailable, with a reason that names the SDK package.
 - **The root is searched in the other order.** `sdk_root` in `[module."br.com.dias.maxine-afx"]`, then `MAXINE_AFX_ROOT`, then `/opt/nvidia/maxine/afx`. The configured root comes first, whereas for the video modules the environment variable comes first (section 4).
 
-The os-release shim of section 3 applies to the worker in the same way. At start the worker merges the package's environment into its own, preloads the shim and executes itself again, once, with the same rules as the daemon. It logs `SDK environment applied from /usr/share/maxine-afx/maxine-afx.env`:
-
-```bash
-journalctl --user -u omarchy-broadcast-audiod | grep 'SDK environment'
-```
+The os-release shim of section 3 applies to the worker in the same way. At start the worker merges the package's environment into its own, preloads the shim and executes itself again, once, with the same rules as the daemon. It logs `SDK environment applied from /usr/share/maxine-afx/maxine-afx.env` ([microphone.md](microphone.md#the-workers-sdk-environment) shows the command that finds the line).
 
 The worker starts on demand and exits when the microphone is idle, so the next start applies the environment. You need no restart of the unit after installing the package.
 
-The Arch package `omarchy-broadcast-maxine-afx-git` (or `omarchy-broadcast-maxine-afx-bin`) installs the module and depends on `maxine-afx-sdk-local`. From a checkout, install the module for the current user with:
-
-```bash
-scripts/install-user.sh --audio
-```
+The Arch package `omarchy-broadcast-maxine-afx-git` (or `omarchy-broadcast-maxine-afx-bin`) installs the module and depends on `maxine-afx-sdk-local`. From a checkout, the script's `--audio` option installs the module for the current user ([microphone.md](microphone.md#with-scriptsinstall-usersh---audio)).
 
 The module installs and loads without the SDK, and without the SDK the microphone uses its CPU module.
 
@@ -639,13 +598,7 @@ systemctl --user daemon-reload
 systemctl --user restart omarchy-broadcastd.service
 ```
 
-**A checkout.** To remove the Maxine module of a checkout installed with `scripts/install-user.sh`, run:
-
-```bash
-scripts/install-user.sh --uninstall
-```
-
-It removes the module's library and manifest, and the directories among them once they are empty.
+**A checkout.** To remove the Maxine module of a checkout installed with `scripts/install-user.sh`, run the script's `--uninstall` option ([building.md](../building.md#uninstall-a-build-from-source)). It removes the module's library and manifest, and the directories among them once they are empty.
 
 A module installed by hand (the recipe under "From a checkout") has a manifest without the script's mark, and the script refuses to remove it. Delete that manifest and the library it names first, then run the uninstall again:
 

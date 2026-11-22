@@ -6,14 +6,14 @@ Omarchy Broadcast is a daemon for Linux, written in Rust on GStreamer. It turns 
 
 ## What you get
 
-**On any machine** (CPU, or an Intel GPU or NPU through ONNX Runtime; [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime) packages its engines):
+**On any machine** (the open-model effects run through ONNX Runtime, on the CPU, an NVIDIA GPU or an Intel GPU or NPU, by the ONNX Runtime package you install; [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime) packages its engines):
 
-- Background blur and background replacement with open Apache-2.0 models. A replacement can be an image, an animated image or a video; two loops and a set of backgrounds are bundled.
+- Background blur and background replacement with open Apache-2.0 models, on the engine of the ONNX Runtime you install, a GPU included. A replacement can be an image, an animated image or a video; two loops and a set of backgrounds are bundled.
 - Camera passthrough with the camera's own image settings: brightness, contrast, saturation, exposure, white balance, focus and zoom, set per camera.
 - A choice of the camera's resolution and frame rate and of the virtual camera's size and rate.
 - A virtual microphone, **Omarchy Broadcast Mic**, with noise removal on the CPU (DeepFilterNet by default, or RNNoise).
 
-**With an NVIDIA RTX GPU** (the optional NVIDIA Maxine modules, with an SDK you obtain yourself):
+**With an NVIDIA RTX GPU** (the optional NVIDIA Maxine modules add these, with an SDK you obtain yourself):
 
 - Background blur and replacement on the GPU, with a hardened mask edge.
 - Video noise removal, which clears the grain a webcam shows in dim rooms.
@@ -35,40 +35,13 @@ Each effect is a **module**: a manifest and a shared library that the daemon dis
 
 ## Quick start
 
-On Omarchy or Arch Linux. Install the packages (prebuilt; use `-git` in place of `-bin` to build from source):
+On Omarchy or Arch Linux. The open-model effects need ONNX Runtime 1.29 or later, and the package you install sets the engine they run on. The table of hardware and packages is [step 1 of the INSTALL.md of omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md#1-choose-your-packages): install ONNX Runtime from there first. Then install the daemon and its open-model module (prebuilt; use `-git` in place of `-bin` to build from source):
 
 ```sh
 yay -S omarchy-broadcast-bin omarchy-broadcast-onnx-bin
 ```
 
-Without an NVIDIA GPU, add `onnxruntime-cpu`. With one, add `cuda`:
-
-```sh
-yay -S onnxruntime-cpu     # no NVIDIA GPU
-yay -S cuda                # NVIDIA GPU
-```
-
-Create the virtual camera device once. This needs root:
-
-```sh
-sudo install -Dm644 /usr/share/doc/omarchy-broadcast/examples/modprobe.d/omarchy-broadcast.conf /etc/modprobe.d/omarchy-broadcast.conf
-echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
-sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
-```
-
-Start the daemon at every login:
-
-```sh
-systemctl --user enable --now omarchy-broadcastd
-```
-
-Check that it runs. The output lists your camera:
-
-```sh
-omarchy-broadcast start
-```
-
-Then select **Omarchy Broadcast** as the camera in your application and pick an effect. [INSTALL.md](INSTALL.md) has every step and the requirements: choosing `-bin` or `-git`, the modules (ONNX, NVIDIA Maxine, the microphone), other Linux distributions, the bar plugin, building from source and uninstalling.
+That installs the packages but does not give you a camera yet. [INSTALL.md](INSTALL.md) continues with the virtual camera device, starting the daemon and checking it. It also covers more models, the NVIDIA Maxine effects, the virtual microphone, the bar plugin, other Linux distributions and uninstalling.
 
 ## How it works
 
@@ -117,7 +90,7 @@ The bar plugin is the one Omarchy-specific part. On other desktops, the CLI is t
 
 ## Learn more
 
-- [INSTALL.md](INSTALL.md): the install steps, the requirements, other distributions, building from source and uninstalling.
+- [INSTALL.md](INSTALL.md): the install steps on Arch Linux and Omarchy, checking the result and uninstalling. [docs/building.md](docs/building.md) builds and installs from a checkout, for other distributions.
 - [LIMITATIONS.md](LIMITATIONS.md): what the software cannot do, why, and what to do about it.
 - [docs/README.md](docs/README.md): the documentation, by task. It indexes the architecture, the setup guides and the benchmarks. [docs/modules.md](docs/modules.md) covers writing and installing modules.
 
