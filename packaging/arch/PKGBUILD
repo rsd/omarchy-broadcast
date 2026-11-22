@@ -132,7 +132,7 @@ pkgrel=1
 # crates/obc-module-abi/include/omarchy_broadcast_module.h; the core's
 # package() fails when it does not.
 _module_abi=1.6
-pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
+pkgdesc='Virtual camera and microphone daemon for Linux with live effect modules, v4l2loopback and PipeWire outputs, a D-Bus API and a CLI'
 url='https://github.com/rsd/omarchy-broadcast'
 arch=('x86_64')
 # The project is MIT OR Apache-2.0. The CPU voice module statically includes
