@@ -25,30 +25,45 @@ Steps 3 and 4 are optional, and you can do them after [the check](#check-that-it
 
    The command prints nothing when it is satisfied. That means only that some ONNX Runtime 1.29 or later is installed, a CPU-only one included: it does not say which engine the effects will use. The [check below](#check-that-it-works) shows that. If the command prints the requirement, install ONNX Runtime first.
 
-2. **Install the daemon and the open-model module.** Take one of the two kinds. The `-bin` packages are prebuilt. The `-git` packages are built on your machine. They conflict, so install one kind.
+2. **Install the daemon and the open-model module.** Take one of the two kinds. They conflict, so run only one of the two commands below. The `-bin` packages are prebuilt:
 
    ```sh
-   yay -S omarchy-broadcast-bin omarchy-broadcast-onnx-bin     # prebuilt
-   yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git     # built from source
+   yay -S omarchy-broadcast-bin omarchy-broadcast-onnx-bin
+   ```
+
+   The `-git` packages are built on your machine:
+
+   ```sh
+   yay -S omarchy-broadcast-git omarchy-broadcast-onnx-git
    ```
 
    The command installs the core and the module. The module's package also brings in its default model, so the open-model effects work without a further download. On a first install the package prints the next steps, which are steps 5 and 6 below.
-
-   The Maxine module packages of step 4 depend on the core, not on the open-model module or on ONNX Runtime, and [docs/setup/maxine.md](docs/setup/maxine.md#quick-start) installs them with the core alone. Without the open-model module you get no background effect while the video runs in system memory, because only the CPU path can run it there: with no usable CUDA, or while the battery saver is active ([docs/setup/onnx.md](docs/setup/onnx.md#using-it-on-a-machine-without-an-nvidia-gpu)).
 
 3. **Add more models (optional).** [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models) holds four open person-segmentation models as ONNX files, with checksums and licences, and one Arch package for each. You can do this after the check, because the default model is already installed. Install more of them there, then choose one in [docs/setup/onnx.md](docs/setup/onnx.md#choose-the-model-and-the-engine).
 
 4. **Add the NVIDIA effects (optional, NVIDIA RTX GPU only).** The NVIDIA Maxine effects need an NVIDIA RTX GPU and its driver ([requirements](docs/setup/maxine.md#1-requirements)), and an SDK that you download from NVIDIA yourself. [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) turns each SDK into a local pacman package: `maxine-vfx-sdk-local` for the video effects, `maxine-ar-sdk-local` for eye contact and auto-framing, `maxine-afx-sdk-local` for the microphone's effects. Build and install the SDK packages you want there first. [docs/setup/maxine.md](docs/setup/maxine.md#2-the-sdk-package) lists the SDK features each effect needs, and that repository covers the microphone's effects and their sample rates.
 
-   **Install only the module packages whose SDK package you built.** A module package depends on its SDK package, so its install stops without it. The video and AR module packages also pull in `cuda` as a dependency, so you do not install it yourself. Each line below is one module:
+   **Install only the module packages whose SDK package you built.** A module package depends on its SDK package. If that is not installed, the AUR helper tries to build it from its AUR recipe. That build fails without your SDK download, and the module package is not installed. The video and AR module packages also pull in `cuda` as a dependency, so you do not install it yourself. Run the command of each module you want. Use `-git` in place of `-bin` if you chose the source kind in step 2.
+
+   The video effects need `maxine-vfx-sdk-local`:
 
    ```sh
-   yay -S omarchy-broadcast-maxine-vfx-bin    # video effects; needs maxine-vfx-sdk-local
-   yay -S omarchy-broadcast-maxine-ar-bin     # eye contact and auto-framing; needs maxine-ar-sdk-local
-   yay -S omarchy-broadcast-maxine-afx-bin    # microphone effects; needs maxine-afx-sdk-local
+   yay -S omarchy-broadcast-maxine-vfx-bin
    ```
 
-   Use `-git` in place of `-bin` if you chose the source kind in step 2. The daemon lists the modules once it runs (see [Check that it works](#check-that-it-works)). You can do this step after the check: install the packages, then restart the daemon as [Update](#update) shows. [docs/setup/maxine.md](docs/setup/maxine.md) covers their setup and checks.
+   Eye contact and auto-framing need `maxine-ar-sdk-local`:
+
+   ```sh
+   yay -S omarchy-broadcast-maxine-ar-bin
+   ```
+
+   The microphone's effects need `maxine-afx-sdk-local`:
+
+   ```sh
+   yay -S omarchy-broadcast-maxine-afx-bin
+   ```
+
+   The daemon lists the modules once it runs (see [Check that it works](#check-that-it-works)). You can do this step after the check: install the packages, then restart the daemon as [Update](#update) shows. [docs/setup/maxine.md](docs/setup/maxine.md) covers their setup and checks.
 
 5. **Create the virtual camera.** This needs root and runs once. The core package depends on a v4l2loopback kernel module (`v4l2loopback-dkms` provides it), so step 2 installed one if the system had none. The package ships the `modprobe.d` line as an example.
 
@@ -94,7 +109,7 @@ After step 6 on a first install, `State` is `idle`: no application uses the came
 systemctl --user status omarchy-broadcastd
 ```
 
-Select **Omarchy Broadcast** as the camera in an application, such as the browser Omarchy ships (Chromium) or OBS. With `exclusive_caps=1`, the device is listed as a camera only while the daemon runs ([why](docs/setup/loopback.md#why-exclusive_caps1)), so step 6 comes first. Then choose an effect:
+Select **Omarchy Broadcast** as the camera in an application, such as the browser Omarchy ships (Chromium) or OBS. With `exclusive_caps=1`, the device is listed as a camera only while the daemon runs ([why](docs/setup/loopback.md#why-exclusive_caps1)), so step 6 comes first. The daemon streams into the device from its start, black frames (or the away image) while no application reads it. Then choose an effect:
 
 ```sh
 omarchy-broadcast effect blur
@@ -158,7 +173,7 @@ The daemon runs the new version afterwards. A module library that is rebuilt tak
 | `omarchy-broadcast status` shows the state `error` | The v4l2loopback device labelled "Omarchy Broadcast" is missing. The daemon retries every 2 s | Create the virtual camera (step 5). [docs/setup/loopback.md](docs/setup/loopback.md#troubleshooting) has more |
 | `omarchy-broadcast` exits with status 3 | The daemon is not running, or there is no D-Bus session bus | Run `omarchy-broadcast start` or step 6, then `systemctl --user status omarchy-broadcastd` |
 | The AUR helper offers the previous version | The AUR's RPC index lags a few minutes after a release | Wait and try again |
-| The install of a Maxine module package stops on `maxine-vfx-sdk-local` (or `-ar-`, `-afx-`) | The SDK package is built locally from your own download and is not installed | Build and install it with [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) first (step 4) |
+| The install of a Maxine module package fails while building `maxine-vfx-sdk-local` (or `-ar-`, `-afx-`), with `no Maxine VFX SDK found` (or `AR`, `AFX`) | The SDK package is not installed, so the AUR helper builds its recipe, which needs your own SDK download | Build and install it with [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) first (step 4) |
 | An old daemon keeps starting after you installed the package | A copy of the unit in `~/.config/systemd/user` shadows the packaged one | [docs/setup/daemon.md](docs/setup/daemon.md#which-unit-is-used) |
 
 More in the troubleshooting sections of the guides: [daemon](docs/setup/daemon.md#troubleshooting), [loopback](docs/setup/loopback.md#troubleshooting), [ONNX](docs/setup/onnx.md#8-troubleshooting), [Maxine](docs/setup/maxine.md#7-troubleshooting) and [microphone](docs/setup/microphone.md#troubleshooting).

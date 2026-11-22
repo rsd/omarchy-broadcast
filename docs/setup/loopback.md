@@ -42,7 +42,7 @@ Step 5 of [INSTALL.md](../../INSTALL.md#steps) ends with the check, which needs 
 | `Module v4l2loopback is in use` on `modprobe -r` | An application holds a loopback node | Find it with `fuser -v /dev/video10`, close it, reload the module |
 | The daemon is in the state `error` and retries every 2 s | No device carries the label `Omarchy Broadcast` | Check the name in `/sys/class/video4linux/*/name`, then fix the `card_label` and reload the module |
 | Two applications want the camera and the second gets "device busy" or no camera | v4l2loopback 0.14 and later lets one process stream at a time | See [One application at a time](#one-application-at-a-time) and [LIMITATIONS.md](../../LIMITATIONS.md#one-application-streams-from-the-virtual-camera-at-a-time) |
-| The camera does not show up in OBS or a browser | With `exclusive_caps=1` the device appears only while the daemon is streaming | Start the daemon and open the camera in an application; see [Why `exclusive_caps=1`](#why-exclusive_caps1) |
+| The camera does not show up in OBS or a browser | With `exclusive_caps=1` the device appears only while the daemon runs | Start the daemon; see [Why `exclusive_caps=1`](#why-exclusive_caps1) |
 | Device names show literal quote characters | Each label was quoted separately in the `modprobe.d` line | Put all labels inside one pair of quotes ([Several devices](#several-devices)) |
 | The daemon logs "crash cover not in place" | The v4l2loopback version lacks the `timeout` and `timeout_image_io` controls | Use a newer v4l2loopback (0.15.4 has them); the daemon still runs ([below](#what-the-daemon-sets-on-the-device)) |
 
@@ -67,7 +67,7 @@ In practice:
 
 ## Why `exclusive_caps=1`
 
-With `exclusive_caps=1` the device advertises only the CAPTURE capability while a producer is writing to it. It therefore appears as a camera in OBS or a browser only while the daemon is streaming. It does not show up as a dead, black camera otherwise.
+With `exclusive_caps=1` the device advertises only the CAPTURE capability while a producer is writing to it. It does not show up as a dead camera otherwise. The daemon's loopback writer is that producer. It opens the device when the daemon starts and streams into it in every state, idle and off included: black frames, or the away image when `[output] placeholder = "image"` and `[effect] fallback_image` are set. It stops only while its writer has failed, shown as the `error` state naming the device, which the daemon retries every 2 s. The device therefore appears as a camera in OBS or a browser whenever the daemon runs. An application that opens it is counted as a consumer, and that starts the camera unless you turned it off.
 
 Chrome requires this: it lists only devices that expose capture capability and not output capability. Keep it enabled.
 

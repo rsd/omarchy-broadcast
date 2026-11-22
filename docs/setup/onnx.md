@@ -274,9 +274,22 @@ The module provides `background` in the `matte` slot with rank 200 and the devic
 - the `battery` profile picks this module;
 - a pin chooses regardless of the profile.
 
+To prefer this module through the profile, and then see which module is `selected`:
+
 ```bash
 omarchy-broadcast modules profile battery
+omarchy-broadcast modules
+```
+
+To pin it:
+
+```bash
 omarchy-broadcast modules pin background br.com.dias.onnx-cutout
+```
+
+To remove the pin:
+
+```bash
 omarchy-broadcast modules pin background --clear
 ```
 
@@ -466,8 +479,6 @@ sudo pacman -R omarchy-onnx-model-<id>      # for each model package you install
 
   ```bash
   sudo pacman -Rs omarchy-broadcast-onnx-git
-  # or, for the prebuilt module:
-  sudo pacman -Rs omarchy-broadcast-onnx-bin
   ```
 
 - For a checkout, the script's `--uninstall` option removes what the script installed, the module's library, manifest and models included ([building.md](../building.md#uninstall-a-build-from-source)).

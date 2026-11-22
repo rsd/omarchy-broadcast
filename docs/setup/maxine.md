@@ -37,6 +37,8 @@ Before you start, you need:
 - the core package installed and working ([INSTALL.md](../../INSTALL.md));
 - the SDK downloaded from NVIDIA with your own account (section 2).
 
+The module needs neither the open-model module nor ONNX Runtime, but without the open-model module you get no background effect while the video runs in system memory: with `[video] memory = "system"`, with no usable CUDA or while the battery saver is active ([onnx.md](onnx.md#using-it-on-a-machine-without-an-nvidia-gpu)).
+
 Then:
 
 1. Build and install the SDK package `maxine-vfx-sdk-local` from your download, with omarchy-nvidia-sdks (section 2).
@@ -153,7 +155,7 @@ The package installs:
 
 The daemon finds both files at start (section 3).
 
-Nothing in omarchy-broadcast builds or downloads the SDK. The module package `omarchy-broadcast-maxine-vfx-git` (or `-bin`) depends on `maxine-vfx-sdk-local`, so its install stops until the SDK package is installed. The core does not need it. The SDK is a personal download, which is why the module is a package of its own.
+Nothing in omarchy-broadcast builds or downloads the SDK. The module package `omarchy-broadcast-maxine-vfx-git` (or `-bin`) depends on `maxine-vfx-sdk-local`. Without the SDK package installed, its install fails: the AUR helper tries to build the SDK package from its AUR recipe, which needs your own download. The core does not need it. The SDK is a personal download, which is why the module is a package of its own.
 
 **Licence.** The SDK is under NVIDIA's licence and is for your own machine only. omarchy-broadcast never distributes it. You must not put the SDK, the models or the package in a repository, a package or a release artifact. The licence notes are in the "Licence and personal use" section of the omarchy-nvidia-sdks README.
 
@@ -320,11 +322,9 @@ The shim library and the replacement `os-release` come from the omarchy-nvidia-s
 With the SDK installed and its environment applied to the daemon (section 3), you select the effects in two ways:
 
 - In `config.toml`: the `[effect]` section (`mode`, `blur_strength`, `background_image`, `denoise`, `enhance`, `relight`, `relight_light`, `relight_direction`, `relight_brightness`, `privacy`, `privacy_mode`, `maxine_root`) and the module's own `[module."br.com.dias.maxine-vfx"]` table (`sdk_root`). See [../config.example.toml](../config.example.toml).
-- At run time, with the `effect` command, which the daemon remembers across restarts:
+- At run time, with the `effect` command, which the daemon remembers across restarts. It takes one of `none`, `blur` or `replace`, for example:
 
   ```bash
-  omarchy-broadcast effect none
-  omarchy-broadcast effect blur
   omarchy-broadcast effect replace
   ```
 
@@ -340,10 +340,15 @@ With the SDK installed and its environment applied to the daemon (section 3), yo
 
 ### Video noise removal
 
-Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or at run time:
+Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or at run time. Turn it on:
 
 ```bash
 omarchy-broadcast denoise on
+```
+
+Turn it off:
+
+```bash
 omarchy-broadcast denoise off
 ```
 
@@ -381,10 +386,9 @@ Relighting and enhancement are stages that stack the same way, and they fail ope
 
   Otherwise the setting is greyed with the reason ("The camera already captures at full resolution", "The camera's format cannot be enhanced"). Turning it on or off while the camera is open reopens the camera, like a camera switch: the virtual camera holds the last frame and keeps its format.
 
-  The **method** is the setting `effect.video.enhance_method` ("Enhancement method"). Write it in the panel or with:
+  The **method** is the setting `effect.video.enhance_method` ("Enhancement method"), `ai` or `fast`. Write it in the panel or with the command below, which selects `fast`. Write `ai` in its place to go back to the default:
 
   ```bash
-  omarchy-broadcast settings set effect.video.enhance_method ai
   omarchy-broadcast settings set effect.video.enhance_method fast
   ```
 
@@ -580,13 +584,15 @@ omarchy-broadcast modules info br.com.dias.maxine-afx
 
 ## 8. Uninstall
 
+Remove the module package first, because it depends on the SDK package. Then remove the SDK package, if nothing else uses it, and restart the daemon:
+
 ```bash
-# the module package first (it depends on the SDK package), then the SDK package,
-# only if nothing else uses it
-sudo pacman -R omarchy-broadcast-maxine-vfx-git     # or omarchy-broadcast-maxine-vfx-bin, if you installed the prebuilt one
+sudo pacman -R omarchy-broadcast-maxine-vfx-git
 sudo pacman -R maxine-vfx-sdk-local
 systemctl --user restart omarchy-broadcastd.service
 ```
+
+For the prebuilt module, remove `omarchy-broadcast-maxine-vfx-bin` instead.
 
 Without the SDK the daemon runs as usual and the effects are unavailable.
 

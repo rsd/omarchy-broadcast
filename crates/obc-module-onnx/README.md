@@ -32,9 +32,7 @@ The library is `crates/obc-module-onnx/target/release/libobc_module_onnx.so`. No
 
 On Arch, install the package `omarchy-broadcast-onnx-git` (or the prebuilt `omarchy-broadcast-onnx-bin`) instead of the steps below. The steps below install from a build.
 
-1. **Install ONNX Runtime**, 1.29 or later.
-   - Recommended: `onnxruntime-core` plus the provider packages you need (`onnxruntime-provider-cuda13-<preset>`, `onnxruntime-provider-tensorrt-cuda13`, `onnxruntime-provider-openvino`) from <https://github.com/rsd/omarchy-onnxruntime>. Install them together in one `pacman -U` (see its [INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md)). Each provider is loaded only when asked for, so a missing vendor runtime disables only that engine. Its [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/engines.md) lists the vendor packages and its [docs/results.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/results.md) has figures.
-   - Alternatives on Arch: `onnxruntime-cpu`, or `onnxruntime-opt-cuda` for NVIDIA's CUDA engine (any package that provides `onnxruntime`).
+1. **Install ONNX Runtime**, 1.29 or later: any package that provides `onnxruntime`. [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime) provides ONNX Runtime 1.29.0 as pacman packages for Arch and Omarchy, and says which package fits which hardware: see [step 1 of its INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md#1-choose-your-packages).
    - TensorRT also needs its library directory on the daemon's `LD_LIBRARY_PATH` (see "TensorRT's library path" below).
 2. **Install the module**: the library and the manifest in a `modules.d` directory, with `library` pointing at the library:
 

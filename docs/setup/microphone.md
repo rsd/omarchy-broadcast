@@ -122,11 +122,16 @@ The states:
 
 ## Use it
 
-"Omarchy Broadcast Mic" appears as an ordinary microphone. Select it in the application (the input device setting of the meeting, recording or chat program), or make it the default microphone:
+"Omarchy Broadcast Mic" appears as an ordinary microphone. Select it in the application (the input device setting of the meeting, recording or chat program), or make it the default microphone (the setting "Use as default microphone"):
 
 ```sh
-omarchy-broadcast mic default            # Use as default microphone
-omarchy-broadcast mic restore-default    # go back to the microphone that was the default
+omarchy-broadcast mic default
+```
+
+To go back to the microphone that was the default:
+
+```sh
+omarchy-broadcast mic restore-default
 ```
 
 Nothing makes it the default by itself. The source is mono at 48 kHz. A stereo microphone is downmixed. `wpctl status` lists the source under **Filters**, not under Sources, because WirePlumber groups filter-chain nodes there. Applications list it as an ordinary input named "Omarchy Broadcast Mic".
@@ -189,10 +194,22 @@ The settings are in the settings tree. `omarchy-broadcast settings` shows it, an
 | `mic.cpu.engine` ("Engine") | `deepfilternet` (the default) or `rnnoise`. Reloads the engine. The audio stays raw while the new one loads |
 | `mic.echo.*`, `mic.voice.*` | Room echo removal and studio voice, offered by the GPU module only: [On an NVIDIA GPU](#on-an-nvidia-gpu-maxine-audio-effects) |
 
+To set the strength of noise removal:
+
 ```sh
 omarchy-broadcast settings set mic.noise.strength 70
+```
+
+To change the engine:
+
+```sh
 omarchy-broadcast settings set mic.cpu.engine rnnoise
-omarchy-broadcast settings set mic.input.enabled off     # raw audio through the same source
+```
+
+To pass raw audio through the same source:
+
+```sh
+omarchy-broadcast settings set mic.input.enabled off
 ```
 
 A module installed later adds its own settings to the same page, such as the GPU module's switch and strength for room echo removal. A setting that cannot be changed now is shown with the reason.
@@ -203,7 +220,12 @@ A USB microphone has its own capture gain, applied in the device before any soft
 
 ```sh
 omarchy-broadcast settings set mic.input.hardware_gain_db 36
-omarchy-broadcast config set mic.hardware_gain_db 36.0    # the same, as a configuration key
+```
+
+The configuration key `mic.hardware_gain_db` holds the same value. To set it there instead:
+
+```sh
+omarchy-broadcast config set mic.hardware_gain_db 36.0
 ```
 
 - **When it appears.** The setting appears only when the microphone being captured is a USB audio device whose card has one capture volume control. With several controls, the daemon takes one only when it is named `Mic`, `Headset`, `Capture` or `Microphone`. Otherwise the setting is absent rather than a guess. A value outside the device's range is refused.
@@ -241,12 +263,19 @@ omarchy-broadcast config set mic.<key> VALUE
 | `hardware_gain_db` | unset | The capture gain of a USB microphone, in dB. Unset never touches the device's gain ([above](#hardware-gain-of-a-usb-microphone)) |
 | `force_conflicts` | `false` | Run effects that their modules declare as excluding each other, together (studio voice with noise or room echo removal, [below](#studio-voice-excludes-noise-and-echo-removal)). For testing; set in a file |
 
-Which module provides a stage is chosen as for video: by rank, by the backend profile and by pin:
+Which module provides a stage is chosen as for video: by rank, by the backend profile and by pin.
+
+To prefer a CPU module over a GPU one:
 
 ```sh
-omarchy-broadcast modules profile battery           # prefer a CPU module over a GPU one
-omarchy-broadcast modules pin mic-denoise MODULE    # pin a module
-omarchy-broadcast modules                           # list the audio modules, with their stages, next to the video ones
+omarchy-broadcast modules profile battery
+```
+
+To pin a module, and then list the audio modules, with their stages, next to the video ones:
+
+```sh
+omarchy-broadcast modules pin mic-denoise MODULE
+omarchy-broadcast modules
 ```
 
 ## On an NVIDIA GPU (Maxine audio effects)
@@ -439,12 +468,22 @@ If one stage cannot be loaded, only that stage is dropped and the rest of the ch
 
 ## Troubleshooting
 
-Logs:
+The log of the mic host and its plugin:
 
 ```sh
-journalctl --user -u omarchy-broadcast-mic.service                     # the mic host and its plugin
-journalctl --user -u omarchy-broadcast-audiod.service -u omarchy-broadcast-audiod.socket   # the worker
-journalctl --user -u omarchy-broadcastd                                # the daemon
+journalctl --user -u omarchy-broadcast-mic.service
+```
+
+The worker's log:
+
+```sh
+journalctl --user -u omarchy-broadcast-audiod.service -u omarchy-broadcast-audiod.socket
+```
+
+The daemon's log:
+
+```sh
+journalctl --user -u omarchy-broadcastd
 ```
 
 | Symptom | Cause | Fix |
@@ -558,11 +597,16 @@ The configuration files and the unit are in the repository's `dist/` directory (
 
 ## Before you start with the units
 
-- At least one LADSPA plugin package. The Arch package lists both as optional dependencies.
+- At least one LADSPA plugin package. The Arch package lists both as optional dependencies. Install the plugin of each engine you want. The RNNoise engine (default):
 
 ```sh
-sudo pacman -S noise-suppression-for-voice   # RNNoise engine (default)
-sudo pacman -S deepfilternet-ladspa          # DeepFilterNet engine
+sudo pacman -S noise-suppression-for-voice
+```
+
+The DeepFilterNet engine:
+
+```sh
+sudo pacman -S deepfilternet-ladspa
 ```
 
 `noise-suppression-for-voice` installs `/usr/lib/ladspa/librnnoise_ladspa.so`. `deepfilternet-ladspa` installs `/usr/lib/ladspa/libdeep_filter_ladspa.so`. The configurations were written against `noise-suppression-for-voice` 1.21 and `deepfilternet-ladspa` 0.5.6. The RNNoise plugin (`noise-suppression-for-voice`) is GPL-3.0 and DeepFilterNet's LADSPA plugin (`deepfilternet-ladspa`) is MIT or Apache-2.0. omarchy-broadcast uses these plugins but does not ship them; they are optional dependencies of the package.
@@ -600,12 +644,21 @@ It enables nothing. `scripts/install-user.sh --uninstall` removes these files. I
 
 Keep the file names: the unit looks the configuration up by name. PipeWire searches `~/.config/pipewire`, `/etc/pipewire` and `/usr/share/pipewire`. Run the commands from the repository root.
 
-```sh
-# the engine or engines you want:
-install -Dm644 dist/pipewire/omarchy-broadcast-mic-rnnoise.conf    ~/.config/pipewire/omarchy-broadcast-mic-rnnoise.conf
-install -Dm644 dist/pipewire/omarchy-broadcast-mic-deepfilter.conf ~/.config/pipewire/omarchy-broadcast-mic-deepfilter.conf
+Install the configuration of each engine you want. RNNoise:
 
-# the unit (once):
+```sh
+install -Dm644 dist/pipewire/omarchy-broadcast-mic-rnnoise.conf ~/.config/pipewire/omarchy-broadcast-mic-rnnoise.conf
+```
+
+DeepFilterNet:
+
+```sh
+install -Dm644 dist/pipewire/omarchy-broadcast-mic-deepfilter.conf ~/.config/pipewire/omarchy-broadcast-mic-deepfilter.conf
+```
+
+Then install the unit, once:
+
+```sh
 install -Dm644 dist/systemd/omarchy-broadcast-mic@.service ~/.config/systemd/user/omarchy-broadcast-mic@.service
 systemctl --user daemon-reload
 ```

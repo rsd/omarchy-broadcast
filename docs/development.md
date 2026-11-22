@@ -111,11 +111,28 @@ The AUR copy of `packaging/arch/PKGBUILD` differs from it only in where it build
 - It copies the install scriptlet, `packaging/arch/omarchy-broadcast.install`, unchanged. The scriptlet lies beside the copy when the `.SRCINFO` is generated, because makepkg checks that it exists.
 - The AUR repository holds exactly `PKGBUILD`, `.SRCINFO`, `omarchy-broadcast.install` and `LICENSE` (0BSD, written by the script too). `--aur` and `--check` refuse any other file in it.
 
+The script has four modes. To print the AUR PKGBUILD:
+
 ```sh
-scripts/aur.sh                  # prints the AUR PKGBUILD
-scripts/aur.sh --srcinfo        # prints its .SRCINFO
-scripts/aur.sh --check DIR      # fails, with a diff, when DIR's files are stale or DIR holds another file
-scripts/aur.sh --aur DIR        # writes PKGBUILD, .SRCINFO, omarchy-broadcast.install and LICENSE into DIR
+scripts/aur.sh
+```
+
+To print its .SRCINFO:
+
+```sh
+scripts/aur.sh --srcinfo
+```
+
+To check `DIR`, which fails with a diff when its files are stale or it holds another file:
+
+```sh
+scripts/aur.sh --check DIR
+```
+
+To write PKGBUILD, .SRCINFO, omarchy-broadcast.install and LICENSE into `DIR`:
+
+```sh
+scripts/aur.sh --aur DIR
 ```
 
 `DIR` must be the top of a git clone of the AUR repository. The script commits nothing. The clone is kept in `aur/omarchy-broadcast-git`, which this repository ignores. To publish, after the release commit is pushed to GitHub:
