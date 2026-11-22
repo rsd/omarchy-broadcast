@@ -189,7 +189,7 @@ The vendor runtimes of each engine are:
 | Engine | Packages |
 |---|---|
 | NVIDIA CUDA | `cuda`, `cudnn`, `nvidia-utils` |
-| NVIDIA TensorRT | TensorRT 11, as the package `tensorrt`: the AUR's `tensorrt` (under `/usr`) or `nvidia-tensorrt-sdk-local` from omarchy-nvidia-sdks (under `/opt/nvidia/tensorrt`); see "TensorRT's library path" below |
+| NVIDIA TensorRT | TensorRT 11, as the package `tensorrt`: the AUR's `tensorrt` (under `/usr`) or `nvidia-tensorrt-sdk-local` from omarchy-nvidia-sdks (under `/opt/nvidia/tensorrt`, visible to every program from its pkgrel 4); see "TensorRT's library path" below |
 | OpenVINO, Intel CPU | `openvino` |
 | OpenVINO, Intel GPU | `openvino-intel-gpu-plugin`, `intel-compute-runtime`, and an Intel GPU present in the running system (on a laptop with a GPU switch, hybrid mode rather than discrete-only) |
 | OpenVINO, Intel NPU | `openvino-intel-npu-plugin`, `intel-npu-driver`, `level-zero-loader`, and access to `/dev/accel/accel0` (normally through the `render` group) |
@@ -223,13 +223,19 @@ ONNX Runtime allows one environment per process, and the first library the daemo
 
 ### TensorRT's library path
 
-TensorRT needs its library directory on the daemon's `LD_LIBRARY_PATH`. TensorRT 11 opens its per-GPU builder library by name, `libnvinfer_builder_resource_sm<NN>.so.<version>` (on TensorRT 10, `libnvinfer_builder_resource.so.<version>`), and only the process's library path finds that name. Without the path, ONNX Runtime's TensorRT provider crashes the process, both when it builds an engine and when it loads a cached one.
+TensorRT's libraries must be findable by the daemon's library path. TensorRT 11 opens its per-GPU builder library by name, `libnvinfer_builder_resource_sm<NN>.so.<version>` (on TensorRT 10, `libnvinfer_builder_resource.so.<version>`), and only the process's library path finds that name. Without it, ONNX Runtime's TensorRT provider crashes the process, both when it builds an engine and when it loads a cached one.
 
 The module therefore checks, before it starts TensorRT, that the library for the installed GPU can be loaded. If it cannot, TensorRT is refused with a reason (section 5). `auto` goes on to CUDA, and an explicit `tensorrt` fails the load.
 
 **With the AUR's `tensorrt`,** which installs under `/usr/lib`, you need nothing: that directory is on the library path already.
 
-**With `nvidia-tensorrt-sdk`,** whose libraries are under `/opt/nvidia/tensorrt/lib`, give the daemon the package's environment file. It sets `LD_LIBRARY_PATH=/opt/nvidia/tensorrt/lib`. Use a systemd user drop-in at `~/.config/systemd/user/omarchy-broadcastd.service.d/onnx-tensorrt.conf`:
+**With `nvidia-tensorrt-sdk-local`** from omarchy-nvidia-sdks, you need nothing either, from release 4 of the package (pkgrel 4) on. The package ships a loader entry, `/etc/ld.so.conf.d/nvidia-tensorrt-sdk.conf`, for `/opt/nvidia/tensorrt/lib`. It also links TensorRT's builder libraries (`libnvinfer_builder_resource_sm<NN>.so.<version>`) into `/usr/lib`. So the daemon finds TensorRT without an environment file. The package still ships `/usr/share/nvidia-tensorrt/nvidia-tensorrt.env`, for compatibility. To check the release, run:
+
+```bash
+pacman -Q nvidia-tensorrt-sdk-local
+```
+
+**With an older release of `nvidia-tensorrt-sdk-local`** (pkgrel 3 or earlier), whose libraries are under `/opt/nvidia/tensorrt/lib`, give the daemon the package's environment file. It sets `LD_LIBRARY_PATH=/opt/nvidia/tensorrt/lib`. Use a systemd user drop-in at `~/.config/systemd/user/omarchy-broadcastd.service.d/onnx-tensorrt.conf`:
 
 ```ini
 [Service]
@@ -243,9 +249,9 @@ systemctl --user daemon-reload
 systemctl --user restart omarchy-broadcastd
 ```
 
-The `-` makes a missing file no error. The setting applies to the daemon's unit only. Do not put TensorRT's directory on `LD_LIBRARY_PATH` in a login profile. The directory holds only TensorRT's own libraries, but the rule of [maxine.md](maxine.md) stands: a library path set for every program you start can shadow the system's libraries.
+The `-` makes a missing file no error. The setting applies to the daemon's unit only. Do not put TensorRT's directory on `LD_LIBRARY_PATH` in a login profile. The directory holds only TensorRT's own libraries, but the rule of [maxine.md](maxine.md) stands: a library path set for every program you start can shadow the system's libraries. Updating the package to the current release removes the need for the drop-in.
 
-**With the Maxine module.** The daemon applies the Maxine SDK package's environment itself. It never applies that environment's `LD_LIBRARY_PATH`, which would put the SDK's bundled CUDA and TensorRT libraries ahead of the engines of ONNX Runtime ([maxine.md](maxine.md#3-the-sdk-environment)). The value you give the unit above is the one the daemon runs with. The Maxine module loads its libraries from its SDK root by absolute path and does not need it ([maxine.md](maxine.md)).
+**With the Maxine module.** The daemon applies the Maxine SDK package's environment itself. It never applies that environment's `LD_LIBRARY_PATH`, which would put the SDK's bundled CUDA and TensorRT libraries ahead of the engines of ONNX Runtime ([maxine.md](maxine.md#3-the-sdk-environment)). The value you give the unit (older package releases only) is the one the daemon runs with. The Maxine module loads its libraries from its SDK root by absolute path and does not need it ([maxine.md](maxine.md)).
 
 If you still have the `maxine.conf` drop-in of an earlier version, remove it. It is not needed any more, and it sets `LD_LIBRARY_PATH` too. When two files set a variable, the later one in the order of the file names wins, so the TensorRT drop-in would have to sort after it.
 
@@ -521,7 +527,7 @@ The NVIDIA GPU then stays asleep under `openvino-gpu`. The log says whether the 
 | `unavailable: No cut-out model installed (searched: ...)` | No model file in the directories listed | Install the models (section 3). The message names the directories searched |
 | A model fails to load with a checksum or file error | The file is not the catalogue's: a different conversion, a truncated copy | Use the files that the package or the checkout's scripts produce. Their checksums are in the module's README |
 | The model runs on the CPU although you have an NVIDIA GPU | `auto` found nothing better: the installed build is `onnxruntime-cpu`, or the CUDA reason says why (`CUDA not available: ...`) | Install `onnxruntime-core` with a CUDA provider package (or `onnxruntime-opt-cuda`) and `cudnn`, and read the reason in the log (section 5) |
-| The log says TensorRT's libraries are not on the daemon's library path, and the model runs on CUDA | The daemon's `LD_LIBRARY_PATH` lacks TensorRT's directory (`/opt/nvidia/tensorrt/lib` with `nvidia-tensorrt-sdk-local`) | Add the drop-in of section 2, "TensorRT's library path", then reload systemd and restart the daemon |
+| The log says TensorRT's libraries are not on the daemon's library path, and the model runs on CUDA | TensorRT's directory is not on the daemon's library path (`/opt/nvidia/tensorrt/lib` with `nvidia-tensorrt-sdk-local` pkgrel 3 or earlier) | Update the package to pkgrel 4 or later, or add the drop-in of section 2, "TensorRT's library path", then reload systemd and restart the daemon |
 | `Warning` says `<engine> was chosen and cannot run: <reason>; using <other engine>` | The engine you chose cannot run here. The module runs the first later engine of the order that starts. The stored setting is unchanged | Read the reason and fix it, or choose `auto` or the engine that runs |
 | The load fails with `<engine> was chosen and cannot run: ...; no later engine could run it (...)` | The chosen engine and every engine after it in the order failed | Read the reasons in the list. Choose `auto` or an engine that can run |
 | After changing the engine or model the picture did not change, and `Warning` ends `the previous setting keeps running` | The new setting could not load. The previous one keeps running by design | Read the reason before the semicolon and fix it, or set the setting back. Change it again or apply it again to try it once more |

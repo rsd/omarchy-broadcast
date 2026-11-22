@@ -137,7 +137,7 @@ TensorRT 11 opens its per-GPU builder library by name (`libnvinfer_builder_resou
 
 The module opens that library itself before it starts TensorRT. When it cannot, TensorRT is refused with a reason, `auto` goes on to CUDA and an explicit `tensorrt` fails the load.
 
-For `nvidia-tensorrt-sdk` (`/opt/nvidia/tensorrt`), set the path for the daemon's unit with a systemd user drop-in, `~/.config/systemd/user/omarchy-broadcastd.service.d/onnx-tensorrt.conf`:
+The current `nvidia-tensorrt-sdk-local` (pkgrel 4 or later) needs nothing: it ships a loader entry for `/opt/nvidia/tensorrt/lib` and links the builder libraries into `/usr/lib`. For an older release (`/opt/nvidia/tensorrt`), set the path for the daemon's unit with a systemd user drop-in, `~/.config/systemd/user/omarchy-broadcastd.service.d/onnx-tensorrt.conf`:
 
 ```ini
 [Service]
@@ -151,7 +151,7 @@ systemctl --user daemon-reload
 systemctl --user restart omarchy-broadcastd
 ```
 
-A TensorRT under `/usr/lib` (the AUR's `tensorrt`) needs nothing.
+A TensorRT under `/usr/lib` (the AUR's `tensorrt`) needs nothing either.
 
 The daemon never applies the Maxine SDK environment's own `LD_LIBRARY_PATH`, because its bundled CUDA and TensorRT libraries would shadow these engines. So the value of this drop-in is the one the daemon runs with. A `maxine.conf` drop-in of an earlier version also sets it; you no longer need it, so remove it. The full procedure is in [docs/setup/onnx.md](../../docs/setup/onnx.md).
 
