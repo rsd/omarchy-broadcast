@@ -4,7 +4,7 @@ On an NVIDIA RTX GPU, the Maxine modules give you the GPU video effects `blur` a
 
 The effects run on the NVIDIA Maxine Video Effects SDK, through the **Maxine module**. The module is a loadable module of omarchy-broadcast ([../modules.md](../modules.md)) that the daemon loads and that opens the SDK at run time.
 
-omarchy-broadcast does not contain, build or download the SDK. The SDK is a personal download from NVIDIA. The sibling project omarchy-nvidia-sdks (the omarchy-nvidia-sdks repository) packages it for Arch as `maxine-vfx-sdk-local`.
+omarchy-broadcast does not contain, build or download the SDK. The sibling project [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) installs it (section 2).
 
 This page covers the omarchy-broadcast side:
 
@@ -35,21 +35,21 @@ Before you start, you need:
 
 - an NVIDIA GPU of compute capability 7.5 or newer, and driver 570.26 or newer (section 1);
 - the core package installed and working ([INSTALL.md](../../INSTALL.md));
-- the SDK downloaded from NVIDIA with your own account (section 2).
+- the Video Effects SDK, installed with omarchy-nvidia-sdks (section 2).
 
 The module needs neither the open-model module nor ONNX Runtime, but without the open-model module you get no background effect while the video runs in system memory: with `[video] memory = "system"`, with no usable CUDA or while the battery saver is active ([onnx.md](onnx.md#using-it-on-a-machine-without-an-nvidia-gpu)).
 
 Then:
 
-1. Build and install the SDK package `maxine-vfx-sdk-local` from your download, with omarchy-nvidia-sdks (section 2).
-2. Install the module package `omarchy-broadcast-maxine-vfx-bin` (or `omarchy-broadcast-maxine-vfx-git`), as [INSTALL.md](../../INSTALL.md#add-the-nvidia-effects-optional-nvidia-rtx-gpu-only) describes. The module package depends on `maxine-vfx-sdk-local`.
+1. Install the Video Effects SDK with [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) (section 2).
+2. Install the module package `omarchy-broadcast-maxine-vfx-bin` (or `omarchy-broadcast-maxine-vfx-git`), as [INSTALL.md](../../INSTALL.md#add-the-nvidia-effects-optional-nvidia-rtx-gpu-only) describes.
 3. If the daemon is already running, restart it. Check the log and the module (section 3). The log shows `SDK environment applied from /usr/share/maxine-vfx/maxine-vfx.env`. `modules` lists `br.com.dias.maxine-vfx` with its stages.
 
 ## The Maxine module
 
 The module is the library `libobc_module_maxine.so` and a manifest, `maxine-vfx.toml`, which gives it the id `br.com.dias.maxine-vfx`.
 
-The Arch package `omarchy-broadcast-maxine-vfx-git` (or its prebuilt twin `omarchy-broadcast-maxine-vfx-bin`) is one of the packages built from one `PKGBUILD`. It depends on the module ABI that the core `omarchy-broadcast-git` provides and on `maxine-vfx-sdk-local`. It installs:
+The Arch package `omarchy-broadcast-maxine-vfx-git` (or its prebuilt twin `omarchy-broadcast-maxine-vfx-bin`) is one of the packages built from one `PKGBUILD`. It depends on the module ABI that the core `omarchy-broadcast-git` provides and on the Video Effects SDK (section 2). It installs:
 
 - the library as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so`;
 - the manifest in `/usr/lib/omarchy-broadcast/modules.d/`, where the daemon looks for manifests. The manifest names the library by absolute path.
@@ -114,7 +114,7 @@ Use an absolute path. `[effect] maxine_root` is still honoured: the daemon passe
 | GPU | NVIDIA, compute capability 7.5 or newer (Turing and up). Tested on the reference machine: RTX 5080 Laptop, CC 12.0 (sm_120) | `nvidia-smi --query-gpu=name,compute_cap --format=csv` |
 | Driver | 570.26 or newer. Tested: 615.78.08. The mask-hardening kernel does not raise this floor or the GPU floor | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
 | System CUDA toolkit | The SDK does not need it: the SDK bundles CUDA 12.8, cuDNN 9.7.1 and TensorRT 10.9 and only takes `libcuda.so.1` from the driver (`nvidia-utils`). The daemon's CUDA video path does need `cuda` for NVRTC (`libnvrtc.so`), which GStreamer's CUDA converters open, so the packages of the Maxine video module and the AR module depend on `cuda` | |
-| SDK features | One SDK package that contains the features below, with the models for your GPU architecture | `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` |
+| SDK features | An SDK install that contains the features below, with the models for your GPU architecture | `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` |
 
 Which effect needs which feature:
 
@@ -136,32 +136,25 @@ Which effect needs which feature:
 - The enhancement stage is available when either of its features is installed. Section 6 says what runs when the chosen method is the one that is missing.
 - The daemon checks what is installed from these files, without waking the GPU. A stage whose feature is missing is shown as "Not installed" by the clients and is never requested.
 
-## 2. The SDK package
+## 2. Install the SDK
 
-The omarchy-nvidia-sdks repository owns everything about the SDK itself: the NVIDIA account and NGC access, the download, the supported GPU architectures, and the Arch package `maxine-vfx-sdk-local`. Follow its [README](https://github.com/rsd/omarchy-nvidia-sdks#readme) and [INSTALL.md](https://github.com/rsd/omarchy-nvidia-sdks/blob/main/INSTALL.md) to build and install the package, and its `docs/download.md` for the download and `docs/gpu-support.md` for the architectures. Install it before the module package, which depends on it.
+The omarchy-nvidia-sdks repository owns everything about the SDK itself. Install the SDK with its [README](https://github.com/rsd/omarchy-nvidia-sdks#readme) and [INSTALL.md](https://github.com/rsd/omarchy-nvidia-sdks/blob/main/INSTALL.md), with the features of section 1 that you use, before the module package.
 
-Build the package with the features omarchy-broadcast uses (section 1). Leave out what you do not want:
-
-- `nvvfxrelighting` is only for relighting;
-- `nvvfxvideosuperres` and `nvvfxupscale` are only for enhancement;
-- `nvvfxtruehdr` is only for the HDR look;
-- frame generation needs `nvvfxvideoframegeneration`, which you can add the same way.
-
-The package installs:
+The daemon looks for the installed SDK here:
 
 - the SDK under `/opt/nvidia/maxine/videofx`;
-- an environment file, `/usr/share/maxine-vfx/maxine-vfx.env`;
+- the environment file, `/usr/share/maxine-vfx/maxine-vfx.env`;
 - the os-release shim, `/usr/lib/maxine-vfx/os-release-shim.so`.
 
 The daemon finds both files at start (section 3).
 
-Nothing in omarchy-broadcast builds or downloads the SDK. The module package `omarchy-broadcast-maxine-vfx-git` (or `-bin`) depends on `maxine-vfx-sdk-local`. Without the SDK package installed, its install fails: the AUR helper tries to build the SDK package from its AUR recipe, which needs your own download. The core does not need it. The SDK is a personal download, which is why the module is a package of its own.
+Nothing in omarchy-broadcast builds or downloads the SDK. The core does not need it. The SDK is licensed separately, which is why the module is a package of its own.
 
-**Licence.** The SDK is under NVIDIA's licence and is for your own machine only. omarchy-broadcast never distributes it. You must not put the SDK, the models or the package in a repository, a package or a release artifact. The licence notes are in the "Licence and personal use" section of the omarchy-nvidia-sdks README.
+**Licence.** The SDK is under NVIDIA's licence and is for your own machine only. omarchy-broadcast never distributes it. You must not put the SDK, the models or a package built from them in a repository, a package or a release artifact. The licence notes are in the "Licence and personal use" section of the omarchy-nvidia-sdks README.
 
 ## 3. The SDK environment
 
-The daemon needs the os-release shim from the moment it starts (see below). You need no systemd drop-in for it. With the SDK package installed, `omarchy-broadcastd` applies the package's environment to itself when it starts, and logs that it did.
+The daemon needs the os-release shim from the moment it starts (see below). You need no systemd drop-in for it. With the SDK installed, `omarchy-broadcastd` applies the SDK's environment to itself when it starts, and logs that it did.
 
 Install the packages ([INSTALL.md](../../INSTALL.md#add-the-nvidia-effects-optional-nvidia-rtx-gpu-only)), restart the daemon and check the log and the module:
 
@@ -171,11 +164,11 @@ journalctl --user -u omarchy-broadcastd | grep 'SDK environment'
 omarchy-broadcast modules
 ```
 
-The line is `SDK environment applied from /usr/share/maxine-vfx/maxine-vfx.env`. With the AR SDK installed as well, it names the two files, separated by a comma. `modules` lists `br.com.dias.maxine-vfx` with its stages. The same holds for a checkout (`scripts/install-user.sh`) when `maxine-vfx-sdk-local` is installed.
+The line is `SDK environment applied from /usr/share/maxine-vfx/maxine-vfx.env`. With the AR SDK installed as well, it names the two files, separated by a comma. `modules` lists `br.com.dias.maxine-vfx` with its stages. The same holds for a checkout (`scripts/install-user.sh`) when the Video Effects SDK is installed.
 
 ### What the daemon does
 
-At start the daemon looks for the SDK's two files: the environment file `/usr/share/maxine-vfx/maxine-vfx.env` (in the `EnvironmentFile=` syntax of systemd) and the shim `/usr/lib/maxine-vfx/os-release-shim.so`. Then it does the same for `maxine-ar-sdk-local` (`/usr/share/maxine-ar/maxine-ar.env`, `/usr/lib/maxine-ar/os-release-shim.so`).
+At start the daemon looks for the SDK's two files: the environment file `/usr/share/maxine-vfx/maxine-vfx.env` (in the `EnvironmentFile=` syntax of systemd) and the shim `/usr/lib/maxine-vfx/os-release-shim.so`. Then it does the same for the AR SDK (`/usr/share/maxine-ar/maxine-ar.env`, `/usr/lib/maxine-ar/os-release-shim.so`).
 
 When an SDK has both files, the daemon merges the file into its environment and **executes itself again**, once, with the same arguments and the same process. The PID, the unit and the sockets that systemd handed over are the same, and the process keeps the name of the binary.
 
@@ -228,7 +221,7 @@ systemctl --user restart omarchy-broadcastd.service
 
 The SDK's model loader reads `/etc/os-release` and refuses distributions that are not on NVIDIA's list. Omarchy reports `ID=omarchy`, and the SDK then fails with `-1209` ("no kernel image is available for execution on the device"). That message is misleading: no CUDA error occurs.
 
-`os-release-shim.so` is an `LD_PRELOAD` library, part of `maxine-vfx-sdk-local`. It shows the preloading process a replacement `os-release` (Ubuntu 24.04) instead of the real file. Only that process is affected, and no root is needed. It does not modify the SDK or the models. NVIDIA does not support this configuration. The shim works because the SDK reads `/etc/os-release` through an ordinary C library call. A future SDK version that reads it another way, or checks something else, would make the load fail again with `-1209`. The Maxine hardware tests detect this. How it works is in the "The compatibility shim" section of `docs/usage.md` in the omarchy-nvidia-sdks repository.
+`os-release-shim.so` is an `LD_PRELOAD` library that omarchy-nvidia-sdks installs with the Video Effects SDK. It shows the preloading process a replacement `os-release` (Ubuntu 24.04) instead of the real file. Only that process is affected, and no root is needed. It does not modify the SDK or the models. NVIDIA does not support this configuration. The shim works because the SDK reads `/etc/os-release` through an ordinary C library call. A future SDK version that reads it another way, or checks something else, would make the load fail again with `-1209`. The Maxine hardware tests detect this. How it works is in the "The compatibility shim" section of `docs/usage.md` in the omarchy-nvidia-sdks repository.
 
 Set `MAXINE_OS_RELEASE_DEBUG=1` in the daemon's environment to make the shim log each redirect on stderr. The journal then shows whether the shim is active.
 
@@ -246,7 +239,7 @@ The SDK root is the directory that contains `lib/`, `features/` and `external/`.
 
 1. `MAXINE_VFX_ROOT` in the daemon's environment, when it is set and not empty. The daemon does not take it from the package's environment file (section 3). Set it in a drop-in of your own to override the other sources.
 2. `sdk_root` in the module's table of `config.toml`, `[module."br.com.dias.maxine-vfx"]`, or, when that table sets none, `[effect] maxine_root` (an alias, kept for existing configurations). It must be an absolute path ([../config.example.toml](../config.example.toml)). A relative or empty `maxine_root` is rejected when the file is loaded. Whether the directory exists is found out when an effect loads.
-3. `/opt/nvidia/maxine/videofx`, when that is a directory: where `maxine-vfx-sdk-local` installs the SDK.
+3. `/opt/nvidia/maxine/videofx`, when that is a directory: where omarchy-nvidia-sdks installs the SDK.
 4. Otherwise no root: the SDK is looked up on the library search path only, which then has to include its directories (`LD_LIBRARY_PATH` at process start).
 
 When a root is chosen, the module loads the SDK's own libraries from it, by absolute path, before it opens `libVideoFX.so`. These are the SDK libraries, the libraries of every feature under `features/*/lib`, and the bundled CUDA and TensorRT libraries they depend on. **`LD_LIBRARY_PATH` is therefore not needed.** It still works if it is set. A feature added to the tree later is found without any change to the unit. The `models` directory next to the loaded `libVideoFX.so` (`<root>/lib/models`) is passed to the SDK as `NVVFX_MODEL_DIRECTORY`.
@@ -276,15 +269,15 @@ What the daemon reads, and where each value comes from:
 | `LD_LIBRARY_PATH` | Not needed. The environment file sets it, and the daemon does not apply it: its own loading from the root uses the same files | |
 | `OBC_NO_SDK_ENV` | `1` makes the daemon skip the SDK environment (section 3) | Set it by hand, for diagnosis |
 
-A feature added to the package later, as noise removal was, needs only a rebuild and a reinstall of `maxine-vfx-sdk-local` and a restart of the daemon.
+A feature added to the installed SDK later needs only a restart of the daemon.
 
-The bundled CUDA 12 and TensorRT 10 libraries are loaded into the daemon only. Never put them on `LD_LIBRARY_PATH` in a login profile or in `~/.bashrc`: they would shadow Arch's CUDA 13 for every program you start. For the same reason the SDK package installs no `ld.so.conf.d` or `profile.d` entry.
+The bundled CUDA 12 and TensorRT 10 libraries are loaded into the daemon only. Never put them on `LD_LIBRARY_PATH` in a login profile or in `~/.bashrc`: they would shadow Arch's CUDA 13 for every program you start.
 
 Development knob: `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process overrides the noise-removal strength, for comparisons. It is not a supported configuration (see section 6).
 
 ## 5. An SDK tree without the package
 
-An SDK tree that was installed some other way, for example under `~/.local/opt/maxine/VideoFX`, works too. The daemon applies an environment only from the SDK packages. For a tree of your own, set up in a drop-in what the package would. Two things are needed:
+An SDK tree that was installed some other way, for example under `~/.local/opt/maxine/VideoFX`, works too. The daemon applies an environment only from the fixed paths of section 2. For a tree of your own, set up in a drop-in what the package would. Two things are needed:
 
 1. The root, either in `config.toml`:
 
@@ -352,7 +345,7 @@ Turn it off:
 omarchy-broadcast denoise off
 ```
 
-It removes the grain a webcam produces, which is mostly visible in dim rooms. It runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the package (section 2).
+It removes the grain a webcam produces, which is mostly visible in dim rooms. It runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the installed SDK (section 1).
 
 - **It fails open.** Noise removal hides nothing. If it cannot load or run (the feature or SDK is missing, or the frame size is out of range), the stream continues without it, and the daemon's `Error` property says `noise removal unavailable: <reason>`. The privacy setting (`[effect] privacy`) does not apply to it and the daemon does not enter `error`. With privacy on, the effects themselves fail closed, as below.
 - **Frame size.** The feature supports frames from 80x80 up to 1920x1080 (the SDK's range). An output contract above 1080p runs without noise removal and reports the reason.
@@ -441,20 +434,20 @@ Problems with the SDK itself (download, package, architecture) are in omarchy-nv
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| The daemon's `Warning` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...); the video is black until it can run`, naming the os-release override (this page, section 3) (`Error`, with the state `error`, before interface revision 11) | The daemon runs without the shim: `maxine-vfx-sdk-local` is not installed (or lacks its environment file or its shim), the daemon was started with `OBC_NO_SDK_ENV=1`, or it was started before the package was installed. With privacy on (`[effect] privacy = true`, mode `black`) the virtual camera stays black. With the default, privacy off, it shows the camera without the effect | `journalctl --user -u omarchy-broadcastd \| grep 'SDK environment'` must show `SDK environment applied from ...` (or `already in place`). Install the package (section 2) and restart the daemon. Check `ls /usr/share/maxine-vfx/maxine-vfx.env /usr/lib/maxine-vfx/os-release-shim.so`. Set `MAXINE_OS_RELEASE_DEBUG=1` to see the redirect. A `cannot be preloaded` line in the journal means the shim cannot be loaded (a broken package, or a drop-in of yours whose `LD_PRELOAD` path is wrong) |
-| The journal has a warning ending `running without its environment`, naming a file under `/usr/share/maxine-vfx`, `/usr/lib/maxine-vfx` or the AR or audio equivalents | The SDK package is half installed (the environment file without the shim, or the reverse), or its environment file cannot be read or parsed (the warning gives the line) | Rebuild and reinstall the SDK package (section 2). The daemon runs without that SDK until then |
-| The journal has `the os-release shim of the SDK environment is not loaded` after `SDK environment applied` | The daemon executed itself again with `LD_PRELOAD`, but the shim did not load into it (a library that cannot be mapped, or a `noexec` mount of `/usr/lib`) | Check the library with `ldd /usr/lib/maxine-vfx/os-release-shim.so` and the mount options. Reinstall the package |
-| The unit fails to start, and `journalctl --user -u omarchy-broadcastd` shows `Failed to load environment files: No such file or directory` (systemd does not name the file) | A drop-in copied for an earlier version still has `EnvironmentFile=/usr/share/maxine-vfx/maxine-vfx.env` without a leading `-`, and `maxine-vfx-sdk-local` was removed | Remove the drop-in (section 8). The daemon no longer needs it |
+| The daemon's `Warning` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...); the video is black until it can run`, naming the os-release override (this page, section 3) (`Error`, with the state `error`, before interface revision 11) | The daemon runs without the shim: the Video Effects SDK is not installed (or its install lacks the environment file or the shim), the daemon was started with `OBC_NO_SDK_ENV=1`, or it was started before the SDK was installed. With privacy on (`[effect] privacy = true`, mode `black`) the virtual camera stays black. With the default, privacy off, it shows the camera without the effect | `journalctl --user -u omarchy-broadcastd \| grep 'SDK environment'` must show `SDK environment applied from ...` (or `already in place`). Install or update the SDK with [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) and restart the daemon. Check `ls /usr/share/maxine-vfx/maxine-vfx.env /usr/lib/maxine-vfx/os-release-shim.so`. Set `MAXINE_OS_RELEASE_DEBUG=1` to see the redirect. A `cannot be preloaded` line in the journal means the shim cannot be loaded (a broken SDK install, or a drop-in of yours whose `LD_PRELOAD` path is wrong) |
+| The journal has a warning ending `running without its environment`, naming a file under `/usr/share/maxine-vfx`, `/usr/lib/maxine-vfx` or the AR or audio equivalents | The SDK install is incomplete (the environment file without the shim, or the reverse), or its environment file cannot be read or parsed (the warning gives the line) | Install or update the SDK with omarchy-nvidia-sdks. The daemon runs without that SDK until then |
+| The journal has `the os-release shim of the SDK environment is not loaded` after `SDK environment applied` | The daemon executed itself again with `LD_PRELOAD`, but the shim did not load into it (a library that cannot be mapped, or a `noexec` mount of `/usr/lib`) | Check the library with `ldd /usr/lib/maxine-vfx/os-release-shim.so` and the mount options. Install or update the SDK with omarchy-nvidia-sdks |
+| The unit fails to start, and `journalctl --user -u omarchy-broadcastd` shows `Failed to load environment files: No such file or directory` (systemd does not name the file) | A drop-in copied for an earlier version still has `EnvironmentFile=/usr/share/maxine-vfx/maxine-vfx.env` without a leading `-`, and the Video Effects SDK was removed | Remove the drop-in (section 8). The daemon no longer needs it |
 | An effect fails with a message that the SDK is already loaded from another place and asks for a restart | `sdk_root`, `[effect] maxine_root` (or `MAXINE_VFX_ROOT`) changed after the SDK was first loaded in the running daemon | `systemctl --user restart omarchy-broadcastd` (section 4) |
-| An effect reports that a feature library is not found (`-2`) or the package lacks a feature | The package was built without that feature | Rebuild `maxine-vfx-sdk-local` with the features of section 1 that you use (section 2), reinstall it and restart the daemon |
+| An effect reports that a feature library is not found (`-2`) or the SDK lacks a feature | The installed SDK does not have that feature | Install or update the SDK with omarchy-nvidia-sdks, with the features of section 1 that you use, and restart the daemon |
 | `omarchy-broadcast modules` says `No effect modules installed`, or the settings have no effect group | The Maxine module's manifest is not in a `modules.d` directory: the package is not installed, or the checkout was not installed with `scripts/install-user.sh` (or the module was not built and installed by hand) | Install the package, or run `scripts/install-user.sh` in the checkout (see "From a checkout" under [The Maxine module](#the-maxine-module)). Then `systemctl --user restart omarchy-broadcastd` |
 | The module is listed `unavailable`, with a reason such as `The library /... is not installed` or `Built for module ABI N; this daemon supports module ABI 1` | The library named by the manifest's `library` is missing, or was built for another version of the module interface than this daemon's | Check the paths with `omarchy-broadcast modules info br.com.dias.maxine-vfx`. Rebuild and reinstall the module from the same checkout as the daemon |
 | The module is `disabled` with `Disabled after crashing the daemon twice in a row` | The module's code was running when the daemon went down twice in a row (see the journal for the crash) | Fix the cause (the SDK installation and the shim of section 3 are the usual ones), then `omarchy-broadcast modules enable br.com.dias.maxine-vfx` |
-| A setting such as `effect.lighting.relight`, `effect.video.denoise` or `effect.video.hdr` is greyed "Not installed" | The package has no library, or no models for this GPU's architecture, for that feature (relighting also needs `nvvfxgreenscreen`; the HDR look needs `nvvfxtruehdr`, which has no model files) | `ls /opt/nvidia/maxine/videofx/features` and `ls /opt/nvidia/maxine/videofx/lib/models`. Rebuild the package with the feature and your architecture (section 2). The daemon looks again at its next start, reload and session |
-| A stage shows as installed, but the effect fails when it loads, and `Warning` gives the SDK's reason | Until the GPU's compute capability is known (before the first session on a machine, with no cache file), the check counts models for any architecture as installed. A model for another architecture then fails when the stage loads, and the stage fails open with the SDK's reason. The check reports what is on disk, not what loads | Install models for your GPU's architecture (section 2). After the first session the daemon knows the architecture and shows the stage as "Not installed" |
+| A setting such as `effect.lighting.relight`, `effect.video.denoise` or `effect.video.hdr` is greyed "Not installed" | The installed SDK has no library, or no models for this GPU's architecture, for that feature (relighting also needs `nvvfxgreenscreen`; the HDR look needs `nvvfxtruehdr`, which has no model files) | `ls /opt/nvidia/maxine/videofx/features` and `ls /opt/nvidia/maxine/videofx/lib/models`. Install or update the SDK with omarchy-nvidia-sdks. The daemon looks again at its next start, reload and session |
+| A stage shows as installed, but the effect fails when it loads, and `Warning` gives the SDK's reason | Until the GPU's compute capability is known (before the first session on a machine, with no cache file), the check counts models for any architecture as installed. A model for another architecture then fails when the stage loads, and the stage fails open with the SDK's reason. The check reports what is on disk, not what loads | Install or update the SDK with omarchy-nvidia-sdks, with the models for your GPU's architecture. After the first session the daemon knows the architecture and shows the stage as "Not installed" |
 | The daemon's `Error` says `relighting unavailable: ...` or `enhance unavailable: ...`, and the video is shown without it | The feature failed to load or run (the reason says which) | The reason names the SDK's status. Check section 3 (the shim applies to every feature's library) and the models. The video is not affected otherwise |
-| The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The package does not contain the `nvvfxdenoising` feature, or the daemon found no SDK root (section 4) and so looked for it on the library search path only | Check that `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` lists `nvvfxdenoising`. If not, rebuild the package with it (section 2). Check the `SDK environment` line (section 3) |
-| The same, with `-1209` or `-13` | The shim is not applied to this process (the feature's library needs it too), or the `Denoise-*` models for your architecture are not in the package | Section 3. `ls /opt/nvidia/maxine/videofx/lib/models` must show `Denoise-agg-<SM>.engine.trtpkg` and `Denoise-con-<SM>.engine.trtpkg`. Otherwise rebuild the package for your architecture |
+| The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The installed SDK does not contain the `nvvfxdenoising` feature, or the daemon found no SDK root (section 4) and so looked for it on the library search path only | Check that `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` lists `nvvfxdenoising`. If not, install or update the SDK with omarchy-nvidia-sdks. Check the `SDK environment` line (section 3) |
+| The same, with `-1209` or `-13` | The shim is not applied to this process (the feature's library needs it too), or the `Denoise-*` models for your architecture are not installed | Section 3. `ls /opt/nvidia/maxine/videofx/lib/models` must show `Denoise-agg-<SM>.engine.trtpkg` and `Denoise-con-<SM>.engine.trtpkg`. Otherwise install or update the SDK with omarchy-nvidia-sdks |
 | The same, with a message that the frame size is out of range | The output contract is smaller than 80x80 or larger than 1920x1080 | Use an output mode within the range (`[output]` in `config.toml`). Noise removal does not run outside it |
 | The daemon's `Warning` property (`Error` before interface revision 11) or the element's status names the mask-hardening kernel and a CUDA error `222` ("the NVIDIA driver is older than this build supports") | The driver rejects the PTX of the mask-hardening kernel: it is older than 570.26 | Update the NVIDIA driver to 570.26 or newer (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`). With privacy on (`[effect] privacy`), the virtual camera stays black until then; with the default, privacy off, it shows the camera without the effect |
 | The same, with CUDA error `221` | The driver cannot JIT-compile the kernel: `libnvidia-ptxjitcompiler.so.1` is missing from the driver installation | Reinstall the driver's userspace package (`nvidia-utils`) so that it provides `libnvidia-ptxjitcompiler.so.1`. Check with `ldconfig -p \| grep ptxjitcompiler` |
@@ -466,9 +459,9 @@ Two more effects run on the NVIDIA Maxine **AR** SDK, through a second module of
 - **Eye contact** redirects the eyes towards the camera.
 - **Auto-framing** is a digital pan and zoom that keeps the face in frame.
 
-The AR SDK is a separate personal download from the Video Effects SDK. omarchy-nvidia-sdks packages it as `maxine-ar-sdk-local`. Everything on this page about not distributing the SDK (section 9) applies to it too.
+The AR SDK is separate from the Video Effects SDK, and omarchy-nvidia-sdks installs it too. Everything on this page about not distributing the SDK (section 9) applies to it too.
 
-The module is the library `libobc_module_maxine_ar.so` and the manifest `maxine-ar.toml`. The Arch package `omarchy-broadcast-maxine-ar-git` (or `omarchy-broadcast-maxine-ar-bin`) installs it and depends on `maxine-ar-sdk-local` (and on the module ABI that the core provides). `scripts/install-user.sh` installs it for the current user in the same way as the Maxine module (see "From a checkout" under [The Maxine module](#the-maxine-module)).
+The module is the library `libobc_module_maxine_ar.so` and the manifest `maxine-ar.toml`. The Arch package `omarchy-broadcast-maxine-ar-git` (or `omarchy-broadcast-maxine-ar-bin`) installs it, and depends on the AR SDK and on the module ABI that the core provides. `scripts/install-user.sh` installs it for the current user in the same way as the Maxine module (see "From a checkout" under [The Maxine module](#the-maxine-module)).
 
 It opens the SDK at run time, so it installs and loads without the SDK or an NVIDIA GPU. Without the SDK, or without the models the effect needs for your GPU, the effect's setting is greyed with the reason, for example `Maxine AR SDK not installed` or `No face detection models for this GPU (sm_120)`. Check it with:
 
@@ -482,7 +475,7 @@ omarchy-broadcast modules info br.com.dias.maxine-ar
 | `eye-contact` | `effect.eye_contact.enabled` | `nvarfaceboxdetection`, `nvarlandmarkdetection` and `nvargazeredirection`, with the models for your GPU architecture: face detection, 126-point face landmarks and gaze redirection |
 | `auto-frame` | `effect.auto_frame.enabled` | `nvarfaceboxdetection`, with its face detection models |
 
-The GPU and driver requirements are those of section 1. The names are those of the SDK's feature directories under `features/`. The daemon checks what is installed from these directories and the files in `lib/models`, without waking the GPU. `MAXINE_AR_FEATURES` in `/usr/share/maxine-ar/maxine-ar.env` lists the features the package was built with.
+The GPU and driver requirements are those of section 1. The names are those of the SDK's feature directories under `features/`. The daemon checks what is installed from these directories and the files in `lib/models`, without waking the GPU. `MAXINE_AR_FEATURES` in `/usr/share/maxine-ar/maxine-ar.env` lists the features the installed SDK contains.
 
 ### The AR SDK root
 
@@ -517,10 +510,10 @@ The AR SDK's feature libraries read `/etc/os-release` as the Video Effects SDK's
 
 The shim is process-wide:
 
-- With both packages installed, the daemon preloads one shim, the Video Effects package's, and applies the AR file's other variables. `MAXINE_OS_RELEASE` is then the Video Effects package's.
-- With only `maxine-ar-sdk-local` installed, it preloads the AR package's.
+- With both SDKs installed, the daemon preloads one shim, the Video Effects SDK's, and applies the AR file's other variables. `MAXINE_OS_RELEASE` is then the Video Effects SDK's.
+- With only the AR SDK installed, it preloads the AR SDK's.
 
-The log line names the files applied. You write nothing by hand. Earlier versions asked for a drop-in `maxine-ar.conf` at `~/.config/systemd/user/omarchy-broadcastd.service.d/` when only the AR package was installed. It is no longer needed.
+The log line names the files applied. You write nothing by hand. Earlier versions asked for a drop-in `maxine-ar.conf` at `~/.config/systemd/user/omarchy-broadcastd.service.d/` when only the AR SDK was installed. It is no longer needed.
 
 ### Both SDKs in one process
 
@@ -546,32 +539,32 @@ If a stage is greyed or does not run, the reason is the one `omarchy-broadcast m
 
 | Reason shown | Cause | Fix |
 |---|---|---|
-| `Maxine AR SDK not installed` | No SDK root was found, or it lacks the core libraries | Install `maxine-ar-sdk-local`, or set `sdk_root` or `MAXINE_AR_ROOT`. Restart the daemon |
-| `Maxine AR face detection not installed`, `Maxine AR landmark detection not installed` or `Maxine AR eye contact not installed` | The package was built without that feature | Rebuild `maxine-ar-sdk-local` with the feature (the table above), reinstall it and restart the daemon |
-| `No face detection models for this GPU (sm_120)` (or `126-point face landmark`, or `Eye Contact`) | The package has no models of that kind for your GPU architecture | `ls /opt/nvidia/maxine/arsdk/lib/models`, and rebuild the package for your architecture |
+| `Maxine AR SDK not installed` | No SDK root was found, or it lacks the core libraries | Install or update the AR SDK with omarchy-nvidia-sdks, or set `sdk_root` or `MAXINE_AR_ROOT`. Restart the daemon |
+| `Maxine AR face detection not installed`, `Maxine AR landmark detection not installed` or `Maxine AR eye contact not installed` | The installed AR SDK does not have that feature | Install or update the AR SDK with omarchy-nvidia-sdks, with the features of the table above, and restart the daemon |
+| `No face detection models for this GPU (sm_120)` (or `126-point face landmark`, or `Eye Contact`) | The installed AR SDK has no models of that kind for your GPU architecture | `ls /opt/nvidia/maxine/arsdk/lib/models`, and install or update the AR SDK with omarchy-nvidia-sdks |
 | The stage is available but is dropped, and the `Warning` names an SDK status | The shim is not applied to the daemon (the feature libraries read `/etc/os-release`), or the models are not found | The AR shim section above and section 3 (the `SDK environment` line). `MAXINE_OS_RELEASE_DEBUG=1` shows the redirect |
 
-A drop-in `maxine-ar.conf` written for an earlier version is not needed any more. Remove it as in section 8. Remove the AR module package and then the SDK package, only if nothing else uses the SDK (`omarchy-broadcast-maxine-ar-bin` for the prebuilt module):
+A drop-in `maxine-ar.conf` written for an earlier version is not needed any more. Remove it as in section 8. Remove the AR module package with the command below (`omarchy-broadcast-maxine-ar-bin` for the prebuilt module). Section 8 says where removing the SDK is covered.
 
 ```bash
-sudo pacman -R omarchy-broadcast-maxine-ar-git maxine-ar-sdk-local
+sudo pacman -R omarchy-broadcast-maxine-ar-git
 ```
 
 ## The Maxine audio effects module
 
-The microphone's GPU effects run on the NVIDIA Maxine **Audio Effects** SDK, through a third module of omarchy-broadcast, `br.com.dias.maxine-afx` (an `audio-filter` module: [../modules.md](../modules.md#the-audio-modules-in-this-repository)). The Audio Effects SDK is a separate personal download from the Video Effects and AR SDKs. omarchy-nvidia-sdks packages it as `maxine-afx-sdk-local`. Section 9 applies to it too.
+The microphone's GPU effects run on the NVIDIA Maxine **Audio Effects** SDK, through a third module of omarchy-broadcast, `br.com.dias.maxine-afx` (an `audio-filter` module: [../modules.md](../modules.md#the-audio-modules-in-this-repository)). The Audio Effects SDK is separate from the Video Effects and AR SDKs, and omarchy-nvidia-sdks installs it too. Section 9 applies to it too.
 
 It differs from the two video modules in three ways, which is why this page does not describe it with them:
 
-- **The audio worker loads it, not the daemon.** The worker is the unit `omarchy-broadcast-audiod.service`. The worker, not `omarchy-broadcastd`, applies the Audio Effects SDK's environment to itself (`/usr/share/maxine-afx/maxine-afx.env` and `/usr/lib/maxine-afx/os-release-shim.so`). The daemon never opens the audio SDK. The camera does not need the audio SDK, and the microphone does not need the camera's. A machine can have any of the three SDK packages.
+- **The audio worker loads it, not the daemon.** The worker is the unit `omarchy-broadcast-audiod.service`. The worker, not `omarchy-broadcastd`, applies the Audio Effects SDK's environment to itself (`/usr/share/maxine-afx/maxine-afx.env` and `/usr/lib/maxine-afx/os-release-shim.so`). The daemon never opens the audio SDK. The camera does not need the audio SDK, and the microphone does not need the camera's. A machine can have any of the three SDKs.
 - **`LD_LIBRARY_PATH` is required.** The SDK opens its effects' feature libraries by a name that only the library search path resolves, read when the process starts. So, unlike the video modules, which load their libraries by absolute path, this module requires the path to lead to the feature libraries of the root in use. The package's environment file sets it, and the worker, unlike the daemon, applies it: it merges the file's entries after the ones of its own environment (section 3). Without it the stages are unavailable, with a reason that names the SDK package.
 - **The root is searched in the other order.** `sdk_root` in `[module."br.com.dias.maxine-afx"]`, then `MAXINE_AFX_ROOT`, then `/opt/nvidia/maxine/afx`. The configured root comes first, whereas for the video modules the environment variable comes first (section 4).
 
 The os-release shim of section 3 applies to the worker in the same way. At start the worker merges the package's environment into its own, preloads the shim and executes itself again, once, with the same rules as the daemon. It logs `SDK environment applied from /usr/share/maxine-afx/maxine-afx.env` ([microphone.md](microphone.md#the-workers-sdk-environment) shows the command that finds the line).
 
-The worker starts on demand and exits when the microphone is idle, so the next start applies the environment. You need no restart of the unit after installing the package.
+The worker starts on demand and exits when the microphone is idle, so the next start applies the environment. You need no restart of the unit after installing the SDK.
 
-The Arch package `omarchy-broadcast-maxine-afx-git` (or `omarchy-broadcast-maxine-afx-bin`) installs the module and depends on `maxine-afx-sdk-local`. From a checkout, the script's `--audio` option installs the module for the current user ([microphone.md](microphone.md#with-scriptsinstall-usersh---audio)).
+The Arch package `omarchy-broadcast-maxine-afx-git` (or `omarchy-broadcast-maxine-afx-bin`) installs the module and depends on the Audio Effects SDK. From a checkout, the script's `--audio` option installs the module for the current user ([microphone.md](microphone.md#with-scriptsinstall-usersh---audio)).
 
 The module installs and loads without the SDK, and without the SDK the microphone uses its CPU module.
 
@@ -584,15 +577,14 @@ omarchy-broadcast modules info br.com.dias.maxine-afx
 
 ## 8. Uninstall
 
-Remove the module package first, because it depends on the SDK package. Then remove the SDK package, if nothing else uses it, and restart the daemon:
+Remove the module package and restart the daemon:
 
 ```bash
 sudo pacman -R omarchy-broadcast-maxine-vfx-git
-sudo pacman -R maxine-vfx-sdk-local
 systemctl --user restart omarchy-broadcastd.service
 ```
 
-For the prebuilt module, remove `omarchy-broadcast-maxine-vfx-bin` instead.
+For the prebuilt module, remove `omarchy-broadcast-maxine-vfx-bin` instead. Removing the SDKs is covered by [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks).
 
 Without the SDK the daemon runs as usual and the effects are unavailable.
 
@@ -624,7 +616,7 @@ omarchy-broadcast modules disable br.com.dias.maxine-vfx
 rm -f ~/.local/lib/omarchy-broadcast/os-release-shim.so ~/.local/lib/omarchy-broadcast/fake-os-release
 ```
 
-**The audio module** needs no drop-in either. Once `maxine-afx-sdk-local` is removed (after `omarchy-broadcast-maxine-afx-git`, or `-bin`, which depends on it), the worker starts without the SDK from its next start. Delete a drop-in copied for an earlier version, `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf`:
+**The audio module** needs no drop-in either. Once the Audio Effects SDK is removed, the worker starts without it from its next start. Delete a drop-in copied for an earlier version, `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf`:
 
 ```bash
 rm -f ~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf
@@ -637,14 +629,12 @@ systemctl --user daemon-reload
 omarchy-broadcast modules disable br.com.dias.maxine-afx
 ```
 
-The NGC CLI, the NGC key and the downloads belong to omarchy-nvidia-sdks. Its documentation covers removing them.
-
 ## 9. Licence and support
 
 This is a summary, not legal advice. Read the licence you accept.
 
 - The SDK and its models are NVIDIA's, under NVIDIA's licence. You download them with your own NVIDIA account and accept that licence yourself.
-- Neither omarchy-broadcast nor omarchy-nvidia-sdks redistributes NVIDIA files. Do not commit the SDK, the models, an NGC key or `~/.ngc/` to a repository, and do not put them in a package or release artifact.
+- omarchy-broadcast never redistributes NVIDIA files. Do not commit the SDK or the models to a repository, and do not put them in a package or release artifact.
 - Benchmark results for the SDK are not published (SLA 8.9).
 - Running the SDK on a distribution it does not list, through the compatibility shim, is not supported by NVIDIA.
 

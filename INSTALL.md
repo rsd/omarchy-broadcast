@@ -125,25 +125,25 @@ Every command of the CLI is in [docs/cli-json.md](docs/cli-json.md). The guides 
 
 ## Add the NVIDIA effects (optional, NVIDIA RTX GPU only)
 
-This section starts in a second repository. The NVIDIA Maxine effects need an NVIDIA RTX GPU and its driver, and an SDK that you download from NVIDIA yourself. [The requirements](docs/setup/maxine.md#1-requirements) include the SDK features each effect needs. [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) turns each SDK into a local pacman package: `maxine-vfx-sdk-local` for the video effects, `maxine-ar-sdk-local` for eye contact and auto-framing, `maxine-afx-sdk-local` for the microphone's effects. Build and install the SDK packages you want there, then come back here. That repository also covers the microphone's effects and their sample rates.
+The NVIDIA Maxine effects need an NVIDIA RTX GPU and its driver, and the NVIDIA Maxine SDK of each module you want. [The requirements](docs/setup/maxine.md#1-requirements) list the SDK features each effect needs. omarchy-broadcast does not contain or install the SDK.
 
-**Install only the module packages whose SDK package you built.** A module package depends on its SDK package. If that is not installed, the AUR helper tries to build it from its AUR recipe. That build fails without your SDK download, and the module package is not installed. The video and AR module packages also pull in `cuda` as a dependency, so you do not install it yourself.
+[omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) installs the Video Effects, AR and Audio Effects SDKs on Arch and Omarchy. Install the SDKs you want there first, then come back here.
 
 The commands below install the prebuilt kind. If you chose the `-git` kind in step 2, replace `-bin` with `-git` at the end of each name, for example `omarchy-broadcast-maxine-vfx-git`. Run the command of each module you want.
 
-The video effects need `maxine-vfx-sdk-local`:
+The video effects need the Maxine Video Effects SDK:
 
 ```sh
 yay -S omarchy-broadcast-maxine-vfx-bin
 ```
 
-Eye contact and auto-framing need `maxine-ar-sdk-local`:
+Eye contact and auto-framing need the Maxine AR SDK:
 
 ```sh
 yay -S omarchy-broadcast-maxine-ar-bin
 ```
 
-The microphone's effects need `maxine-afx-sdk-local`:
+The microphone's effects need the Maxine Audio Effects SDK:
 
 ```sh
 yay -S omarchy-broadcast-maxine-afx-bin
@@ -177,7 +177,6 @@ The daemon runs the new version afterwards. A module library that is rebuilt tak
 | `omarchy-broadcast status` shows the state `error` | The v4l2loopback device labelled "Omarchy Broadcast" is missing. The daemon retries every 2 s | Create the virtual camera (step 4). [docs/setup/loopback.md](docs/setup/loopback.md#troubleshooting) has more |
 | `omarchy-broadcast` exits with status 3 | The daemon is not running, or there is no D-Bus session bus | Run `omarchy-broadcast start` or step 5, then `systemctl --user status omarchy-broadcastd` |
 | The AUR helper offers the previous version | The AUR's RPC index lags a few minutes after a release | Wait and try again |
-| The install of a Maxine module package fails while building `maxine-vfx-sdk-local` (or `-ar-`, `-afx-`), with `no Maxine VFX SDK found` (or `AR`, `AFX`) | The SDK package is not installed, so the AUR helper builds its recipe, which needs your own SDK download | Build and install it with [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) first ([Add the NVIDIA effects](#add-the-nvidia-effects-optional-nvidia-rtx-gpu-only)) |
 | An old daemon keeps starting after you installed the package | A copy of the unit in `~/.config/systemd/user` shadows the packaged one | [docs/setup/daemon.md](docs/setup/daemon.md#which-unit-is-used) |
 
 More in the troubleshooting sections of the guides: [daemon](docs/setup/daemon.md#troubleshooting), [loopback](docs/setup/loopback.md#troubleshooting), [ONNX](docs/setup/onnx.md#8-troubleshooting), [Maxine](docs/setup/maxine.md#7-troubleshooting) and [microphone](docs/setup/microphone.md#troubleshooting).
@@ -197,8 +196,8 @@ More in the troubleshooting sections of the guides: [daemon](docs/setup/daemon.m
    systemctl --user daemon-reload
    ```
 
-   This removes the udev rule too. Remove any drop-in you copied from the examples (the WirePlumber one). A Maxine drop-in copied for an earlier version is not needed any more ([docs/setup/maxine.md](docs/setup/maxine.md#3-the-sdk-environment)). The Maxine module packages and the SDK packages are removed as [docs/setup/maxine.md](docs/setup/maxine.md#8-uninstall) describes. For a build from a checkout, see [docs/building.md](docs/building.md#uninstall-a-build-from-source).
+   This removes the udev rule too. Remove any drop-in you copied from the examples (the WirePlumber one). A Maxine drop-in copied for an earlier version is not needed any more ([docs/setup/maxine.md](docs/setup/maxine.md#3-the-sdk-environment)). The Maxine module packages are removed as [docs/setup/maxine.md](docs/setup/maxine.md#8-uninstall) describes. For a build from a checkout, see [docs/building.md](docs/building.md#uninstall-a-build-from-source).
 
 3. The bar plugin is not part of the package. See the [omarchy-broadcast-plugin](https://github.com/rsd/omarchy-broadcast-plugin) repository for removing it. Removing the plugin does not touch the daemon.
 
-ONNX Runtime, the model packages and the SDK packages belong to their own repositories, and removing them is described there.
+ONNX Runtime, the model packages and the NVIDIA SDKs belong to their own repositories, and removing them is described there.

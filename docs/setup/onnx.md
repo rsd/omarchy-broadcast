@@ -1,6 +1,6 @@
 # Open-model cut-out (ONNX)
 
-The open-model cut-out gives you background blur and background replacement without NVIDIA Maxine and without an NVIDIA GPU. It is a loadable module with the id `br.com.dias.onnx-cutout` ([modules.md](../modules.md)). It provides the `background` stage: it cuts the person out and blurs or replaces the room behind them. It uses open models under the Apache License 2.0. The module loads ONNX Runtime at run time, so one build works with whichever `onnxruntime-*` package you install.
+The open-model cut-out gives you background blur and background replacement without NVIDIA Maxine and without an NVIDIA GPU. It is a loadable module with the id `br.com.dias.onnx-cutout` ([modules.md](../modules.md)). It provides the `background` stage: it cuts the person out and blurs or replaces the room behind them. It uses open models under the Apache License 2.0. The module loads ONNX Runtime at run time, so one build works with whichever ONNX Runtime package you install.
 
 This page covers how to install the module, its runtime and its models, how to choose the model and the engine, how to read the reasons an engine is not used, and the failures specific to omarchy-broadcast. Every setting, key and variable of the module is in its [README](../../crates/obc-module-onnx/README.md).
 
@@ -133,7 +133,7 @@ Without ONNX Runtime, or without any model file, the module still loads. `omarch
 
 The module needs ONNX Runtime 1.29 or later: a `libonnxruntime.so` with the C API of that version. The module package depends on `onnxruntime>=1.29`, and any package that provides it satisfies the module.
 
-Any package that provides `onnxruntime` 1.29 or later satisfies the module, a CPU-only one included, and the package decides which engines the module can use. The choice is made in [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime): [step 1 of its INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md#1-choose-your-packages) is the table of hardware and packages and says which vendor runtimes each engine needs, and its [docs/choosing.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/choosing.md) compares that set with Arch's `onnxruntime-*` packages. This guide does not repeat them. Its [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/engines.md) describes each engine and what it needs. After you install a package, check it as [Check the install](#check-the-install) describes: the reasons in section 5 say what an engine is missing.
+Any package that provides `onnxruntime` 1.29 or later satisfies the module, a CPU-only one included, and the package decides which engines the module can use. The choice is made in [omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime): [step 1 of its INSTALL.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/INSTALL.md#1-choose-your-packages) is the table of hardware and packages and says which vendor runtimes each engine needs, and its [docs/choosing.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/choosing.md) compares that set with Arch's own ONNX Runtime packages. This guide does not repeat them. Its [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/engines.md) describes each engine and what it needs. After you install a package, check it as [Check the install](#check-the-install) describes: the reasons in section 5 say what an engine is missing.
 
 AMD GPUs have no engine in the module yet. On an AMD machine it runs the CPU engine.
 
@@ -157,19 +157,13 @@ TensorRT's libraries must be findable by the daemon's library path. TensorRT 11 
 
 The module therefore checks, before it starts TensorRT, that the library for the installed GPU can be loaded. If it cannot, TensorRT is refused with a reason (section 5). `auto` goes on to CUDA, and an explicit `tensorrt` fails the load.
 
-**With the AUR's `tensorrt`,** which installs under `/usr/lib`, you need nothing: that directory is on the library path already.
+When TensorRT's libraries are on the system's library path, you need nothing. To install or update TensorRT, use [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks).
 
-**With `nvidia-tensorrt-sdk-local`** from omarchy-nvidia-sdks, you need nothing either, from release 4 of the package (pkgrel 4) on. The package ships a loader entry, `/etc/ld.so.conf.d/nvidia-tensorrt-sdk.conf`, for `/opt/nvidia/tensorrt/lib`. It also links TensorRT's builder libraries (`libnvinfer_builder_resource_sm<NN>.so.<version>`) into `/usr/lib`. So the daemon finds TensorRT without an environment file. The package still ships `/usr/share/nvidia-tensorrt/nvidia-tensorrt.env`, for compatibility. To check the release, run:
-
-```bash
-pacman -Q nvidia-tensorrt-sdk-local
-```
-
-**With an older release of `nvidia-tensorrt-sdk-local`** (pkgrel 3 or earlier), whose libraries are under `/opt/nvidia/tensorrt/lib`, give the daemon the package's environment file. It sets `LD_LIBRARY_PATH=/opt/nvidia/tensorrt/lib`. Use a systemd user drop-in at `~/.config/systemd/user/omarchy-broadcastd.service.d/onnx-tensorrt.conf`:
+When TensorRT's libraries are in a directory that is not on the library path, such as `/opt/nvidia/tensorrt/lib`, put that directory on the daemon's `LD_LIBRARY_PATH`. Use a systemd user drop-in at `~/.config/systemd/user/omarchy-broadcastd.service.d/onnx-tensorrt.conf`:
 
 ```ini
 [Service]
-EnvironmentFile=-/usr/share/nvidia-tensorrt/nvidia-tensorrt.env
+Environment=LD_LIBRARY_PATH=/opt/nvidia/tensorrt/lib
 ```
 
 Then reload systemd and restart the daemon:
@@ -179,9 +173,9 @@ systemctl --user daemon-reload
 systemctl --user restart omarchy-broadcastd
 ```
 
-The `-` makes a missing file no error. The setting applies to the daemon's unit only. Do not put TensorRT's directory on `LD_LIBRARY_PATH` in a login profile. The directory holds only TensorRT's own libraries, but the rule of [maxine.md](maxine.md) stands: a library path set for every program you start can shadow the system's libraries. Updating the package to the current release removes the need for the drop-in.
+The setting applies to the daemon's unit only. Do not put TensorRT's directory on `LD_LIBRARY_PATH` in a login profile. The directory holds only TensorRT's own libraries, but the rule of [maxine.md](maxine.md) stands: a library path set for every program you start can shadow the system's libraries.
 
-**With the Maxine module.** The daemon applies the Maxine SDK package's environment itself. It never applies that environment's `LD_LIBRARY_PATH`, which would put the SDK's bundled CUDA and TensorRT libraries ahead of the engines of ONNX Runtime ([maxine.md](maxine.md#3-the-sdk-environment)). The value you give the unit (older package releases only) is the one the daemon runs with. The Maxine module loads its libraries from its SDK root by absolute path and does not need it ([maxine.md](maxine.md)).
+**With the Maxine module.** The daemon applies the Maxine SDK's environment itself. It never applies that environment's `LD_LIBRARY_PATH`, which would put the SDK's bundled CUDA and TensorRT libraries ahead of the engines of ONNX Runtime ([maxine.md](maxine.md#3-the-sdk-environment)). The value you give the unit is the one the daemon runs with. The Maxine module loads its libraries from its SDK root by absolute path and does not need it ([maxine.md](maxine.md)).
 
 If you still have the `maxine.conf` drop-in of an earlier version, remove it. It is not needed any more, and it sets `LD_LIBRARY_PATH` too. When two files set a variable, the later one in the order of the file names wins, so the TensorRT drop-in would have to sort after it.
 
@@ -368,7 +362,7 @@ A model that fails to load leaves what was running as it was.
 
 ### Measured on each engine
 
-These are the same model and frames on each engine of the omarchy-onnxruntime build of 1.29.0. They were measured on its earlier single package, `onnxruntime-full`; the library is the same.
+These are the same model and frames on each engine of the omarchy-onnxruntime build of 1.29.0. They were measured on an earlier packaging of that build; the library is the same.
 
 Conditions:
 
@@ -453,7 +447,7 @@ The NVIDIA GPU then stays asleep under `openvino-gpu`. The log says whether the 
 | `unavailable: No cut-out model installed (searched: ...)` | No model file in the directories listed | Install the models (section 3). The message names the directories searched |
 | A model fails to load with a checksum or file error | The file is not the catalogue's: a different conversion, a truncated copy | Use the files that the package or the checkout's scripts produce. Their checksums are in the module's README |
 | The model runs on the CPU although you have an NVIDIA GPU | `auto` found nothing better: the installed ONNX Runtime has only the CPU engine, or the CUDA reason says why (`CUDA not available: ...`) | Install an ONNX Runtime package with the CUDA engine, as omarchy-onnxruntime describes (section 2), and read the reason in the log (section 5) |
-| The log says TensorRT's libraries are not on the daemon's library path, and the model runs on CUDA | TensorRT's directory is not on the daemon's library path (`/opt/nvidia/tensorrt/lib` with `nvidia-tensorrt-sdk-local` pkgrel 3 or earlier) | Update the package to pkgrel 4 or later, or add the drop-in of section 2, "TensorRT's library path", then reload systemd and restart the daemon |
+| The log says TensorRT's libraries are not on the daemon's library path, and the model runs on CUDA | TensorRT's directory is not on the daemon's library path (for example `/opt/nvidia/tensorrt/lib`) | Install or update TensorRT with omarchy-nvidia-sdks, or add the drop-in of section 2, "TensorRT's library path", then reload systemd and restart the daemon |
 | `Warning` says `<engine> was chosen and cannot run: <reason>; using <other engine>` | The engine you chose cannot run here. The module runs the first later engine of the order that starts. The stored setting is unchanged | Read the reason and fix it, or choose `auto` or the engine that runs |
 | The load fails with `<engine> was chosen and cannot run: ...; no later engine could run it (...)` | The chosen engine and every engine after it in the order failed | Read the reasons in the list. Choose `auto` or an engine that can run |
 | After changing the engine or model the picture did not change, and `Warning` ends `the previous setting keeps running` | The new setting could not load. The previous one keeps running by design | Read the reason before the semicolon and fix it, or set the setting back. Change it again or apply it again to try it once more |

@@ -73,15 +73,15 @@ The core installs the daemon, the CLI, the units, the CPU voice module and the m
 | Package | What it adds | Depends on |
 |---|---|---|
 | `omarchy-broadcast` | The core: the daemon and the CLI, the audio worker, the CPU voice module, the microphone's host and plug-in, the units, the D-Bus files, the udev rule, the media and the documentation. The CPU video path is part of the daemon | optional: `nvidia-utils` and `cuda`, for the CUDA video path on NVIDIA GPUs |
-| `omarchy-broadcast-onnx` | The open-model cut-out module (blur and replace, no NVIDIA SDK). Models are separate packages | `onnxruntime>=1.29`, `omarchy-onnx-model-mediapipe-landscape`; optional: the other `omarchy-onnx-model-*` packages and an `onnxruntime-provider-cuda`, `-tensorrt` or `-openvino` engine |
-| `omarchy-broadcast-maxine-vfx` | The Maxine video effects module | `cuda`, `maxine-vfx-sdk-local` |
-| `omarchy-broadcast-maxine-ar` | The Maxine AR module (eye contact, auto-framing) | `cuda`, `maxine-ar-sdk-local` |
-| `omarchy-broadcast-maxine-afx` | The Maxine audio effects module for the microphone | `maxine-afx-sdk-local` |
+| `omarchy-broadcast-onnx` | The open-model cut-out module (blur and replace, no NVIDIA SDK). Models are separate packages | `onnxruntime>=1.29`, `omarchy-onnx-model-mediapipe-landscape`; optional: the other `omarchy-onnx-model-*` packages and an ONNX Runtime engine package ([omarchy-onnxruntime](https://github.com/rsd/omarchy-onnxruntime)) |
+| `omarchy-broadcast-maxine-vfx` | The Maxine video effects module | `cuda`, the Maxine Video Effects SDK (omarchy-nvidia-sdks) |
+| `omarchy-broadcast-maxine-ar` | The Maxine AR module (eye contact, auto-framing) | `cuda`, the Maxine AR SDK (omarchy-nvidia-sdks) |
+| `omarchy-broadcast-maxine-afx` | The Maxine audio effects module for the microphone | The Maxine Audio Effects SDK (omarchy-nvidia-sdks) |
 
 - Each module package depends on the module ABI range it was built for (`omarchy-broadcast-module-abi>=1.6` and `<2`), which the core provides. The daemon refuses a module built for a newer ABI minor than its own.
-- The NVIDIA SDK is never packaged here. `maxine-vfx-sdk-local`, `maxine-ar-sdk-local` and `maxine-afx-sdk-local` are built from your own download with the [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) repository ([setup/maxine.md](setup/maxine.md)). The daemon and the audio worker find the SDK's environment and apply it to themselves, so no systemd drop-in and no `LD_LIBRARY_PATH` are needed.
+- The NVIDIA SDK is never packaged here. The [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks) repository installs it ([setup/maxine.md](setup/maxine.md)). The daemon and the audio worker find the SDK's environment and apply it to themselves, so no systemd drop-in and no `LD_LIBRARY_PATH` are needed.
 - The ONNX models are packages of their own from [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models): `omarchy-onnx-model-<id>`, with `<id>` one of `mediapipe-landscape` (the default), `pphumanseg-v2-mobile`, `pphumanseg-v2-lite` or `modnet`. They install in `/usr/share/omarchy-onnx-models` with each model's own licence ([setup/onnx.md](setup/onnx.md)).
-- The prebuilt packages do not contain the NVIDIA SDKs or ONNX Runtime, which are licensed separately. The Maxine and ONNX modules hold no code of either: they load the SDK or the runtime when the daemon runs. So the `-bin` modules need the SDK packages and an `onnxruntime` package exactly as the `-git` ones do.
+- The prebuilt packages do not contain the NVIDIA SDKs or ONNX Runtime, which are licensed separately. The Maxine and ONNX modules hold no code of either: they load the SDK or the runtime when the daemon runs. So the `-bin` modules need the SDKs and ONNX Runtime exactly as the `-git` ones do.
 
 ## What the core package installs
 

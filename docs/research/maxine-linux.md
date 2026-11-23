@@ -1,6 +1,6 @@
 # NVIDIA Maxine on Linux: technical notes
 
-Background notes on the NVIDIA Maxine SDKs relevant to this project: distribution and licence, versions, Blackwell support, features and API shape. They were compiled from NVIDIA's public documentation and catalog pages (checked in November 2026) and later checked by installing the VFX SDK; the install procedure is in [../setup/maxine.md](../setup/maxine.md). Statements marked **unverified** have not been confirmed first-hand. NVIDIA pages change; re-check before relying on version numbers.
+Background notes on the NVIDIA Maxine SDKs relevant to this project: distribution and licence, versions, Blackwell support, features and API shape. They were compiled from NVIDIA's public documentation and catalog pages (checked in November 2026) and later checked by installing the VFX SDK; the SDK install procedure is in [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks), and the module side in [../setup/maxine.md](../setup/maxine.md). Statements marked **unverified** have not been confirmed first-hand. NVIDIA pages change; re-check before relying on version numbers.
 
 ## 1. Distribution and licence
 
@@ -18,13 +18,13 @@ Background notes on the NVIDIA Maxine SDKs relevant to this project: distributio
 - **AR Linux collection**, "Maxine Linux Augmented Reality SDK" (updated 2025-06-26, NVAIE-tagged). https://catalog.ngc.nvidia.com/orgs/nvidia/maxine/collections/maxine_linux_ar_sdk_collection_ga/-
 - **GitHub** `github.com/NVIDIA-Maxine` (page fetched 2026-11): repos `Maxine-VFX-SDK`, `Maxine-AR-SDK`, `Maxine-AFX-SDK`, `VFX-SDK-Samples`, `AR-SDK-Samples`, `AFX-SDK-Samples`, `nvidia-vfx-python-samples`. These were last updated 2026-09/10.
   - The `Maxine-*-SDK` repos are MIT-licensed headers, proxy-loader source and Windows samples. Their READMEs are Windows-only and ship no binaries.
-  - The old `github.com/NVIDIA/MAXINE-*-SDK` URLs return 404 (verified for AR and VFX). A forum thread of 2025-02-20 to 2025-05-17 reports the same, with AUR users having made mirrors (Codeberg / Software Heritage). https://forums.developer.nvidia.com/t/obs-streamfx-maxine-ar-afx-vfx-sdks-for-linux/324484
+  - The old `github.com/NVIDIA/MAXINE-*-SDK` URLs return 404 (verified for AR and VFX). A forum thread of 2025-02-20 to 2025-05-17 reports the same. https://forums.developer.nvidia.com/t/obs-streamfx-maxine-ar-afx-vfx-sdks-for-linux/324484
   - The Linux samples are in `VFX-SDK-Samples` and `AR-SDK-Samples`. They install deps and build with `build_samples.sh`, and the SDK itself still comes from NGC. https://github.com/NVIDIA-Maxine/VFX-SDK-Samples
 
 ### Account and access
 - **NGC pages show two options:** "NVIDIA AI Enterprise" (sales form) or "NVIDIA Developer Program" ("Get Access", described as "free tools, support, and tech resources"). A plain free NGC account is explicitly not enough.
   - Seen on `vfx_sdk_core` (2026-09-30), the VFX collection (2026-09-10) and the AFX collection (2026-10-05). This is new compared with the 2025 pages, which only offered NVAIE.
-  - The Developer Program path unlocks the Linux download (verified by installing; see [../setup/maxine.md](../setup/maxine.md)). The terms that apply are summarised below.
+  - The Developer Program path unlocks the Linux download (verified by installing; see [omarchy-nvidia-sdks](https://github.com/rsd/omarchy-nvidia-sdks)). The terms that apply are summarised below.
 - **History of the gating:**
   - Forum users in Jan 2025 reported NGC returning 402 "Payment Required" and a redirect to a 90-day AI Enterprise evaluation request. https://forums.developer.nvidia.com/t/maxine-r14-release-notes-and-highlights/318615
   - The Maxine R14 notes (2025-01-02) say "Linux SDK features are included under an NVAIE license".
@@ -62,7 +62,7 @@ Background notes on the NVIDIA Maxine SDKs relevant to this project: distributio
   - **AFX is explicit:** it bundles its libs (CUDA 12.8.1, TensorRT 10.9.0.34, cuDNN 9.7.1, "All libraries that are required to use the SDK are in the package"). Driver 570.26+. https://docs.nvidia.com/maxine/afx/latest/LinuxAFXSDK/GetStartedOnLinux.html
 - **No system CUDA toolkit is required for the SDK:** `NvVFX_CudaStreamCreate` is documented as a wrapper for `cudaStreamCreate()` "so you can avoid linking the CUDA Toolkit libraries", and the bundled runtime works without a system CUDA install (verified). https://docs.nvidia.com/maxine/vfx/latest/API/Reference/VideoEffectsFunctions.html
 - **Arch Linux reports:** none found for VFX / AR / AFX (searches for Arch / Manjaro / NixOS / Fedora returned nothing relevant). In practice the SDK loads on Arch with one workaround for its distribution check ([../setup/maxine.md](../setup/maxine.md#the-os-release-shim)).
-  - The only Arch-adjacent items are the AUR `obs-streamfx-unstable` mirrors of the old GitHub source (forum thread above) and `nvbroadcast-bin` (AUR page blocked by Anubis; see section 6).
+  - The only Arch-adjacent item is `nvbroadcast-bin` (AUR page blocked by Anubis; see section 6), and that project does not use Maxine.
   - Blucast avoids the distro problem by running the SDK in an Ubuntu 20.04 container with the NVIDIA Container Toolkit. NVIDIA's own docs have a "Run SDK in a Container" page that builds on Ubuntu 20.04. https://docs.nvidia.com/maxine/vfx/latest/LinuxVFXSDK/RunSDKinaContainer.html
   - A container is the safe fallback where the SDK does not load.
 
